@@ -74,3 +74,52 @@ func TestOpenRejectsSharedStore(t *testing.T) {
 		t.Fatal("a relative store was accepted")
 	}
 }
+
+func TestOpenRejectsSymlinkedRuns(t *testing.T) {
+	base := t.TempDir()
+	elsewhere := filepath.Join(base, "elsewhere")
+	os.Mkdir(elsewhere, 0o700)
+	root := filepath.Join(base, "niten")
+	os.Mkdir(root, 0o700)
+	if err := os.Symlink(elsewhere, filepath.Join(root, "runs")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(root); err == nil {
+		t.Fatal("a symlinked runs directory was accepted")
+	}
+	if entries, _ := os.ReadDir(elsewhere); len(entries) != 0 {
+		t.Fatalf("Open wrote through the symlink: %v", entries)
+	}
+	// A runs directory swapped for a symlink after Open is caught before staging.
+	root2 := filepath.Join(base, "niten2")
+	s, err := Open(root2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Remove(filepath.Join(s.Root, "runs"))
+	os.Symlink(elsewhere, filepath.Join(s.Root, "runs"))
+	id, _ := NewRunID(time.Now())
+	if _, err := s.Stage(id); err == nil {
+		t.Fatal("staging followed a swapped runs symlink")
+	}
+	if entries, _ := os.ReadDir(elsewhere); len(entries) != 0 {
+		t.Fatalf("staging wrote through the symlink: %v", entries)
+	}
+}
+
+func TestLocateCreatesNothing(t *testing.T) {
+	base, _ := filepath.EvalSymlinks(t.TempDir())
+	link := filepath.Join(base, "link")
+	os.Symlink(filepath.Join(base, "real"), link)
+	os.Mkdir(filepath.Join(base, "real"), 0o700)
+	got, err := Locate(filepath.Join(link, "state", "niten"))
+	if err != nil || got != filepath.Join(base, "real", "state", "niten") {
+		t.Fatalf("Locate = %q %v", got, err)
+	}
+	if _, err := os.Stat(filepath.Join(base, "real", "state")); !os.IsNotExist(err) {
+		t.Fatal("Locate created a directory")
+	}
+	if _, err := Locate("relative"); err == nil {
+		t.Fatal("a relative store was located")
+	}
+}

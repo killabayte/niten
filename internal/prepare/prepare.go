@@ -144,36 +144,52 @@ func Prepare(ctx context.Context, o Options) (*Result, error) {
 		return nil, err
 	}
 
-	st, err := store.Open(cfg.StoreDir)
+	// Nothing is written anywhere before the store and the temporary directory are known
+	// to lie outside every repository the plan could bind: the explicit bindings and the
+	// manifest locators. The store itself is created only once every check has passed.
+	storeRoot, err := store.Locate(cfg.StoreDir)
 	if err != nil {
 		return nil, fail(contract.ExitFormat, ReasonStore, "%v", err)
+	}
+	tmpBase, err := workspace.Canonical(os.TempDir())
+	if err != nil {
+		return nil, fail(contract.ExitFormat, ReasonStore, "temporary directory: %v", err)
+	}
+	var candidates []string
+	for _, p := range o.Repos {
+		candidates = append(candidates, p)
+	}
+	if m, err := plan.DecodeManifest(manifestBytes); err == nil {
+		for _, r := range m.Repos {
+			candidates = append(candidates, r.Root)
+		}
+	}
+	for _, c := range candidates {
+		if canon, err := workspace.Canonical(c); err == nil {
+			if f := outside(storeRoot, tmpBase, canon); f != nil {
+				return nil, f
+			}
+		}
 	}
 	runID, err := store.NewRunID(now)
 	if err != nil {
 		return nil, fail(contract.ExitFormat, ReasonStore, "%v", err)
 	}
-	stage, err := st.Stage(runID)
-	if err != nil {
-		return nil, fail(contract.ExitFormat, ReasonStore, "%v", err)
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			stage.Abort()
-		}
-	}()
-	for _, f := range []struct {
-		rel  string
-		data []byte
-	}{{stagedPlan, planBytes}, {stagedReceipt, receiptBytes}, {stagedManifest, manifestBytes}} {
-		if err := stage.Write(f.rel, f.data, 0o400); err != nil {
-			return nil, fail(contract.ExitFormat, ReasonStore, "%v", err)
-		}
-	}
-	stagedPlanPath, _ := stage.Path(stagedPlan)
+	var files []pending
+	files = append(files, pending{stagedPlan, planBytes, 0o400}, pending{stagedReceipt, receiptBytes, 0o400}, pending{stagedManifest, manifestBytes, 0o400})
 
-	// 2. Shogun's own verification of the staged triplet.
-	vrec, err := runShogunVerify(ctx, cfg.ShogunCommand, stagedPlanPath)
+	// 2. Shogun's own verification of a private copy of the triplet.
+	verifyDir, err := os.MkdirTemp("", "niten-verify-")
+	if err != nil {
+		return nil, fail(contract.ExitFormat, ReasonStore, "temporary directory: %v", err)
+	}
+	defer os.RemoveAll(verifyDir)
+	for _, f := range files {
+		if err := os.WriteFile(filepath.Join(verifyDir, filepath.Base(f.rel)), f.data, 0o400); err != nil {
+			return nil, fail(contract.ExitFormat, ReasonStore, "temporary copy: %v", err)
+		}
+	}
+	vrec, err := runShogunVerify(ctx, cfg.ShogunCommand, filepath.Join(verifyDir, filepath.Base(stagedPlan)))
 	if err != nil {
 		return nil, fail(contract.ExitFormat, ReasonShogunVerify, "%v", err)
 	}
@@ -261,16 +277,22 @@ func Prepare(ctx context.Context, o Options) (*Result, error) {
 	}
 	exclude := ownOutputs(planPath)
 	src, err := workspace.Inspect(ctx, repoPath, exclude)
+	if errors.Is(err, workspace.ErrUnsupported) {
+		return nil, fail(contract.ExitFormat, ReasonUnsupported, "%s at %s: %v", mrepo.ID, repoPath, err)
+	}
 	if err != nil {
 		return nil, fail(contract.ExitFormat, ReasonRepo, "%s at %s: %v", mrepo.ID, repoPath, err)
 	}
-	if workspace.Within(st.Root, src.Root) || workspace.Within(src.Root, st.Root) {
-		return nil, fail(contract.ExitFormat, ReasonStore, "the store %s and the repository %s must not contain each other", st.Root, src.Root)
+	if f := outside(storeRoot, tmpBase, src.Root); f != nil {
+		return nil, f
 	}
 	if err := drift(mrepo, src); err != nil {
 		return nil, err
 	}
 	base, err := workspace.InventoryBase(ctx, src.Root, src.Head, cfg.Policy.InstructionPaths, cfg.Policy.ProtectedPaths)
+	if errors.Is(err, workspace.ErrUnsupported) {
+		return nil, fail(contract.ExitFormat, ReasonUnsupported, "%s: %v", mrepo.ID, err)
+	}
 	if err != nil {
 		return nil, fail(contract.ExitFormat, ReasonRepo, "%s base inventory: %v", mrepo.ID, err)
 	}
@@ -401,9 +423,7 @@ func Prepare(ctx context.Context, o Options) (*Result, error) {
 			continue
 		}
 		rel := "inputs/execution/" + in.ID
-		if err := stage.Write(rel, data, 0o400); err != nil {
-			return nil, fail(contract.ExitFormat, ReasonStore, "%v", err)
-		}
+		files = append(files, pending{rel, data, 0o400})
 		if refs == nil {
 			refs = []string{}
 		}
@@ -422,9 +442,7 @@ func Prepare(ctx context.Context, o Options) (*Result, error) {
 		e := entry(f)
 		if f.Content != nil {
 			e.Stored = "inputs/instructions/" + f.Path
-			if err := stage.Write(e.Stored, f.Content, 0o400); err != nil {
-				return nil, fail(contract.ExitFormat, ReasonStore, "%v", err)
-			}
+			files = append(files, pending{e.Stored, f.Content, 0o400})
 		}
 		binding.Instructions = append(binding.Instructions, e)
 	}
@@ -478,20 +496,62 @@ func Prepare(ctx context.Context, o Options) (*Result, error) {
 	state := map[string]any{"schema_version": 1, "run_id": runID, "state": string(contract.RunPrepared),
 		"contract_sha256": plan.Digest(cbytes), "plan_digest": c.PlanDigest, "updated_at": c.CreatedAt}
 	sbytes, _ := json.MarshalIndent(state, "", " ")
-	for _, f := range []struct {
-		rel  string
-		data []byte
-	}{{contractFile, cbytes}, {configFile, append(cfgBytes, '\n')}, {stateFile, append(sbytes, '\n')}} {
-		if err := stage.Write(f.rel, f.data, 0o600); err != nil {
-			return nil, fail(contract.ExitFormat, ReasonStore, "%v", err)
+	files = append(files, pending{contractFile, cbytes, 0o600}, pending{configFile, append(cfgBytes, '\n'), 0o600}, pending{stateFile, append(sbytes, '\n'), 0o600})
+
+	// 11. Every check passed: only now the store is created and the run written.
+	dir, err := publish(cfg.StoreDir, storeRoot, tmpBase, src.Root, runID, files)
+	if err != nil {
+		return nil, err
+	}
+	return &Result{RunID: runID, RunDir: dir, Contract: c, Notes: notes}, nil
+}
+
+// pending is a run file held in memory until the run is published.
+type pending struct {
+	rel  string
+	data []byte
+	mode os.FileMode
+}
+
+// outside refuses a store or temporary directory that overlaps the repository.
+func outside(storeRoot, tmpBase, repo string) *Failure {
+	if workspace.Within(storeRoot, repo) || workspace.Within(repo, storeRoot) {
+		return fail(contract.ExitFormat, ReasonStore, "the store %s and the repository %s must not contain each other", storeRoot, repo)
+	}
+	if workspace.Within(tmpBase, repo) {
+		return fail(contract.ExitFormat, ReasonStore, "the temporary directory %s lies inside the repository %s; point TMPDIR elsewhere", tmpBase, repo)
+	}
+	return nil
+}
+
+// publish opens the store, re-checks its canonical root against the repository, writes
+// every file into a staging directory and renames it into place.
+func publish(storeDir, located, tmpBase, repo, runID string, files []pending) (string, error) {
+	st, err := store.Open(storeDir)
+	if err != nil {
+		return "", fail(contract.ExitFormat, ReasonStore, "%v", err)
+	}
+	if st.Root != located {
+		if f := outside(st.Root, tmpBase, repo); f != nil {
+			return "", f
+		}
+	}
+	stage, err := st.Stage(runID)
+	if err != nil {
+		return "", fail(contract.ExitFormat, ReasonStore, "%v", err)
+	}
+	for _, f := range files {
+		if err := stage.Write(f.rel, f.data, f.mode); err != nil {
+			stage.Abort()
+			return "", fail(contract.ExitFormat, ReasonStore, "%v", err)
 		}
 	}
 	dir, err := stage.Commit()
 	if err != nil {
-		return nil, fail(contract.ExitFormat, ReasonStore, "%v", err)
+		stage.Abort()
+		return "", fail(contract.ExitFormat, ReasonStore, "%v", err)
 	}
-	committed = true
-	return &Result{RunID: runID, RunDir: dir, Contract: c, Notes: notes}, nil
+	return dir, nil
 }
 
 // readInput reads a regular file that is not a symlink, up to max bytes.

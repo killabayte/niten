@@ -24,12 +24,17 @@ niten prepare PLAN.md [--repo ID=PATH] [--input ID=PATH]... [--human ID]...
 
 1. **Private copies.** The plan, `<stem>.approval.json` and `<stem>.manifest.json` are
    read once, as regular non-symlink files within size limits (plan 4 MiB, receipt 1 MiB,
-   manifest 4 MiB), and written read-only into a staging run. Only these bytes are used.
-2. **`shogun verify --require-manifest`** runs on the staged copy with PATH, HOME and
-   TMPDIR only, a 30-second timeout and the staging directory as cwd. The executable is
-   `shogun_command`, resolved, hashed and recorded with its `shogun version` output. Only
-   `valid` with exit 0 continues; `changed` is a rejection; anything else, including a
-   Shogun without `--require-manifest`, fails closed.
+   manifest 4 MiB), and kept in memory. Only these bytes are used. Before anything is
+   written, the store location (resolved without creating it) and the temporary directory
+   are checked against every repository the plan could bind: the `--repo` paths and the
+   manifest locators. Neither may lie inside a repository, and the store may not contain
+   one either.
+2. **`shogun verify --require-manifest`** runs on a copy in a private temporary directory
+   with PATH, HOME and TMPDIR only, a 30-second timeout and that directory as cwd; the
+   copy is removed afterwards. The executable is `shogun_command`, resolved, hashed and
+   recorded with its `shogun version` output. Only `valid` with exit 0 continues;
+   `changed` is a rejection; anything else, including a Shogun without
+   `--require-manifest`, fails closed.
 3. **Independent checks** of the same bytes: the approved-body SHA-256 against the
    receipt, a strict receipt decode (unknown fields, schema version, digest shape, plan
    ID and revision agreeing with the immutable metadata), a strict manifest decode, every
@@ -50,18 +55,24 @@ niten prepare PLAN.md [--repo ID=PATH] [--input ID=PATH]... [--human ID]...
    `git diff --binary` against HEAD and the digest of non-ignored untracked files. Left
    out are only the plan triplet actually given to prepare and anything under `.git` or
    `.shogun`; the manifest's own `exclude` list is not honored. Any drift is a rejection;
-   Niten does not rebase. The base commit is then inventoried: submodules and Git LFS
-   attributes are unsupported, instruction files are copied from the commit (never the
-   working tree), protected entries are recorded.
+   Niten does not rebase. Replacement refs, a grafts file and partial clones are
+   unsupported: the first two let the pinned commit id stand for other content, the last
+   would need objects fetched from a remote. The base commit is then inventoried:
+   submodules and Git LFS attributes are unsupported, instruction files are read from the
+   commit (never the working tree), protected entries are recorded.
 7. **References and owners.** Targets must name the repository. A protected path as a
    non-inspect target is refused. An instruction path as a target is allowed and
    reported. Verifications may name the repository, no repository, or a manifest input.
    Every criterion and verification is owned by `niten` unless the user passes
    `--human ID` before the run.
-8. **Execution inputs** (see below), then the contract, `config.json` and `state.json`
-   are written and the staging directory is renamed to `runs/<run-id>`.
+8. **Execution inputs** (see below) are read and checked in memory.
+9. **Publication.** Only now is the store opened (created if needed) and its canonical
+   root checked again. Every file (the triplet copies, execution inputs, instruction
+   copies, the contract, `config.json` and `state.json`) is written into a staging
+   directory inside `runs/`, which is then renamed to `runs/<run-id>`.
 
-A refusal at any step removes the staging directory; no partial run is left.
+A refusal at any step leaves nothing behind: the store is not created, the temporary
+copy is removed, and the source plan and repository are untouched.
 
 ## Grammar
 
@@ -116,9 +127,13 @@ repeats the check against any library.
   paths and stripped environment names are always included; a config file can add to
   them only. `max_ahead_steps` must be 0 and `policy.tool_network` must be `deny`.
 - **Git environment.** Inspection removes every `GIT_*` variable except the global and
-  system config selectors, disables the file-system monitor and otherwise runs the same
-  commands with the same output settings as Shogun, so fingerprints agree on the same
-  machine.
+  system config selectors, runs with `--no-replace-objects` and `--no-lazy-fetch` (and
+  the matching environment variables), disables the file-system monitor and otherwise
+  runs the same commands with the same output settings as Shogun, so fingerprints agree
+  on the same machine. A missing object is an error, never a fetch into the repository.
+- **Store integrity.** The store root and `runs/` must be directories owned by the
+  current user with no group or other permissions; `runs/` must not be a symlink, and it
+  is re-checked before staging and before the final rename.
 
 ## Exit codes and reasons
 
@@ -146,7 +161,8 @@ repeats the check against any library.
 ```
 
 The store and every run directory are private to the owner; the store may not contain
-the repository or lie inside it. The lock, the event journal and recovery are P2.
+the repository or lie inside it, and `runs/` is a real directory. The lock, the event
+journal and recovery are P2.
 
 `contract.json` carries the plan identity, `plan_digest` (body, receipt and manifest
 bytes), `semantics_digest`, the normalized document with source spans and hashes, the
@@ -176,3 +192,9 @@ dirty, multi-repository and non-git planning bases.
 The prepare tests use a scripted `shogun`. `NITEN_TEST_SHOGUN=/path/to/shogun go test
 ./internal/prepare` runs the same scenarios against a real Shogun build; on 2026-09-30
 they passed against the `s0-manifest-sidecar` branch at `29d03b3`.
+
+Review fixes, 2026-09-30: four defects found in an external review are fixed with
+regressions. Replacement refs could make the pinned commit id show another tree; a
+symlinked `runs/` could place a run inside the repository; inspecting a partial clone
+fetched missing objects into it; and a refused `store_dir` inside the repository had
+already been created.

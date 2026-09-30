@@ -38,12 +38,20 @@ type Source struct {
 // ErrNotRepository marks a path that is not the top level of a git work tree with a HEAD.
 var ErrNotRepository = errors.New("not a git repository top level with a commit")
 
+// ErrUnsupported marks a repository that uses a git feature v0.1 does not execute:
+// replacement refs or grafts (they let an object id stand for different content) and
+// partial clones (objects missing locally would have to be fetched).
+var ErrUnsupported = errors.New("unsupported repository")
+
 // Git runs git read-only in root. The environment is the caller's with every GIT_* variable
 // removed except the global/system config selectors, so GIT_DIR or GIT_WORK_TREE cannot
-// redirect the inspection; Shogun's own output settings are added. The file-system monitor
-// is disabled, which does not change any output.
+// redirect the inspection; Shogun's own output settings are added. Replacement refs and
+// grafts are ignored, so every object id means its own content, and lazy fetching from a
+// promisor remote is disabled, so a missing object is an error instead of a write into the
+// repository. The file-system monitor is disabled; none of this changes the output for a
+// repository without those features.
 func Git(ctx context.Context, root string, args ...string) ([]byte, error) {
-	full := append([]string{"-C", root, "--no-optional-locks", "-c", "core.fsmonitor=false"}, args...)
+	full := append([]string{"-C", root, "--no-optional-locks", "--no-replace-objects", "--no-lazy-fetch", "-c", "core.fsmonitor=false"}, args...)
 	cmd := exec.CommandContext(ctx, "git", full...)
 	cmd.Env = gitEnv()
 	var stderr bytes.Buffer
@@ -64,7 +72,41 @@ func gitEnv() []string {
 		}
 		env = append(env, kv)
 	}
-	return append(env, "GIT_EXTERNAL_DIFF=", "GIT_PAGER=cat", "LC_ALL=C", "GIT_TERMINAL_PROMPT=0")
+	return append(env, "GIT_EXTERNAL_DIFF=", "GIT_PAGER=cat", "LC_ALL=C", "GIT_TERMINAL_PROMPT=0",
+		"GIT_NO_REPLACE_OBJECTS=1", "GIT_NO_LAZY_FETCH=1")
+}
+
+// unsupported reports git features that make an object id or the local object store
+// untrustworthy for a pinned base: replacement refs, a grafts file and partial clones.
+func unsupported(ctx context.Context, root string) error {
+	var found []string
+	refs, err := Git(ctx, root, "for-each-ref", "--format=%(refname)", "refs/replace/")
+	if err != nil {
+		return err
+	}
+	if r := strings.Fields(string(refs)); len(r) > 0 {
+		found = append(found, fmt.Sprintf("replacement refs (%s)", strings.Join(r[:min(len(r), 3)], ", ")))
+	}
+	common, err := Git(ctx, root, "rev-parse", "--git-common-dir")
+	if err != nil {
+		return err
+	}
+	gitDir := strings.TrimSpace(string(common))
+	if !filepath.IsAbs(gitDir) {
+		gitDir = filepath.Join(root, gitDir)
+	}
+	if _, err := os.Lstat(filepath.Join(gitDir, "info", "grafts")); err == nil {
+		found = append(found, "a grafts file")
+	}
+	if out, _ := Git(ctx, root, "config", "--get", "extensions.partialclone"); strings.TrimSpace(string(out)) != "" {
+		found = append(found, "a partial clone (extensions.partialClone)")
+	} else if out, _ := Git(ctx, root, "config", "--get-regexp", `^remote\..*\.promisor$`); strings.Contains(string(out), "true") {
+		found = append(found, "a partial clone (promisor remote)")
+	}
+	if len(found) > 0 {
+		return fmt.Errorf("%w: %s uses %s", ErrUnsupported, root, strings.Join(found, " and "))
+	}
+	return nil
 }
 
 // Canonical resolves p to an absolute path without symlinks.
@@ -103,6 +145,9 @@ func Inspect(ctx context.Context, root string, exclude []string) (*Source, error
 	}
 	if t, err := Canonical(strings.TrimSpace(string(top))); err != nil || t != canon {
 		return nil, fmt.Errorf("%w: %s is inside the work tree %s, not its top level", ErrNotRepository, canon, strings.TrimSpace(string(top)))
+	}
+	if err := unsupported(ctx, canon); err != nil {
+		return nil, err
 	}
 	head, err := Git(ctx, canon, "rev-parse", "--verify", "-q", "HEAD")
 	if err != nil {
@@ -204,6 +249,9 @@ const maxInstruction = 1 << 20
 // InventoryBase lists the base commit's instruction and protected entries (from the
 // commit, not the working tree) and detects submodules and Git LFS attributes.
 func InventoryBase(ctx context.Context, root, commit string, instruction, protected []string) (*Base, error) {
+	if err := unsupported(ctx, root); err != nil {
+		return nil, err
+	}
 	tree, err := Git(ctx, root, "rev-parse", "--verify", "-q", commit+"^{tree}")
 	if err != nil {
 		return nil, err
@@ -228,7 +276,7 @@ func InventoryBase(ctx context.Context, root, commit string, instruction, protec
 			continue
 		}
 		if filepath.Base(p) == ".gitattributes" && typ == "blob" {
-			data, err := Git(ctx, root, "cat-file", "blob", blob)
+			data, err := catBlob(ctx, root, blob, p)
 			if err != nil {
 				return nil, err
 			}
@@ -243,7 +291,7 @@ func InventoryBase(ctx context.Context, root, commit string, instruction, protec
 		}
 		bf := BaseFile{Path: p, Mode: mode, Blob: blob}
 		if mode == "120000" || mode == "100644" || mode == "100755" {
-			data, err := Git(ctx, root, "cat-file", "blob", blob)
+			data, err := catBlob(ctx, root, blob, p)
 			if err != nil {
 				return nil, err
 			}
@@ -271,6 +319,16 @@ func InventoryBase(ctx context.Context, root, commit string, instruction, protec
 	sort.Slice(b.Instructions, func(i, j int) bool { return b.Instructions[i].Path < b.Instructions[j].Path })
 	sort.Slice(b.Protected, func(i, j int) bool { return b.Protected[i].Path < b.Protected[j].Path })
 	return b, nil
+}
+
+// catBlob reads a blob of the base commit; with lazy fetching disabled, an object that is
+// not present locally is an error.
+func catBlob(ctx context.Context, root, blob, path string) ([]byte, error) {
+	data, err := Git(ctx, root, "cat-file", "blob", blob)
+	if err != nil {
+		return nil, fmt.Errorf("%s (%s) is not readable from the local object store: %w", path, blob, err)
+	}
+	return data, nil
 }
 
 func digest(b []byte) string {

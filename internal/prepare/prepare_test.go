@@ -179,11 +179,17 @@ func TestPrepareRealPlan(t *testing.T) {
 		t.Fatal("check_spec is not recorded as null")
 	}
 
-	// shogun verified the private copy, not the source file; nothing else was started.
+	// shogun verified a private temporary copy, not the source file, and the copy is gone;
+	// nothing else was started.
 	if e.shogun != os.Getenv("NITEN_TEST_SHOGUN") {
 		log, _ := os.ReadFile(e.shogLog)
-		if !strings.Contains(string(log), "verify --require-manifest "+res.RunDir[:len(res.RunDir)-len(res.RunID)]) || strings.Contains(string(log), e.lib) {
+		_, verified, _ := strings.Cut(string(log), "verify --require-manifest ")
+		verified = strings.TrimSpace(verified)
+		if !strings.HasSuffix(verified, "/plan.md") || strings.HasPrefix(verified, e.lib) || strings.HasPrefix(verified, e.repo) {
 			t.Fatalf("shogun log:\n%s", log)
+		}
+		if _, err := os.Stat(filepath.Dir(verified)); !os.IsNotExist(err) {
+			t.Fatalf("the verification copy %s was left behind", filepath.Dir(verified))
 		}
 	}
 	if m, _ := os.ReadDir(e.markers); len(m) != 0 {
@@ -470,12 +476,67 @@ func TestPrepareScope(t *testing.T) {
 			t.Fatalf("binding %+v notes %v", res.Contract.Repos[0], res.Notes)
 		}
 	})
+	// Review regressions: a refused store location must not have been created, and a
+	// symlinked runs directory or TMPDIR cannot carry a run into the repository.
 	t.Run("store inside the repository", func(t *testing.T) {
 		e := newEnv(t, "fast-min", testutil.ShogunValid)
 		e.cfg.Config.StoreDir = filepath.Join(e.repo, ".niten-store")
 		e.store = e.cfg.Config.StoreDir
 		e.refused(e.opts(), contract.ExitFormat, ReasonStore, "must not contain each other")
+		if _, err := os.Lstat(e.cfg.Config.StoreDir); !os.IsNotExist(err) {
+			t.Fatalf("the refused store was created inside the repository: %v", err)
+		}
+		repoUnchanged(t, e.repo)
 	})
+	t.Run("runs symlinked into the repository", func(t *testing.T) {
+		e := newEnv(t, "fast-min", testutil.ShogunValid)
+		target := filepath.Join(e.repo, ".shogun")
+		os.MkdirAll(target, 0o700)
+		os.MkdirAll(e.store, 0o700)
+		if err := os.Symlink(target, filepath.Join(e.store, "runs")); err != nil {
+			t.Fatal(err)
+		}
+		res, f := e.prepare(e.opts())
+		if f == nil || f.Reason != ReasonStore || !strings.Contains(strings.Join(f.Details, " "), "symlink") {
+			t.Fatalf("got %+v %+v", res, f)
+		}
+		if entries, _ := os.ReadDir(target); len(entries) != 0 {
+			t.Fatalf("a run was written through the symlink into the repository: %v", entries)
+		}
+	})
+	t.Run("temporary directory inside the repository", func(t *testing.T) {
+		e := newEnv(t, "fast-min", testutil.ShogunValid)
+		tmp := filepath.Join(e.repo, ".tmp")
+		os.Mkdir(tmp, 0o700)
+		t.Setenv("TMPDIR", tmp)
+		e.refused(e.opts(), contract.ExitFormat, ReasonStore, "point TMPDIR elsewhere")
+		if entries, _ := os.ReadDir(tmp); len(entries) != 0 {
+			t.Fatalf("files were written into the repository: %v", entries)
+		}
+	})
+}
+
+// repoUnchanged requires the fixture repository to be exactly the approved base.
+func repoUnchanged(t *testing.T, repo string) {
+	t.Helper()
+	s, err := workspace.Inspect(context.Background(), repo, nil)
+	if err != nil || s.Dirty() || s.Head != testutil.FixtureHead {
+		t.Fatalf("repository changed: %+v %v", s, err)
+	}
+}
+
+// Review regression: a replacement ref can make the pinned commit id stand for another
+// tree. Such a repository is refused, never inspected through the replacement.
+func TestPrepareRefusesReplacementRefs(t *testing.T) {
+	e := newEnv(t, "fast-min", testutil.ShogunValid)
+	os.WriteFile(filepath.Join(e.repo, "a.go"), []byte("package substituted\n"), 0o644)
+	testutil.Git(t, e.repo, "add", "a.go")
+	tree := testutil.Git(t, e.repo, "write-tree")
+	replacement := testutil.Git(t, e.repo, "commit-tree", tree, "-m", "replacement")
+	testutil.Git(t, e.repo, "reset", "--hard", testutil.FixtureHead)
+	testutil.Git(t, e.repo, "replace", testutil.FixtureHead, replacement)
+	testutil.Git(t, e.repo, "reset", "--hard", testutil.FixtureHead)
+	e.refused(e.opts(), contract.ExitFormat, ReasonUnsupported, "replacement refs")
 }
 
 func TestPrepareRejectsUnsafeOrAmbiguousPlans(t *testing.T) {
