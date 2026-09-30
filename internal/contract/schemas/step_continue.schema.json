@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "step_continue.schema.json",
+  "type": "object", "additionalProperties": false,
+  "required": ["schema_version", "gate_id", "run_id", "plan_digest", "contract_digest", "step_id", "candidate_sha"],
+  "properties": {
+    "schema_version": {"type": "integer", "const": 1},
+    "gate_id": {"$ref": "common.schema.json#/$defs/nonempty"},
+    "run_id": {"$ref": "common.schema.json#/$defs/nonempty"},
+    "plan_digest": {"$ref": "common.schema.json#/$defs/digest"},
+    "contract_digest": {"$ref": "common.schema.json#/$defs/digest"},
+    "step_id": {"$ref": "common.schema.json#/$defs/id_S"},
+    "candidate_sha": {"$ref": "common.schema.json#/$defs/sha"}
+  }
+}

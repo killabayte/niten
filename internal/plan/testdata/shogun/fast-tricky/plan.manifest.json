@@ -1,0 +1,34 @@
+{
+ "version": 1,
+ "created_at": "2026-09-30T18:45:23Z",
+ "workspace": "/var/folders/5c/n5pt202d5335rbh6hsx11pc80000gn/T/TestZZNitenFixturesfast-tricky1405417084/002/demo",
+ "repos": [
+  {
+   "id": "repo-1",
+   "root": "/private/var/folders/5c/n5pt202d5335rbh6hsx11pc80000gn/T/TestZZNitenFixturesfast-tricky1405417084/002/demo",
+   "is_git": true,
+   "head": "99e8a297c715085c31a6498375964f8e7ca1f237",
+   "diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+   "untracked_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+   "fingerprint": "cc699feb8f2ecbdd8ad7f4d0c378bdcf04c874368384ab3f3c85ca1f84977c1b"
+  }
+ ],
+ "inputs": [
+  {
+   "id": "in-1",
+   "kind": "file",
+   "origin": "/var/folders/5c/n5pt202d5335rbh6hsx11pc80000gn/T/TestZZNitenFixturesfast-tricky1405417084/001/spec.md",
+   "stored_path": "inputs/01-spec.md",
+   "sha256": "b932ec550ff4f11b93f6a848bd8af4462dd4f5624e511c5861130b0b3a57d807",
+   "size": 34,
+   "fetched_at": "2026-09-30T18:45:23Z",
+   "status": "ok"
+  }
+ ],
+ "exclude": [
+  "/var/folders/5c/n5pt202d5335rbh6hsx11pc80000gn/T/TestZZNitenFixturesfast-tricky1405417084/003/library/demo/plan.md",
+  "/var/folders/5c/n5pt202d5335rbh6hsx11pc80000gn/T/TestZZNitenFixturesfast-tricky1405417084/003/library/demo/plan.approval.json",
+  "/var/folders/5c/n5pt202d5335rbh6hsx11pc80000gn/T/TestZZNitenFixturesfast-tricky1405417084/003/library/demo/plan.manifest.json"
+ ],
+ "fingerprint": "9e71d0ae205b309b2fd8b815ae7033c602663f0afcf99685f50229d70136633a"
+}

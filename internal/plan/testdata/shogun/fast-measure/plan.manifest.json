@@ -1,0 +1,23 @@
+{
+ "version": 1,
+ "created_at": "2026-09-30T18:45:24Z",
+ "workspace": "/var/folders/5c/n5pt202d5335rbh6hsx11pc80000gn/T/TestZZNitenFixturesfast-measure3819194917/001/demo",
+ "repos": [
+  {
+   "id": "repo-1",
+   "root": "/private/var/folders/5c/n5pt202d5335rbh6hsx11pc80000gn/T/TestZZNitenFixturesfast-measure3819194917/001/demo",
+   "is_git": true,
+   "head": "99e8a297c715085c31a6498375964f8e7ca1f237",
+   "diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+   "untracked_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+   "fingerprint": "cc699feb8f2ecbdd8ad7f4d0c378bdcf04c874368384ab3f3c85ca1f84977c1b"
+  }
+ ],
+ "inputs": null,
+ "exclude": [
+  "/var/folders/5c/n5pt202d5335rbh6hsx11pc80000gn/T/TestZZNitenFixturesfast-measure3819194917/002/library/demo/plan.md",
+  "/var/folders/5c/n5pt202d5335rbh6hsx11pc80000gn/T/TestZZNitenFixturesfast-measure3819194917/002/library/demo/plan.approval.json",
+  "/var/folders/5c/n5pt202d5335rbh6hsx11pc80000gn/T/TestZZNitenFixturesfast-measure3819194917/002/library/demo/plan.manifest.json"
+ ],
+ "fingerprint": "f9f6d3c1205bc25ab7dc2dff08a61e8da62192e57aae00949c79ba1c6c074a77"
+}

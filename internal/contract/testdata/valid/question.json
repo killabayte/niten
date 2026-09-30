@@ -1,0 +1,1 @@
+{"text": "Should --version print to stdout or stderr?", "needed_decision": true, "options": ["stdout", "stderr"]}

@@ -1,0 +1,7 @@
+# Build outputs
+/niten
+/dist/
+# Local state
+/.niten/
+*.test
+*.out

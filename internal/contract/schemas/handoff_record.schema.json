@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "handoff_record.schema.json",
+  "type": "object", "additionalProperties": false,
+  "required": ["schema_version", "attempt_id", "verified", "handoff"],
+  "properties": {
+    "schema_version": {"type": "integer", "const": 1},
+    "attempt_id": {"$ref": "common.schema.json#/$defs/nonempty"},
+    "verified": {"type": "boolean"},
+    "handoff": {"$ref": "common.schema.json#/$defs/handoff"}
+  }
+}

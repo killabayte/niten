@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "response.schema.json",
+  "type": "object", "additionalProperties": false,
+  "required": ["finding_id", "disposition", "explanation", "evidence_refs"],
+  "properties": {
+    "finding_id": {"$ref": "common.schema.json#/$defs/id_F"},
+    "disposition": {"type": "string", "enum": ["fixed", "disputed"]},
+    "explanation": {"$ref": "common.schema.json#/$defs/nonempty"},
+    "evidence_refs": {"$ref": "common.schema.json#/$defs/evidence_refs"}
+  }
+}

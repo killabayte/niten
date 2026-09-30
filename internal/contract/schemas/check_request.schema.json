@@ -1,0 +1,11 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "check_request.schema.json",
+  "type": "object", "additionalProperties": false,
+  "required": ["proposal", "reason", "criterion_ids"],
+  "properties": {
+    "proposal": {"$ref": "common.schema.json#/$defs/check_spec_proposal"},
+    "reason": {"$ref": "common.schema.json#/$defs/nonempty"},
+    "criterion_ids": {"$ref": "common.schema.json#/$defs/criterion_ids"}
+  }
+}

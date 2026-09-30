@@ -1,0 +1,62 @@
+{
+ "schema_version": 1,
+ "plan_id": "20260930-204521-add-a-json-flag-to-shogun-stats-934b",
+ "revision": 1,
+ "body_sha256": "c7f7ce5f7c300d2ec738c21d5b6b573aad5eb31b63edbb8657211dfbbe5ee98e",
+ "immutable_metadata": {
+  "created": {
+   "t": "str",
+   "v": "2026-09-30"
+  },
+  "plan_id": {
+   "t": "str",
+   "v": "20260930-204521-add-a-json-flag-to-shogun-stats-934b"
+  },
+  "planner": {
+   "t": "str",
+   "v": "claude/opus:high"
+  },
+  "project": {
+   "t": "str",
+   "v": "demo"
+  },
+  "repos": {
+   "t": "list",
+   "v": [
+    {
+     "t": "str",
+     "v": "demo"
+    }
+   ]
+  },
+  "reviewer": {
+   "t": "str",
+   "v": "codex/gpt-6-astra:high"
+  },
+  "revision": {
+   "t": "int",
+   "v": "1"
+  },
+  "run_id": {
+   "t": "str",
+   "v": "20260930-204521-add-a-json-flag-to-shogun-stats-934b"
+  },
+  "title": {
+   "t": "str",
+   "v": "Add a `--json` flag to `shogun stats`."
+  }
+ },
+ "manifest_digest": "030bdcae0907b5416c87f96d244d653b387b8bd80a6c11771cbf423f084ab1ec",
+ "requirements_revision": "1",
+ "review_id": "reviews/plan-1.json",
+ "cli_versions": null,
+ "requested": {
+  "planner": "claude/opus:high",
+  "reviewer": "codex/gpt-6-astra:high"
+ },
+ "reported": {
+  "planner": ":",
+  "reviewer": ":"
+ },
+ "approved_at": "2026-09-30T18:45:22Z"
+}

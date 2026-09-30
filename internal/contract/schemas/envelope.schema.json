@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "envelope.schema.json",
+  "type": "object", "additionalProperties": false,
+  "required": ["schema_version", "run_id", "sequence", "message_id", "reply_to", "attempt_id", "step_ids", "candidate_id", "from", "to", "kind", "payload"],
+  "properties": {
+    "schema_version": {"type": "integer", "const": 1},
+    "run_id": {"$ref": "common.schema.json#/$defs/nonempty"},
+    "sequence": {"type": "integer", "minimum": 0},
+    "message_id": {"$ref": "common.schema.json#/$defs/nonempty"},
+    "reply_to": {"oneOf": [{"type": "null"}, {"$ref": "common.schema.json#/$defs/nonempty"}]},
+    "attempt_id": {"$ref": "common.schema.json#/$defs/nonempty"},
+    "step_ids": {"$ref": "common.schema.json#/$defs/step_ids"},
+    "candidate_id": {"$ref": "common.schema.json#/$defs/candidate_id"},
+    "from": {"$ref": "common.schema.json#/$defs/role"},
+    "to": {"$ref": "common.schema.json#/$defs/role"},
+    "kind": {"$ref": "common.schema.json#/$defs/message_kind"},
+    "payload": {"type": "object"}
+  }
+}

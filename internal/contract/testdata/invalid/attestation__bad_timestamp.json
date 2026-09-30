@@ -1,0 +1,17 @@
+{
+ "schema_version": 1,
+ "criterion_id": "R-002.C1",
+ "plan_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+ "contract_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+ "candidate_sha": "0123456789abcdef0123456789abcdef01234567",
+ "result": "passed",
+ "observation": "Deployed the tag to staging and confirmed the version banner.",
+ "environment": "staging cluster, 2026-09-30",
+ "observed_at": "yesterday",
+ "actor": "yaroslav",
+ "evidence_refs": [
+  "https://ci.example/run/42"
+ ],
+ "submitted_at": "2026-09-30T13:05:00Z",
+ "source": "resume_answers"
+}
