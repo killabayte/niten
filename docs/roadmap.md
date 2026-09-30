@@ -58,7 +58,9 @@ P0a status: the verifier profile passed its offline positive and negative contro
 CLI skeleton exist and their tests pass. An independent review found two defects
 in this slice, both fixed with regressions the same day: a `setsid` descendant could
 outlive `Run` (now swept with `lsof` and retired by `Seal`), and `check_evidence`
-accepted `status: passed` with a failed assertion. Still open in P0a: the separately
+accepted `status: passed` with a failed assertion. A second review found that the
+sweep also killed holders the run had not started and trusted an incomplete `lsof`
+listing; both are fixed with regressions ([P0 profiles](p0-profile.md)). Still open in P0a: the separately
 authorized executor and reviewer live probes. The export CAS and the external store
 are recorded as contract decisions and are implemented in P2/P5.
 

@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -21,15 +22,18 @@ import (
 // lsofPath is the fixed system tool used to find processes that still hold
 // the sandbox roots. Killing the child's process group is not enough: a
 // descendant that calls setsid leaves the group while keeping the Seatbelt
-// profile, so it can go on writing inside the roots after Run returns.
-const lsofPath = "/usr/sbin/lsof"
+// profile, so it can go on writing inside the roots after Run returns. It is a
+// variable only so tests can substitute a failing tool.
+var lsofPath = "/usr/sbin/lsof"
 
-// Sealed describes the roots after Seal: their new paths and the processes
-// that still held them and were killed.
+// Sealed describes the roots after Seal: their new paths, the processes of the
+// attempt that still held them and were killed, and holders the attempt did not
+// start, which were left running.
 type Sealed struct {
 	SourceRoot  string
 	ScratchRoot string
 	Killed      []int
+	Foreign     []int
 }
 
 // survivors returns the PIDs of the caller's other processes that have an
@@ -40,14 +44,12 @@ func survivors(roots []string) ([]int, error) {
 	cmd := exec.CommandContext(ctx, lsofPath, "-w", "-n", "-P", "-F", "pn", "-u", strconv.Itoa(os.Getuid()))
 	var out, errb bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &errb
-	err := cmd.Run()
-	if err != nil {
-		var exitErr *exec.ExitError
-		// lsof exits 1 when some entries could not be listed; the listing it
-		// did produce is still usable. Anything else is a real failure.
-		if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 || out.Len() == 0 {
-			return nil, fmt.Errorf("%s: %v: %s", lsofPath, err, bytes.TrimSpace(errb.Bytes()))
-		}
+	// The listing covers every process of the user, the caller included, so a
+	// complete run always exits 0. Any other exit means some entries could not
+	// be listed; a holder may be among them, and an open descriptor keeps
+	// writing into a tree even after Seal renames it, so the scan fails closed.
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("%s: incomplete listing: %v: %s", lsofPath, err, bytes.TrimSpace(errb.Bytes()))
 	}
 	self := os.Getpid()
 	seen := map[int]bool{}
@@ -78,51 +80,74 @@ func survivors(roots []string) ([]int, error) {
 	return pids, nil
 }
 
-// killSurvivors sends SIGKILL to pids and waits until nothing holds the roots
-// any more. It returns the PIDs that still hold them after the grace period.
-func killSurvivors(roots []string, pids []int) ([]int, error) {
+// classify splits holders into the attempt's own processes and the others. A
+// holder whose ancestry cannot be read is not the attempt's: it is refused,
+// never killed. A holder that exited meanwhile is dropped.
+func classify(pids []int, since time.Time) (mine, foreign []int) {
 	for _, pid := range pids {
-		_ = syscall.Kill(pid, syscall.SIGKILL)
-	}
-	deadline := time.Now().Add(3 * time.Second)
-	for {
-		left, err := survivors(roots)
-		if err != nil {
-			return nil, err
+		ok, err := owned(pid, since)
+		switch {
+		case errors.Is(err, errNoProcess) || errors.Is(err, syscall.ESRCH):
+		case err != nil || !ok:
+			foreign = append(foreign, pid)
+		default:
+			mine = append(mine, pid)
 		}
-		if len(left) == 0 || time.Now().After(deadline) {
-			return left, nil
-		}
-		time.Sleep(50 * time.Millisecond)
 	}
+	return mine, foreign
 }
 
-// reapRoots is the post-run sweep shared by Run and Seal: find processes that
-// still hold the roots, kill them and report them.
-func reapRoots(roots []string) (killed []int, err error) {
+// reapRoots is the post-run sweep shared by Run and Seal. Processes that hold
+// the roots and belong to the attempt that started at since are killed and
+// reported. Processes the attempt did not start (an editor or a shell of the
+// user, a monitoring tool) are never killed: they are reported and the sweep
+// fails, so the attempt is refused instead.
+func reapRoots(roots []string, since time.Time) (killed, foreign []int, err error) {
 	pids, err := survivors(roots)
 	if err != nil {
-		return nil, fmt.Errorf("%w: survivor scan failed: %v", ErrUnavailable, err)
+		return nil, nil, fmt.Errorf("%w: survivor scan failed: %v", ErrUnavailable, err)
 	}
-	if len(pids) == 0 {
-		return nil, nil
+	mine, foreign := classify(pids, since)
+	deadline := time.Now().Add(3 * time.Second)
+	for len(mine) > 0 {
+		for _, pid := range mine {
+			_ = syscall.Kill(pid, syscall.SIGKILL)
+			if !slices.Contains(killed, pid) {
+				killed = append(killed, pid)
+			}
+		}
+		if time.Now().After(deadline) {
+			return killed, foreign, fmt.Errorf("%w: %d process(es) of the attempt still hold the roots after SIGKILL: %v", ErrUnavailable, len(mine), mine)
+		}
+		time.Sleep(50 * time.Millisecond)
+		left, err := survivors(roots)
+		if err != nil {
+			return killed, foreign, fmt.Errorf("%w: survivor scan failed: %v", ErrUnavailable, err)
+		}
+		var more []int
+		mine, more = classify(left, since)
+		for _, pid := range more {
+			if !slices.Contains(foreign, pid) {
+				foreign = append(foreign, pid)
+			}
+		}
 	}
-	left, err := killSurvivors(roots, pids)
-	if err != nil {
-		return pids, fmt.Errorf("%w: survivor scan failed: %v", ErrUnavailable, err)
+	sort.Ints(killed)
+	sort.Ints(foreign)
+	if len(foreign) > 0 {
+		return killed, foreign, fmt.Errorf("%w: %d process(es) this attempt did not start hold the roots; they were left running and the attempt is refused: %v", ErrUnavailable, len(foreign), foreign)
 	}
-	if len(left) > 0 {
-		return pids, fmt.Errorf("%w: %d process(es) still hold the roots after SIGKILL: %v", ErrUnavailable, len(left), left)
-	}
-	return pids, nil
+	return killed, nil, nil
 }
 
-// Seal retires the writable roots of a policy once the attempt is over. Both
-// roots are renamed to sibling paths that no profile permits, so a process
-// that escaped the group kill can no longer write into the trees, and every
-// process still holding them is killed. Callers read outputs from the
+// Seal retires the writable roots of a policy once the attempt that started at
+// since is over (Result.Started of its first Run on these roots). Both roots
+// are renamed to sibling paths that no profile permits, so a process that
+// escaped the group kill can no longer open anything in the trees; the
+// attempt's processes still holding them are killed, and holders it did not
+// start make Seal fail without being killed. Callers read outputs from the
 // returned paths; the old paths must not be used again.
-func (s *Seatbelt) Seal(p Policy) (Sealed, error) {
+func (s *Seatbelt) Seal(p Policy, since time.Time) (Sealed, error) {
 	np, err := p.Normalize()
 	if err != nil {
 		return Sealed{}, err
@@ -139,7 +164,6 @@ func (s *Seatbelt) Seal(p Policy) (Sealed, error) {
 	if err := os.Rename(np.ScratchRoot, sealed.ScratchRoot); err != nil {
 		return sealed, fmt.Errorf("%w: seal scratch root: %v", ErrUnavailable, err)
 	}
-	killed, err := reapRoots([]string{sealed.SourceRoot, sealed.ScratchRoot})
-	sealed.Killed = killed
+	sealed.Killed, sealed.Foreign, err = reapRoots([]string{sealed.SourceRoot, sealed.ScratchRoot}, since)
 	return sealed, err
 }

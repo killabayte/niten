@@ -84,8 +84,12 @@ type Result struct {
 	// group (setsid) but still held the roots. They were killed; a run with
 	// stragglers must not be accepted as evidence.
 	Stragglers bool
-	// SurvivorPIDs lists the processes found holding the roots after the run.
+	// SurvivorPIDs lists the run's own processes found holding the roots after
+	// the run; they were killed.
 	SurvivorPIDs []int
+	// ForeignPIDs lists holders of the roots that the run did not start. They
+	// are never killed; their presence refuses the run.
+	ForeignPIDs []int
 }
 
 // systemReadRoots are read-only system prefixes every process needs. The root

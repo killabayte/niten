@@ -137,12 +137,14 @@ func (s *Seatbelt) Run(ctx context.Context, p Policy, cmd Command) (Result, erro
 		res.Stragglers = true
 	}
 	// A descendant may have left the group with setsid while keeping the
-	// profile. Anything that still holds the roots is ours: kill it and say so.
-	killed, sweepErr := reapRoots([]string{np.SourceRoot, np.ScratchRoot})
+	// profile. Holders of the roots that this run started are killed and
+	// reported; holders it did not start are left alone and refuse the run.
+	killed, foreign, sweepErr := reapRoots([]string{np.SourceRoot, np.ScratchRoot}, res.Started)
 	if len(killed) > 0 {
 		res.Stragglers = true
 		res.SurvivorPIDs = killed
 	}
+	res.ForeignPIDs = foreign
 	if sweepErr != nil {
 		return res, sweepErr
 	}

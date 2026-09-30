@@ -194,15 +194,28 @@ Go 1.26.3. No model was called. What the run established:
   it could keep writing inside the roots after `Run` returned with exit 0. macOS has
   no process namespaces, so the backend now sweeps after every run with
   `/usr/sbin/lsof`: every process of the same user that holds an open file, cwd or
-  mapped binary under the roots is killed and reported in `SurvivorPIDs`, and
-  `Stragglers` becomes true. A run with stragglers is not evidence. The second half
-  is `Seal`: when an attempt is over, both roots are renamed to sibling paths that
-  no profile permits, and holders found through the renamed paths are killed. A
-  detached process that holds nothing at sweep time therefore cannot reach the
-  trees later, and outputs are read from the sealed paths only. Two regressions
-  cover a Go child with `setsid` and a detached `/bin/sh` that opens a file three
-  seconds after the run. Known limit: a detached process that holds nothing and
-  never reopens the roots is invisible; it also cannot affect them.
+  mapped binary under the roots and belongs to the run is killed and reported in
+  `SurvivorPIDs`, and `Stragglers` becomes true. A run with stragglers is not evidence.
+  The second half is `Seal(policy, since)`: when an attempt is over, both roots are
+  renamed to sibling paths that no profile permits, and the attempt's holders found
+  through the renamed paths are killed. A detached process that holds nothing at sweep
+  time therefore cannot reach the trees later, and outputs are read from the sealed
+  paths only. Two regressions cover a Go child with `setsid` and a detached `/bin/sh`
+  that opens a file three seconds after the run. Known limit: a detached process that
+  holds nothing and never reopens the roots is invisible; it also cannot affect them.
+- Second review, fixed 2026-09-30: the sweep killed every holder of the roots,
+  including processes the run never started, such as a shell the user had `cd`'d into
+  the copy. A holder now belongs to the attempt only if its kernel start time
+  (`kern.proc.pid`, microseconds) is not earlier than the attempt start and its parent
+  chain reaches the coordinator or launchd (an orphan left by `setsid`) without passing
+  a process that already existed. Any other holder is never killed: it is reported in
+  `ForeignPIDs` and the run or Seal is refused. A holder started during the attempt
+  and orphaned to launchd cannot be told apart from the attempt's own orphan; that
+  residual case is killed. The same review showed that an open descriptor keeps
+  writing into a renamed tree, so an incomplete `lsof` listing (any non-zero exit)
+  now fails the sweep instead of reporting the roots clean. Regressions cover a
+  foreign holder, an incomplete listing, a sealed path told to a detached process, and
+  the `kinfo_proc` layout the start time is read from.
 
 This closes the offline verifier gate of P0a. The executor and reviewer profiles
 remain unprobed, and the seatbelt result is bound to the OS build above.
