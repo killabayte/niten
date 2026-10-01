@@ -119,13 +119,16 @@ func (e *Engine) evaluate(ctx context.Context, u *StepView) (*Outcome, error) {
 		view.Problems = []string{}
 	}
 	view.Digest = evidenceDigest(cand.Commit, results, view.Problems)
+	// Refused proposals of the executor's turn stay with the unit; they block
+	// only through the coverage they leave missing.
+	carried := slices.Clone(u.Problems)
 	tr := transition{Unit: u.ID, Checks: &view}
 	switch {
 	case unknown:
 	case view.Passed:
-		tr.Step = &stepStateData{State: contract.StepReviewing, Repairs: u.Repairs, Problems: []string{}}
+		tr.Step = &stepStateData{State: contract.StepReviewing, Repairs: u.Repairs, Problems: nonNil(carried)}
 	default:
-		tr.Step = &stepStateData{State: contract.StepChangesRequested, Repairs: u.Repairs, Problems: view.Problems}
+		tr.Step = &stepStateData{State: contract.StepChangesRequested, Repairs: u.Repairs, Problems: append(carried, view.Problems...)}
 	}
 	if err := e.emit(evChecks, tr); err != nil {
 		return nil, err

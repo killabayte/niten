@@ -49,7 +49,8 @@ type FakeScript struct {
 }
 
 // FakeModels writes the scenario and two wrapper scripts that run the current
-// test binary as the claude and codex CLIs. TestMain must call MaybeFakeCLI.
+// test binary as the claude and codex CLIs; the wrappers carry the scenario's
+// paths, so tests using them can run in parallel. TestMain must call MaybeFakeCLI.
 // It returns the wrapper paths and the state directory.
 func FakeModels(t *testing.T, dir string, script FakeScript) (claude, codex, state string) {
 	t.Helper()
@@ -65,13 +66,11 @@ func FakeModels(t *testing.T, dir string, script FakeScript) (claude, codex, sta
 	if err := os.WriteFile(sp, b, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv(FakeScriptEnv, sp)
-	t.Setenv(FakeStateEnv, state)
 	bin := filepath.Join(dir, "fake-bin")
 	os.MkdirAll(bin, 0o755)
 	for role, name := range map[string]string{"executor": "claude", "reviewer": "codex"} {
 		p := filepath.Join(bin, name)
-		w := fmt.Sprintf("#!/bin/sh\n%s=%s exec '%s' \"$@\"\n", FakeRoleEnv, role, os.Args[0])
+		w := fmt.Sprintf("#!/bin/sh\n%s=%s %s='%s' %s='%s' exec '%s' \"$@\"\n", FakeRoleEnv, role, FakeScriptEnv, sp, FakeStateEnv, state, os.Args[0])
 		if err := os.WriteFile(p, []byte(w), 0o755); err != nil {
 			t.Fatal(err)
 		}

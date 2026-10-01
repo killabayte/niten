@@ -19,6 +19,10 @@ import (
 
 func TestMain(m *testing.M) {
 	testutil.MaybeFakeCLI()
+	// Git ignores the user's configuration in every test; set once so the
+	// scenarios can run in parallel.
+	os.Setenv("GIT_CONFIG_GLOBAL", os.DevNull)
+	os.Setenv("GIT_CONFIG_NOSYSTEM", "1")
 	os.Exit(m.Run())
 }
 
@@ -42,7 +46,6 @@ type setup struct {
 
 func newWorld(t *testing.T, script testutil.FakeScript, s setup) *world {
 	t.Helper()
-	testutil.IsolateGit(t)
 	dir, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -217,6 +220,7 @@ func readJSON(t *testing.T, e *Engine, rel string, v any) {
 }
 
 func TestTwoStepPlanReachesDoneAfterTheReceipt(t *testing.T) {
+	t.Parallel()
 	w := newWorld(t, happyScript(t), setup{})
 	out, e := w.run()
 	defer e.Close()

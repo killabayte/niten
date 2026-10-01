@@ -19,7 +19,9 @@ func (e *Engine) applyAnswers(raw []byte) (*Outcome, error) {
 	if err := json.Unmarshal(raw, &a); err != nil {
 		return nil, fmt.Errorf("answers: %w", err)
 	}
-	ref := fmt.Sprintf("answers/%06d.json", e.st.LastSeq+1)
+	// Named by content: a refused file records no event, so the journal
+	// position cannot name the next one.
+	ref := "answers/" + digest(raw)[:16] + ".json"
 	if _, err := e.writeOrReuse(ref, raw); err != nil {
 		return nil, err
 	}
@@ -42,7 +44,11 @@ func (e *Engine) applyAnswers(raw []byte) (*Outcome, error) {
 		}
 	}
 	if len(refused) > 0 {
-		return &Outcome{State: e.st.State, Reason: "answers_refused", Detail: refused, Exit: contract.ExitNeedsInput}, nil
+		exit := contract.ExitNeedsInput
+		if e.st.State == contract.RunImplemented {
+			exit = contract.ExitImplemented
+		}
+		return &Outcome{State: e.st.State, Reason: "answers_refused", Detail: refused, Exit: exit}, nil
 	}
 	return nil, nil
 }

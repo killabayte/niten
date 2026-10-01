@@ -117,6 +117,9 @@ func (e *Engine) attempt(ctx context.Context, s attempt.Spec) (*provider.Result,
 	}()
 	res, perr, err := e.runner.Run(ctx, s)
 	close(done)
+	if err == nil && e.crashAfter != nil {
+		err = e.crashAfter(s.ID)
+	}
 	return res, perr, err
 }
 

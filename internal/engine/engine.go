@@ -80,6 +80,9 @@ type Engine struct {
 	verifier    *verify.Verifier
 	exec, rev   model
 	runner      *attempt.Runner
+	// crashAfter is a test hook: a non-nil error stops the engine right after
+	// an attempt, before its result is processed, as a crash would.
+	crashAfter func(turn string) error
 }
 
 // ErrIntegrity means a run file no longer matches what prepare recorded.
