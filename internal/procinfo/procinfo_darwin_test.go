@@ -35,8 +35,15 @@ func TestLayoutAndIdentity(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer leader.Process.Kill()
-	if l, err := Get(leader.Process.Pid); err != nil || l.PGID != leader.Process.Pid {
+	if l, err := Get(leader.Process.Pid); err != nil || l.PGID != leader.Process.Pid || l.PID != leader.Process.Pid {
 		t.Fatalf("group leader %+v %v", l, err)
+	}
+	members, err := InGroup(leader.Process.Pid)
+	if err != nil || len(members) != 1 || members[0].PID != leader.Process.Pid {
+		t.Fatalf("group members %+v %v", members, err)
+	}
+	if none, err := InGroup(999999); err != nil || len(none) != 0 {
+		t.Fatalf("empty group %+v %v", none, err)
 	}
 	done := exec.Command("/usr/bin/true")
 	done.Run()

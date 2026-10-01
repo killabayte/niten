@@ -42,30 +42,63 @@ type Info struct {
 // stored in records.
 func (i Info) StartMicros() int64 { return i.Start.UnixMicro() }
 
+// offPID is extern_proc.p_pid.
+const offPID = 40
+
 // Get reads the identity of pid.
 func Get(pid int) (Info, error) {
-	mib := [4]int32{1, 14, 1, int32(pid)} // CTL_KERN, KERN_PROC, KERN_PROC_PID
-	buf := make([]byte, 1024)
-	n := uintptr(len(buf))
-	_, _, e := syscall.Syscall6(sysSysctl, uintptr(unsafe.Pointer(&mib[0])), uintptr(len(mib)),
-		uintptr(unsafe.Pointer(&buf[0])), uintptr(unsafe.Pointer(&n)), 0, 0)
-	if e != 0 {
-		return Info{}, e
+	recs, err := query([4]int32{1, 14, 1, int32(pid)}) // CTL_KERN, KERN_PROC, KERN_PROC_PID
+	if err != nil {
+		return Info{}, err
 	}
-	if n == 0 {
+	if len(recs) == 0 {
 		return Info{}, ErrNoProcess
 	}
-	if n != kinfoProcSize {
-		return Info{}, fmt.Errorf("kern.proc.pid returned %d bytes, want %d", n, kinfoProcSize)
+	return recs[0], nil
+}
+
+// InGroup lists the processes whose process group is pgid.
+func InGroup(pgid int) ([]Info, error) {
+	return query([4]int32{1, 14, 2, int32(pgid)}) // KERN_PROC_PGRP
+}
+
+func query(mib [4]int32) ([]Info, error) {
+	for attempt := 0; attempt < 4; attempt++ {
+		var n uintptr
+		if _, _, e := syscall.Syscall6(sysSysctl, uintptr(unsafe.Pointer(&mib[0])), uintptr(len(mib)), 0, uintptr(unsafe.Pointer(&n)), 0, 0); e != 0 {
+			return nil, e
+		}
+		if n == 0 {
+			return nil, nil
+		}
+		n += 4 * kinfoProcSize // room for processes started meanwhile
+		buf := make([]byte, n)
+		_, _, e := syscall.Syscall6(sysSysctl, uintptr(unsafe.Pointer(&mib[0])), uintptr(len(mib)),
+			uintptr(unsafe.Pointer(&buf[0])), uintptr(unsafe.Pointer(&n)), 0, 0)
+		if e == syscall.ENOMEM {
+			continue
+		}
+		if e != 0 {
+			return nil, e
+		}
+		if n%kinfoProcSize != 0 {
+			return nil, fmt.Errorf("kern.proc returned %d bytes, not a multiple of %d", n, kinfoProcSize)
+		}
+		var out []Info
+		for off := uintptr(0); off < n; off += kinfoProcSize {
+			r := buf[off : off+kinfoProcSize]
+			sec := int64(binary.LittleEndian.Uint64(r[offStartSec:]))
+			usec := int64(int32(binary.LittleEndian.Uint32(r[offStartUsec:])))
+			out = append(out, Info{
+				PID:   int(int32(binary.LittleEndian.Uint32(r[offPID:]))),
+				Start: time.Unix(sec, usec*int64(time.Microsecond)),
+				PPID:  int(int32(binary.LittleEndian.Uint32(r[offPPID:]))),
+				PGID:  int(int32(binary.LittleEndian.Uint32(r[offPGID:]))),
+			})
+		}
+		return out, nil
 	}
-	sec := int64(binary.LittleEndian.Uint64(buf[offStartSec:]))
-	usec := int64(int32(binary.LittleEndian.Uint32(buf[offStartUsec:])))
-	return Info{
-		PID:   pid,
-		Start: time.Unix(sec, usec*int64(time.Microsecond)),
-		PPID:  int(int32(binary.LittleEndian.Uint32(buf[offPPID:]))),
-		PGID:  int(int32(binary.LittleEndian.Uint32(buf[offPGID:]))),
-	}, nil
+	return nil, errors.New("kern.proc: the process table kept growing")
 }
 
 // Same reports whether pid is still the process that started at startMicros.

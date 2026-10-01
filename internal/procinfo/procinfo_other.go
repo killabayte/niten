@@ -32,3 +32,6 @@ func Get(pid int) (Info, error) { return Info{}, ErrUnsupported }
 
 // Same is always false off macOS.
 func Same(pid int, startMicros int64) bool { return false }
+
+// InGroup always fails off macOS.
+func InGroup(pgid int) ([]Info, error) { return nil, ErrUnsupported }

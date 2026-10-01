@@ -26,14 +26,6 @@ import (
 // variable only so tests can substitute a failing tool.
 var lsofPath = "/usr/sbin/lsof"
 
-// Sealed describes the roots after Seal: their new paths and the holders that
-// were found there. Holders are never killed by Seal; any holder refuses it.
-type Sealed struct {
-	SourceRoot  string
-	ScratchRoot string
-	Foreign     []int
-}
-
 // survivors returns the PIDs of the caller's other processes that have an
 // open file, cwd, root or mapped binary under any of the roots.
 func survivors(roots []string) ([]int, error) {
