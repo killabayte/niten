@@ -24,6 +24,7 @@ const (
 	evProcessed    = "turn.processed"
 	evChecks       = "checks.evaluated"
 	evFinalStarted = "final.started"
+	evDiscarding   = "worktree.discarding"
 	evResidue      = "worktree.restored"
 	evGateOpened   = "gate.opened"
 	evGateReleased = "gate.released"
@@ -135,6 +136,7 @@ type StepView struct {
 	Problems       []string              `json:"problems"`
 	LastExecutor   string                `json:"last_executor_turn,omitempty"`
 	Rejected       []string              `json:"rejected_snapshots"`
+	PendingDiscard *rejectedData         `json:"pending_discard,omitempty"`
 }
 
 // TurnView is one model invocation as the engine sees it.
@@ -311,6 +313,7 @@ type (
 	sessionData struct {
 		Command        string `json:"command"`
 		ContractSHA256 string `json:"contract_sha256"`
+		ConfigSHA256   string `json:"config_sha256,omitempty"`
 	}
 	cloneData struct {
 		Work     string `json:"work"`
@@ -336,10 +339,15 @@ type (
 		SHA       string               `json:"sha256"`
 		Metadata  string               `json:"metadata_fingerprint"`
 	}
+	// rejectedData is a discarded worktree: planned (Discard) with the snapshot
+	// commit already written, then completed (Rejected) once the ref is kept and
+	// the worktree restored, with the metadata fingerprint taken after that.
 	rejectedData struct {
+		Name       string   `json:"name,omitempty"`
+		Commit     string   `json:"commit,omitempty"`
 		Snapshot   string   `json:"snapshot,omitempty"`
 		Violations []string `json:"violations"`
-		Metadata   string   `json:"metadata_fingerprint"`
+		Metadata   string   `json:"metadata_fingerprint,omitempty"`
 	}
 	messageData struct {
 		ID   string               `json:"message_id"`
@@ -358,6 +366,7 @@ type (
 	transition struct {
 		Unit      string         `json:"unit"`
 		Candidate *candidateData `json:"candidate,omitempty"`
+		Discard   *rejectedData  `json:"discard,omitempty"`
 		Rejected  *rejectedData  `json:"rejected,omitempty"`
 		Messages  []messageData  `json:"messages,omitempty"`
 		Findings  []FindingView  `json:"findings,omitempty"`
@@ -451,7 +460,7 @@ func (s *State) apply(ev store.Event) error {
 			s.LimitHistory = append(s.LimitHistory, c)
 		}
 		s.Limits = d.Limits
-	case evStepState, evChecks, evFinalStarted, evResidue:
+	case evStepState, evChecks, evFinalStarted, evResidue, evDiscarding:
 		var d transition
 		if err := decode(&d); err != nil {
 			return err
@@ -572,11 +581,21 @@ func (s *State) applyTransition(d transition, seq int64) error {
 		u.Candidate, u.CandidateRef, u.Checks, u.Review = &cand, c.Ref, nil, nil
 		s.Head, s.Metadata = cand.Commit, c.Metadata
 	}
+	if r := d.Discard; r != nil {
+		if u.PendingDiscard != nil {
+			return fmt.Errorf("unit %s plans a discard while %s is pending", d.Unit, u.PendingDiscard.Snapshot)
+		}
+		c := *r
+		u.PendingDiscard = &c
+	}
 	if r := d.Rejected; r != nil {
 		if r.Snapshot != "" {
 			u.Rejected = append(u.Rejected, r.Snapshot)
 		}
-		s.Metadata = r.Metadata
+		if r.Metadata == "" {
+			return fmt.Errorf("unit %s records a restored worktree without its metadata", d.Unit)
+		}
+		s.Metadata, u.PendingDiscard = r.Metadata, nil
 	}
 	for _, m := range d.Messages {
 		s.Messages = append(s.Messages, m.ID)

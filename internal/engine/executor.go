@@ -108,13 +108,19 @@ func (e *Engine) executorTurn(ctx context.Context, u *StepView) (*Outcome, error
 
 // clearUnrecorded removes roots left under the id of a turn the journal does
 // not have: a crash before the turn was recorded. No attempt can have run
-// there (attempts start only after their turn is recorded), and a root that
-// any process still holds is refused, never removed.
+// there (attempts start only after their turn is recorded).
 func (e *Engine) clearUnrecorded(id string) error {
 	if e.st.Turn(id) != nil {
 		return fmt.Errorf("turn %s is already in the journal", id)
 	}
-	for _, root := range []string{filepath.Join(e.work, "executor", id), filepath.Join(e.work, "control", id), e.reviewBase(id)} {
+	return e.clearLeftovers("an unrecorded turn", filepath.Join(e.work, "executor", id), filepath.Join(e.work, "control", id), e.reviewBase(id))
+}
+
+// clearLeftovers removes roots a crash left before the journal recorded them.
+// A root any process still holds, or whose holders cannot be listed, is
+// refused, never removed.
+func (e *Engine) clearLeftovers(what string, roots ...string) error {
+	for _, root := range roots {
 		if _, err := os.Lstat(root); errors.Is(err, os.ErrNotExist) {
 			continue
 		} else if err != nil {
@@ -122,15 +128,15 @@ func (e *Engine) clearUnrecorded(id string) error {
 		}
 		pids, err := holders.List([]string{root})
 		if err != nil {
-			return fmt.Errorf("the leftover %s cannot be checked: %w", root, err)
+			return fmt.Errorf("the leftover %s of %s cannot be checked: %w", root, what, err)
 		}
 		if len(pids) > 0 {
-			return fmt.Errorf("the leftover %s of an unrecorded turn is held by processes %v", root, pids)
+			return fmt.Errorf("the leftover %s of %s is held by processes %v", root, what, pids)
 		}
 		if err := os.RemoveAll(root); err != nil {
 			return err
 		}
-		e.logf("removed the leftover %s of an unrecorded turn", root)
+		e.logf("removed the leftover %s of %s", root, what)
 	}
 	return nil
 }
@@ -210,37 +216,83 @@ func (e *Engine) cleanResidue(ctx context.Context, u *StepView) (*Outcome, error
 		}
 		return nil, e.emit(evResidue, transition{Unit: u.ID, Rejected: &rejectedData{Violations: []string{}, Metadata: fp}})
 	}
-	rej, out, err := e.discard(ctx, ins, fmt.Sprintf("residue-%03d", len(e.st.Turns)+1), e.o.Now())
+	plan, out, err := e.planDiscard(ctx, ins, fmt.Sprintf("residue-%03d", len(e.st.Turns)+1), e.o.Now())
 	if out != nil || err != nil {
 		return out, err
 	}
-	return nil, e.emit(evResidue, transition{Unit: u.ID, Rejected: rej})
+	if err := e.emit(evDiscarding, transition{Unit: u.ID, Discard: plan}); err != nil {
+		return nil, err
+	}
+	return nil, e.completeDiscard(ctx, u)
 }
 
-// discard keeps a snapshot of the worktree under refs/niten/rejected and
-// restores the worktree to the last candidate. Tampered git metadata stops the
-// run instead: no git command may read a worktree whose metadata a model changed.
-func (e *Engine) discard(ctx context.Context, ins *workspace.Inspection, name string, at time.Time) (*rejectedData, *Outcome, error) {
+// planDiscard writes the commit of the worktree's snapshot, without any ref
+// and without changing anything; the caller records the plan in the journal
+// and only then completeDiscard keeps the snapshot and restores the worktree.
+// So a crash in between never lets a processing see a restored worktree as
+// the attempt's result. Tampered git metadata stops the run instead: no git
+// command may read a worktree whose metadata a model changed.
+func (e *Engine) planDiscard(ctx context.Context, ins *workspace.Inspection, name string, at time.Time) (*rejectedData, *Outcome, error) {
 	if ins.Tree == "" {
 		out, err := e.stop(contract.RunFailed, "clone_tampered", ins.Violations, contract.ExitFormat)
 		return nil, out, err
 	}
-	rej := &rejectedData{Violations: ins.Violations}
-	if rej.Violations == nil {
-		rej.Violations = []string{}
-	}
-	snap, err := e.clone.SaveRejected(ctx, ins, name, at)
+	commit, err := e.clone.Snapshot(ctx, ins, name, at)
 	if err != nil {
 		return nil, nil, err
 	}
-	rej.Snapshot = "refs/niten/rejected/" + name + "@" + snap
+	return &rejectedData{Name: name, Commit: commit, Snapshot: "refs/niten/rejected/" + name + "@" + commit, Violations: nonNil(slices.Clone(ins.Violations))}, nil, nil
+}
+
+// completeDiscard carries out a recorded discard plan: the snapshot is kept
+// under refs/niten/rejected, the worktree restored to the last candidate and
+// the metadata fingerprint taken after that recorded. Every step is
+// idempotent, so recovery completes a plan a crash interrupted.
+func (e *Engine) completeDiscard(ctx context.Context, u *StepView) error {
+	d := u.PendingDiscard
+	if d == nil {
+		return nil
+	}
+	if err := e.crash("discard.planned"); err != nil {
+		return err
+	}
+	if err := e.clone.KeepRejected(ctx, d.Name, d.Commit); err != nil {
+		return err
+	}
+	if err := e.crash("discard.kept"); err != nil {
+		return err
+	}
 	if err := e.clone.Restore(ctx); err != nil {
-		return nil, nil, err
+		return err
 	}
-	if rej.Metadata, err = e.clone.MetadataFingerprint(); err != nil {
-		return nil, nil, err
+	fp, err := e.clone.MetadataFingerprint()
+	if err != nil {
+		return err
 	}
-	return rej, nil, nil
+	done := *d
+	done.Metadata = fp
+	return e.emit(evResidue, transition{Unit: u.ID, Rejected: &done})
+}
+
+// completeDiscards finishes every discard plan a crash left pending.
+func (e *Engine) completeDiscards(ctx context.Context) error {
+	for _, u := range append(slices.Clone(e.st.Steps), e.st.Final) {
+		if u.PendingDiscard != nil {
+			e.logf("%s: completing the recorded discard %s", u.ID, u.PendingDiscard.Snapshot)
+			if err := e.completeDiscard(ctx, u); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// crash is the test hook of named crash points.
+func (e *Engine) crash(point string) error {
+	if e.crashAt != nil {
+		return e.crashAt(point)
+	}
+	return nil
 }
 
 // stopForClass maps a failed attempt to the state the run waits in.
@@ -283,13 +335,16 @@ func (e *Engine) processExecutor(ctx context.Context, t *TurnView, res *provider
 		}
 		pd := processedData{Turn: t.ID, Outcome: OutcomeFailed, Class: string(perr.Class), Reasons: []string{perr.Msg}}
 		if len(ins.Changes) > 0 || len(ins.Violations) > 0 || len(ins.Ignored) > 0 {
-			rej, out, err := e.discard(ctx, ins, t.ID, at)
+			plan, out, err := e.planDiscard(ctx, ins, t.ID, at)
 			if out != nil || err != nil {
 				return out, err
 			}
-			pd.Rejected = rej
+			pd.Discard = plan
 		}
 		if err := e.emit(evProcessed, pd); err != nil {
+			return nil, err
+		}
+		if err := e.completeDiscard(ctx, u); err != nil {
 			return nil, err
 		}
 		return e.stopForClass(perr)
@@ -306,12 +361,15 @@ func (e *Engine) processExecutor(ctx context.Context, t *TurnView, res *provider
 		return nil, err
 	}
 	reject := func(reason string, reasons []string) (*Outcome, error) {
-		rej, out, err := e.discard(ctx, ins, t.ID, at)
+		plan, out, err := e.planDiscard(ctx, ins, t.ID, at)
 		if out != nil || err != nil {
 			return out, err
 		}
 		if err := e.emit(evProcessed, processedData{Turn: t.ID, Outcome: OutcomeRejected, Reasons: reasons, Reported: res.Reported.Model,
-			transition: transition{Rejected: rej}}); err != nil {
+			transition: transition{Discard: plan}}); err != nil {
+			return nil, err
+		}
+		if err := e.completeDiscard(ctx, u); err != nil {
 			return nil, err
 		}
 		return e.stop(contract.RunPaused, reason, reasons, contract.ExitPaused)

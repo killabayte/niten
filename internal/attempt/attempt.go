@@ -101,17 +101,21 @@ type finished struct {
 
 // streamDigests records the digests of an attempt's stream files.
 func streamDigests(run *store.Run, f *finished, stdoutRef, stderrRef string) error {
-	for _, s := range []struct {
-		ref      string
-		dst, sum *string
-	}{{stdoutRef, &f.StdoutRef, &f.StdoutSHA}, {stderrRef, &f.StderrRef, &f.StderrSHA}} {
-		b, err := run.ReadArtifact(s.ref, "")
+	var err error
+	f.StdoutRef, f.StdoutSHA, f.StderrRef, f.StderrSHA, err = digestStreams(run, stdoutRef, stderrRef)
+	return err
+}
+
+func digestStreams(run *store.Run, stdoutRef, stderrRef string) (string, string, string, string, error) {
+	var sums [2]string
+	for i, ref := range []string{stdoutRef, stderrRef} {
+		b, err := run.ReadArtifact(ref, "")
 		if err != nil {
-			return fmt.Errorf("digest the stream %s: %w", s.ref, err)
+			return "", "", "", "", fmt.Errorf("digest the stream %s: %w", ref, err)
 		}
-		*s.dst, *s.sum = s.ref, digest(b)
+		sums[i] = digest(b)
 	}
-	return nil
+	return stdoutRef, sums[0], stderrRef, sums[1], nil
 }
 
 type resolved struct {
@@ -119,6 +123,11 @@ type resolved struct {
 	Reason    string `json:"reason"`
 	ResultRef string `json:"result_ref,omitempty"`
 	ResultSHA string `json:"result_sha256,omitempty"`
+	// The streams a recovered result was parsed from.
+	StdoutRef string `json:"stdout_ref,omitempty"`
+	StdoutSHA string `json:"stdout_sha256,omitempty"`
+	StderrRef string `json:"stderr_ref,omitempty"`
+	StderrSHA string `json:"stderr_sha256,omitempty"`
 	Remains   []int  `json:"remaining_pids,omitempty"`
 	Blocked   bool   `json:"blocked,omitempty"`
 }
@@ -494,6 +503,10 @@ func record(run *store.Run, rec Recovered) error {
 			return err
 		}
 		v.ResultRef, v.ResultSHA = ref, sha
+		dir := "attempts/" + rec.ID
+		if v.StdoutRef, v.StdoutSHA, v.StderrRef, v.StderrSHA, err = digestStreams(run, dir+"/stdout.jsonl", dir+"/stderr.log"); err != nil {
+			return err
+		}
 	case StatusNotStarted:
 		typ = EvNotStarted
 	}

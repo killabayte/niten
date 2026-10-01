@@ -302,6 +302,25 @@ func TestTwoStepPlanReachesDoneAfterTheReceipt(t *testing.T) {
 	if !vetRan {
 		t.Fatalf("the reviewer's check request did not join the final checks: %+v", r.Checks)
 	}
+	// Every file of the run is a projection, the receipt itself, or an
+	// artifact the receipt lists with its digest.
+	listed := map[string]string{}
+	for _, a := range r.Artifacts {
+		listed[a.Ref] = a.SHA
+	}
+	projections := map[string]bool{"state.json": true, "events.jsonl": true, "lock": true, "execution.json": true, "execution.md": true,
+		"receipts/1-done.json": true, "receipts/1-done.md": true}
+	filepath.WalkDir(e.run.Dir, func(p string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return err
+		}
+		rel, _ := filepath.Rel(e.run.Dir, p)
+		rel = filepath.ToSlash(rel)
+		if !projections[rel] && listed[rel] == "" {
+			t.Errorf("%s is neither a projection nor an artifact of the receipt", rel)
+		}
+		return nil
+	})
 	// The final tree holds both functions and all tests.
 	for p, want := range map[string]string{calcGo: calcSubMul, calcTestGo: testSubMul} {
 		b, ok, err := e.clone.FileAt(context.Background(), head, p)

@@ -777,22 +777,54 @@ func (c *Clone) FileAt(ctx context.Context, commit, path string) (data []byte, o
 // The ref is never moved: saving an equal snapshot under the same name again
 // succeeds, a different one fails.
 func (c *Clone) SaveRejected(ctx context.Context, ins *Inspection, name string, at time.Time) (string, error) {
-	if name == "" || strings.ContainsAny(name, "/ \t\n:~^?*[\\") {
-		return "", fmt.Errorf("invalid rejected snapshot name %q", name)
-	}
-	commit, err := c.commitTree(ctx, ins.Tree, ins.Head, "niten: rejected snapshot "+name, at)
+	commit, err := c.Snapshot(ctx, ins, name, at)
 	if err != nil {
 		return "", err
 	}
+	return commit, c.KeepRejected(ctx, name, commit)
+}
+
+// Snapshot writes the commit of an inspected snapshot for a rejected result
+// without any ref: equal inputs give the same commit. KeepRejected then makes
+// it reachable, so the commit can be recorded before anything changes.
+func (c *Clone) Snapshot(ctx context.Context, ins *Inspection, name string, at time.Time) (string, error) {
+	if !validRejectedName(name) {
+		return "", fmt.Errorf("invalid rejected snapshot name %q", name)
+	}
+	if ins.Tree == "" || ins.Head == "" {
+		return "", errors.New("the inspection has no snapshot")
+	}
+	return c.commitTree(ctx, ins.Tree, ins.Head, "niten: rejected snapshot "+name, at)
+}
+
+// KeepRejected points refs/niten/rejected/<name> at commit. It is a
+// compare-and-swap on the ref's absence and a no-op when the ref already
+// points at commit; it never moves an existing ref.
+func (c *Clone) KeepRejected(ctx context.Context, name, commit string) error {
+	if !validRejectedName(name) || !gitSHA(commit) {
+		return fmt.Errorf("invalid rejected snapshot %q at %q", name, commit)
+	}
 	ref := "refs/niten/rejected/" + name
 	if _, err := c.git(ctx, nil, "update-ref", ref, commit, strings.Repeat("0", 40)); err != nil {
-		// Saving the same snapshot again (after a crash) is idempotent.
-		if cur, rerr := c.git(ctx, nil, "rev-parse", "--verify", "--quiet", ref); rerr == nil && strings.TrimSpace(string(cur)) == commit {
-			return commit, nil
+		if cur, rerr := c.Rejected(ctx, name); rerr == nil && cur == commit {
+			return nil
 		}
-		return "", err
+		return err
 	}
-	return commit, nil
+	return nil
+}
+
+// Rejected returns the commit refs/niten/rejected/<name> points at, or "".
+func (c *Clone) Rejected(ctx context.Context, name string) (string, error) {
+	if !validRejectedName(name) {
+		return "", fmt.Errorf("invalid rejected snapshot name %q", name)
+	}
+	out, err := c.git(ctx, nil, "for-each-ref", "--format=%(objectname)", "refs/niten/rejected/"+name)
+	return strings.TrimSpace(string(out)), err
+}
+
+func validRejectedName(name string) bool {
+	return name != "" && !strings.ContainsAny(name, "/ \t\n:~^?*[\\")
 }
 
 // Restore makes the worktree exactly HEAD again: tracked files are reset and

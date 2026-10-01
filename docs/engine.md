@@ -68,6 +68,20 @@ without an outcome is resolved without calling the model again:
 - **An attempt that provably never started** lets the turn run anew.
 - **An unknown outcome** keeps the executor's worktree as a rejected snapshot, restores
   the worktree and asks the user. The next `resume` is that decision.
+
+Every side effect outside the store is recorded before or recognized after a crash:
+
+- **Discards are two-phase.** A rejected, failed or unknown executor result, or a residue
+  in the worktree, is discarded by first writing the snapshot commit (no ref yet) and
+  recording the plan together with the turn's outcome. Only then is the snapshot kept
+  under `refs/niten/rejected/` and the worktree restored, and `worktree.restored`
+  records the metadata fingerprint after it. `resume` completes a plan a crash
+  interrupted before it recovers attempts, so a processing never sees a restored
+  worktree as an attempt's result.
+- **A clone left by a crash before `clone.created`** is never trusted: no model ran in
+  it, so it is removed and made anew, unless a process holds it.
+- **The configuration** the run started with is recorded by digest in its first session;
+  a changed `config.json` stops every later start.
 - **Processes that still hold an attempt** pause the run without touching them.
 
 ## Turns and what is trusted
@@ -234,7 +248,8 @@ content digest, before its entries apply.
 - the clone's branch, tree and worktree equal the head candidate;
 - nothing holds the run's work area;
 - every mandatory criterion is covered (coordinator-owned) or attested (human-owned);
-- every artifact the journal references matches its digest.
+- every artifact the journal references matches its digest, no discard is pending, and
+  every rejected snapshot is kept at its recorded commit.
 
 Then a receipt is written as an immutable version (`receipts/<n>-<status>.json` and
 `.md`), `receipt.saved` is recorded with both digests, `execution.json` and
@@ -249,9 +264,20 @@ before `receipt.saved` therefore rebuilds the same bytes, and the existing files
 reused.
 
 The artifacts the gate verifies are every one the journal references by digest:
-candidate records, messages, check evidence and the streams it binds, attempt prompts,
-streams, outcomes and results, collected reviewer evidence, answers files,
-attestations, earlier receipts, the stored inputs and the contract.
+
+- candidate records and messages;
+- the evidence of every recorded check, and the streams each evidence record binds;
+- attempt prompts, which must equal their turn's packet digest;
+- the streams, outcomes and results of finished attempts, and the results and streams
+  of attempts recovered from a saved stream;
+- collected reviewer evidence, answers files, attestations and earlier receipts;
+- the configuration, the contract and the stored inputs, execution inputs and
+  instruction copies included.
+
+A reference without a digest is an error, never skipped. The gate also requires that
+no discard is pending and that every recorded rejected snapshot is still kept at its
+commit. A test checks the converse: after a run, every file of the run directory is a
+projection, the receipt itself or an artifact the receipt lists with its digest.
 
 The receipt holds the plan identity and digests, the base and final commits, per-step
 acceptance, per-criterion status with evidence, the final checks and review, the ledger,
@@ -309,7 +335,11 @@ go-two-step fixture, a two-step plan on a small Go module published by Shogun's 
     accepted check;
   - a missing check stream failing the final gate, a receipt rebuilt byte for byte
     after a crash, leftover roots of an unrecorded turn (free and held), and crash
-    downtime kept out of the active time.
+    downtime kept out of the active time;
+  - a recovered result checked by the final gate, a clone left by a crash before
+    `clone.created` (free and held), a discard interrupted before and after its
+    snapshot ref, a receipt recorded once after a crash, a changed configuration, and
+    every run file covered by the receipt.
 
 The prompt-injection scenarios check mechanical boundaries: roles, profiles, packets and
 provenance. They do not claim that any model is robust against injection.

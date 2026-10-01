@@ -73,6 +73,7 @@ type Engine struct {
 	c           *plan.Contract
 	doc         *plan.Document
 	contractSHA string
+	configSHA   string
 	cfg         config.Config
 	st          *State
 	work        string
@@ -82,6 +83,9 @@ type Engine struct {
 	runner      *attempt.Runner
 	// inSession is set once this process recorded its session boundary.
 	inSession bool
+	// crashAt is a test hook: a non-nil error at a named point stops the
+	// engine there, as a crash would.
+	crashAt func(point string) error
 	// crashAfter is a test hook: a non-nil error stops the engine right after
 	// an attempt, before its result is processed, as a crash would.
 	crashAfter func(turn string) error
@@ -142,17 +146,16 @@ func (e *Engine) load() error {
 		return fmt.Errorf("%w: contract.json: %v", ErrIntegrity, err)
 	}
 	e.contractSHA = digest(cb)
-	want := ""
 	for _, ev := range e.events {
 		if ev.Type == evSession {
 			var d sessionData
 			if err := json.Unmarshal(ev.Data, &d); err != nil {
 				return fmt.Errorf("%w: event %d: %v", store.ErrCorrupt, ev.Seq, err)
 			}
-			want = d.ContractSHA256
 			break
 		}
 	}
+	want := firstSession(e.events).ContractSHA256
 	if want == "" {
 		var prepared struct {
 			ContractSHA256 string `json:"contract_sha256"`
@@ -186,6 +189,10 @@ func (e *Engine) load() error {
 	if err != nil {
 		return fmt.Errorf("%w: config.json: %v", ErrIntegrity, err)
 	}
+	e.configSHA = digest(cfgBytes)
+	if recorded := firstSession(e.events).ConfigSHA256; recorded != "" && recorded != e.configSHA {
+		return fmt.Errorf("%w: config.json changed since the run started (sha256 %s, recorded %s)", ErrIntegrity, e.configSHA, recorded)
+	}
 	var loaded config.Loaded
 	if err := json.Unmarshal(cfgBytes, &loaded); err != nil {
 		return fmt.Errorf("%w: config.json: %v", ErrIntegrity, err)
@@ -210,6 +217,19 @@ func (e *Engine) load() error {
 	}
 	e.work = filepath.Join(e.o.Store.Root, "work", c.RunID)
 	return nil
+}
+
+// firstSession is the data of the run's first session event: the digests of
+// the contract and the configuration the run started with.
+func firstSession(events []store.Event) sessionData {
+	var d sessionData
+	for _, ev := range events {
+		if ev.Type == evSession {
+			_ = json.Unmarshal(ev.Data, &d)
+			return d
+		}
+	}
+	return d
 }
 
 // initialState is the projection right after prepare.
@@ -330,10 +350,13 @@ func (e *Engine) Resume(ctx context.Context, r ResumeOptions) (Outcome, error) {
 		// The journal ends inside a session: the coordinator crashed. Mark the
 		// boundary before recovery records anything, so the downtime is not
 		// counted as active time.
-		if err := e.emit(evSession, sessionData{Command: "recover", ContractSHA256: e.contractSHA}); err != nil {
+		if err := e.emit(evSession, sessionData{Command: "recover", ContractSHA256: e.contractSHA, ConfigSHA256: e.configSHA}); err != nil {
 			return e.failure(err)
 		}
 		e.inSession = true
+	}
+	if err := e.completeDiscards(ctx); err != nil {
+		return e.failure(err)
 	}
 	if out, err := e.recoverAttempts(ctx); err != nil || out != nil {
 		if err != nil {
@@ -392,7 +415,7 @@ func (e *Engine) session(ctx context.Context, command string) (Outcome, error) {
 		}
 	}
 	if !e.inSession {
-		if err := e.emit(evSession, sessionData{Command: command, ContractSHA256: e.contractSHA}); err != nil {
+		if err := e.emit(evSession, sessionData{Command: command, ContractSHA256: e.contractSHA, ConfigSHA256: e.configSHA}); err != nil {
 			return e.failure(err)
 		}
 		e.inSession = true
@@ -737,10 +760,17 @@ func (e *Engine) advancedByPendingTurn(ctx context.Context, c *workspace.Clone, 
 	return false
 }
 
-// createClone makes the run's owned clone at the base commit.
+// createClone makes the run's owned clone at the base commit. A clone left
+// by a crash before clone.created was recorded is never trusted: no model ran
+// in it (turns need a recorded clone), so it is removed, unless a process
+// still holds it, and made anew.
 func (e *Engine) createClone(ctx context.Context) error {
 	repo := e.c.Repos[0]
-	c, err := workspace.CreateClone(ctx, repo.Path, repo.BaseCommit, filepath.Join(e.work, "clone"), filepath.Join(e.work, "gitdir"))
+	work, gitdir := filepath.Join(e.work, "clone"), filepath.Join(e.work, "gitdir")
+	if err := e.clearLeftovers("an unrecorded clone", work, gitdir); err != nil {
+		return err
+	}
+	c, err := workspace.CreateClone(ctx, repo.Path, repo.BaseCommit, work, gitdir)
 	if err != nil {
 		return fmt.Errorf("create the run's clone: %w", err)
 	}

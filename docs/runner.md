@@ -170,7 +170,7 @@ is not repeated; an interrupted recovery reuses its own identical artifact:
 | started, no outcome, recorded process alive with its recorded start time | the group is stopped, then as below |
 | started, members of a dead leader's group remain | `outcome_unknown`, processes reported, never signalled; the run is blocked |
 | started or intent, the attempt's directory is held by any process, or the holders cannot be listed | `outcome_unknown`, blocked until nothing holds it |
-| started, no outcome, nothing holds the directory, complete result in the saved stream | `recovered` without a new model call; the result notes that the exit status is unknown |
+| started, no outcome, nothing holds the directory, complete result in the saved stream | `recovered` without a new model call; the result notes that the exit status is unknown, and the event records the digests of the result and both streams |
 | started, no outcome, incomplete or empty stream | `outcome_unknown` |
 | intent only, stream files exist | `outcome_unknown`: the prompt is delivered only after `attempt.started`, so the stream is never a result |
 | intent only, stream files never created | `not_started` |

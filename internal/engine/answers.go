@@ -125,8 +125,11 @@ func (e *Engine) attest(in contract.AttestationInput) (string, error) {
 	if err := contract.ValidateRecord(contract.RecordAttestation, b); err != nil {
 		return fmt.Sprintf("attestation %s: %v", in.CriterionID, err), nil
 	}
-	ref := fmt.Sprintf("attestations/%s-%06d.json", in.CriterionID, e.st.LastSeq+1)
-	sha, err := e.writeOrReuse(ref, append(b, '\n'))
+	// Named by content: a crash before the event leaves an unreferenced file,
+	// never a name the next submission would collide with.
+	b = append(b, '\n')
+	ref := fmt.Sprintf("attestations/%s-%s.json", in.CriterionID, digest(b)[:16])
+	sha, err := e.writeOrReuse(ref, b)
 	if err != nil {
 		return "", err
 	}

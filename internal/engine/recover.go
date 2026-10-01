@@ -89,15 +89,18 @@ func (e *Engine) unknownTurn(ctx context.Context, t *TurnView, reason string) (*
 			return nil, err
 		}
 		if len(ins.Changes) > 0 || len(ins.Violations) > 0 || len(ins.Ignored) > 0 {
-			rej, out, err := e.discard(ctx, ins, t.ID, turnTime(t))
+			plan, out, err := e.planDiscard(ctx, ins, t.ID, turnTime(t))
 			if out != nil || err != nil {
 				return out, err
 			}
-			pd.Rejected = rej
-			detail = append(detail, "its changes are kept at "+rej.Snapshot)
+			pd.Discard = plan
+			detail = append(detail, "its changes are kept at "+plan.Snapshot)
 		}
 	}
 	if err := e.emit(evProcessed, pd); err != nil {
+		return nil, err
+	}
+	if err := e.completeDiscard(ctx, e.st.Unit(t.Unit)); err != nil {
 		return nil, err
 	}
 	detail = append(detail, "resume again to run the turn anew")

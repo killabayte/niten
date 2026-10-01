@@ -177,6 +177,17 @@ func (e *Engine) finish(ctx context.Context) (*Outcome, error) {
 	for _, t := range e.st.Turns {
 		gate(t.Outcome != "", "turn %s was never processed", t.ID)
 	}
+	for _, u := range append(slices.Clone(e.st.Steps), f) {
+		gate(u.PendingDiscard == nil, "%s has an unfinished discard %v", u.ID, u.PendingDiscard)
+		if e.clone == nil {
+			continue
+		}
+		for _, snap := range u.Rejected {
+			ref, commit, _ := strings.Cut(snap, "@")
+			cur, err := e.clone.Rejected(ctx, strings.TrimPrefix(ref, "refs/niten/rejected/"))
+			gate(err == nil && cur == commit, "the rejected snapshot %s is not kept at %s", ref, commit)
+		}
+	}
 	if e.clone != nil {
 		h, err := e.clone.Head(ctx)
 		gate(err == nil && h == head, "the clone's branch is not at the head candidate")
@@ -328,9 +339,12 @@ func (e *Engine) tracesTo(spec *CheckSpec, criterion string) bool {
 }
 
 // verifyArtifacts re-reads every artifact the events reference with its
-// recorded digest: candidate records, messages, check evidence and the streams
-// each evidence record binds, attempt prompts, streams, outcomes and results,
-// collected reviewer evidence, answers, attestations, receipts and the inputs.
+// recorded digest: candidate records, messages, check evidence (every recorded
+// check) and the streams each evidence record binds, attempt prompts (which
+// must equal their turn's packet), streams, outcomes and results of finished
+// and recovered attempts, collected reviewer evidence, answers, attestations,
+// receipts, the configuration and the stored inputs. A reference without a
+// digest is an error, never skipped.
 func (e *Engine) verifyArtifacts(events []store.Event) ([]artifactRef, error) {
 	seen := map[string]bool{}
 	var out []artifactRef
@@ -341,6 +355,7 @@ func (e *Engine) verifyArtifacts(events []store.Event) ([]artifactRef, error) {
 		}
 	}
 	var evidence []CheckOutcome
+	packets := map[string]string{}
 	for _, ev := range events {
 		switch ev.Type {
 		case evProcessed, evChecks, evFinalStarted, evResidue, evStepState:
@@ -360,15 +375,53 @@ func (e *Engine) verifyArtifacts(events []store.Event) ([]artifactRef, error) {
 			if d.Checks != nil {
 				evidence = append(evidence, d.Checks.Results...)
 			}
+		case evTurn:
+			var d TurnView
+			if err := json.Unmarshal(ev.Data, &d); err != nil {
+				return nil, err
+			}
+			packets[d.ID] = d.PacketSHA
 		case attempt.EvIntent:
 			var d struct {
+				ID        string `json:"id"`
 				PromptRef string `json:"prompt_ref"`
 				PromptSHA string `json:"prompt_sha256"`
 			}
 			if err := json.Unmarshal(ev.Data, &d); err != nil {
 				return nil, err
 			}
+			if want, ok := packets[d.ID]; ok && want != d.PromptSHA {
+				return nil, fmt.Errorf("attempt %s sent a prompt with digest %s, its turn recorded %s", d.ID, d.PromptSHA, want)
+			}
 			add(d.PromptRef, d.PromptSHA)
+		case attempt.EvRecovered:
+			var d struct {
+				ResultRef string `json:"result_ref"`
+				ResultSHA string `json:"result_sha256"`
+				StdoutRef string `json:"stdout_ref"`
+				StdoutSHA string `json:"stdout_sha256"`
+				StderrRef string `json:"stderr_ref"`
+				StderrSHA string `json:"stderr_sha256"`
+			}
+			if err := json.Unmarshal(ev.Data, &d); err != nil {
+				return nil, err
+			}
+			if d.ResultRef == "" || d.ResultSHA == "" {
+				return nil, fmt.Errorf("event %d records a recovered attempt without its result digest", ev.Seq)
+			}
+			add(d.ResultRef, d.ResultSHA)
+			add(d.StdoutRef, d.StdoutSHA)
+			add(d.StderrRef, d.StderrSHA)
+		case "check.recorded":
+			var d struct {
+				CheckID string `json:"check_id"`
+				Ref     string `json:"evidence_ref"`
+				SHA     string `json:"evidence_sha256"`
+			}
+			if err := json.Unmarshal(ev.Data, &d); err != nil {
+				return nil, err
+			}
+			evidence = append(evidence, CheckOutcome{ID: d.CheckID, EvidenceRef: d.Ref, EvidenceSHA: d.SHA})
 		case attempt.EvFinished:
 			var d struct {
 				OutcomeRef string `json:"outcome_ref"`
@@ -418,6 +471,9 @@ func (e *Engine) verifyArtifacts(events []store.Event) ([]artifactRef, error) {
 		if seen[r.EvidenceRef] {
 			continue
 		}
+		if r.EvidenceRef == "" || r.EvidenceSHA == "" {
+			return nil, fmt.Errorf("check %s is recorded without its evidence digest", r.ID)
+		}
 		add(r.EvidenceRef, r.EvidenceSHA)
 		_, ev, err := e.evidence(r)
 		if err != nil {
@@ -433,6 +489,13 @@ func (e *Engine) verifyArtifacts(events []store.Event) ([]artifactRef, error) {
 	add(e.c.Inputs.Receipt.Stored, e.c.Inputs.Receipt.SHA256)
 	add(e.c.Inputs.Manifest.Stored, e.c.Inputs.Manifest.SHA256)
 	add("contract.json", e.contractSHA)
+	add("config.json", firstSession(events).ConfigSHA256)
+	for _, in := range e.c.Inputs.Execution {
+		add(in.Stored, in.SHA256)
+	}
+	for _, in := range e.c.Repos[0].Instructions {
+		add(in.Stored, in.SHA256)
+	}
 	for _, a := range out {
 		if _, err := e.run.ReadArtifact(a.Ref, a.SHA); err != nil {
 			return nil, err
@@ -508,8 +571,13 @@ func (e *Engine) saveReceipt(status contract.RunState) error {
 	if err != nil {
 		return err
 	}
-	if err := e.emit(evReceipt, ReceiptView{Status: string(status), Ref: base + ".json", SHA: sha, MDRef: base + ".md", MDSHA: mdSHA, Candidate: r.Final.Commit}); err != nil {
-		return err
+	rv := ReceiptView{Status: string(status), Ref: base + ".json", SHA: sha, MDRef: base + ".md", MDSHA: mdSHA, Candidate: r.Final.Commit}
+	// A crash after receipt.saved but before the run state: the same receipt
+	// is already recorded and is not recorded twice.
+	if !slices.Contains(e.st.Receipts, rv) {
+		if err := e.emit(evReceipt, rv); err != nil {
+			return err
+		}
 	}
 	if _, err := e.run.Replace("execution.json", b); err != nil {
 		return err

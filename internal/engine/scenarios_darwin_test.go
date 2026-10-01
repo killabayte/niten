@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/killabayte/niten/internal/attempt"
 	"github.com/killabayte/niten/internal/config"
 	"github.com/killabayte/niten/internal/contract"
 	"github.com/killabayte/niten/internal/testutil"
@@ -1105,5 +1106,186 @@ func TestLeftoverRootsOfAnUnrecordedTurn(t *testing.T) {
 				t.Fatalf("a free leftover: %+v %v", out, err)
 			}
 		})
+	}
+}
+
+// A result recovered from a saved stream is evidence like any other: the
+// final gate verifies it, and its absence keeps the run from done.
+func TestRecoveredResultIsPartOfTheFinalGate(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t, happyScript(t), setup{})
+	e := w.open()
+	id := "t001-s-001-implement"
+	e.crashAfter = func(turn string) error {
+		if turn == id {
+			return errors.New("simulated crash")
+		}
+		return nil
+	}
+	if _, err := e.Run(context.Background()); err == nil {
+		e.Close()
+		t.Fatal("no crash")
+	}
+	e.Close()
+	// The crash came after a complete stream, before the outcome was saved.
+	dropTrailing(t, w, evRunState)
+	dropTrailing(t, w, attempt.EvFinished)
+	for _, name := range []string{"outcome.json", "result.json"} {
+		if err := os.Remove(filepath.Join(w.store.RunDir(w.runID), "attempts", id, name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	e = w.open()
+	defer e.Close()
+	removed := ""
+	e.crashAfter = func(turn string) error {
+		if e.st.Turn(turn).Kind != KindFinalReview {
+			return nil
+		}
+		removed = "attempts/" + id + "/recovered-result.json"
+		p, err := e.run.Path(removed)
+		if err != nil {
+			return err
+		}
+		return os.Remove(p)
+	}
+	out, err := e.Resume(context.Background(), ResumeOptions{})
+	if err != nil || removed == "" {
+		t.Fatalf("resume: %+v %v, removed %q", out, err, removed)
+	}
+	want(t, out, contract.RunPaused, "final_gate", "an artifact does not match its digest")
+	if e.State().Turn(id).Outcome != OutcomeApplied {
+		t.Fatalf("the recovered result was not applied: %s", e.State().Turn(id).Outcome)
+	}
+}
+
+// A clone a crash left before clone.created was recorded is removed and made
+// anew; one a process holds is refused.
+func TestCloneLeftoverOfACrashedStart(t *testing.T) {
+	t.Parallel()
+	for _, held := range []bool{false, true} {
+		t.Run(map[bool]string{false: "free", true: "held"}[held], func(t *testing.T) {
+			t.Parallel()
+			w := newWorld(t, happyScript(t), setup{})
+			e := w.open()
+			ctx := context.Background()
+			if err := e.setup(ctx); err != nil {
+				e.Close()
+				t.Fatal(err)
+			}
+			if err := e.emit(evSession, sessionData{Command: "run", ContractSHA256: e.contractSHA, ConfigSHA256: e.configSHA}); err != nil {
+				e.Close()
+				t.Fatal(err)
+			}
+			if err := e.createClone(ctx); err != nil {
+				e.Close()
+				t.Fatal(err)
+			}
+			work := e.clone.Work
+			e.Close()
+			dropTrailing(t, w, evClone)
+			if held {
+				cmd := exec.Command("/bin/sleep", "60")
+				cmd.Dir = work
+				if err := cmd.Start(); err != nil {
+					t.Fatal(err)
+				}
+				defer func() { cmd.Process.Kill(); cmd.Wait() }()
+			}
+			e = w.open()
+			defer e.Close()
+			out, err := e.Run(ctx)
+			if held {
+				if err == nil || !strings.Contains(err.Error(), "held by processes") {
+					t.Fatalf("a held leftover clone: %+v %v", out, err)
+				}
+				return
+			}
+			if err != nil || out.State != contract.RunDone {
+				t.Fatalf("restart after a crash in clone creation: %+v %v", out, err)
+			}
+		})
+	}
+}
+
+// A discard is recorded before it changes anything: a crash before the
+// snapshot ref is kept, or after it but before the worktree is restored, is
+// completed on resume, and the rejected result never becomes a candidate.
+func TestDiscardSurvivesACrash(t *testing.T) {
+	t.Parallel()
+	for _, point := range []string{"discard.planned", "discard.kept"} {
+		t.Run(point, func(t *testing.T) {
+			t.Parallel()
+			a := s1(t)
+			a.Write[".claude/settings.json"] = `{"permissions":{"allow":["Bash(*)"]}}`
+			w := newWorld(t, testutil.FakeScript{Executor: []testutil.FakeAction{a}}, setup{})
+			e := w.open()
+			e.crashAt = func(p string) error {
+				if p == point {
+					return errors.New("simulated crash")
+				}
+				return nil
+			}
+			if _, err := e.Run(context.Background()); err == nil {
+				e.Close()
+				t.Fatal("no crash")
+			}
+			e.Close()
+			dropTrailing(t, w, evRunState)
+			out, e := w.resume(ResumeOptions{})
+			defer e.Close()
+			// The next executor call has no scripted action: a transport pause.
+			want(t, out, contract.RunPaused, "transport", "no scripted action")
+			u := e.State().Unit("S-001")
+			if u.PendingDiscard != nil || len(u.Rejected) != 1 || e.State().Turn("t001-s-001-implement").Outcome != OutcomeRejected {
+				t.Fatalf("discard: pending %+v, rejected %v", u.PendingDiscard, u.Rejected)
+			}
+			ref, commit, _ := strings.Cut(u.Rejected[0], "@")
+			if cur, _ := e.clone.Rejected(context.Background(), strings.TrimPrefix(ref, "refs/niten/rejected/")); cur != commit {
+				t.Fatalf("the snapshot ref points at %q, want %s", cur, commit)
+			}
+			if w.head(e) != testutil.CalcHead || u.Candidate != nil {
+				t.Fatal("the rejected result became a candidate")
+			}
+			if _, err := os.Stat(filepath.Join(e.clone.Work, ".claude")); !errors.Is(err, os.ErrNotExist) {
+				t.Fatal("the worktree was not restored")
+			}
+		})
+	}
+}
+
+// A crash after receipt.saved but before the run state records the receipt once.
+func TestReceiptIsRecordedOnceAfterACrash(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t, happyScript(t), setup{})
+	out, e := w.run()
+	if out.State != contract.RunDone {
+		e.Close()
+		t.Fatalf("fixture: %+v", out)
+	}
+	e.Close()
+	dropTrailing(t, w, evRunState)
+	out, e = w.resume(ResumeOptions{})
+	defer e.Close()
+	if out.State != contract.RunDone || len(e.State().Receipts) != 1 {
+		t.Fatalf("outcome %+v, receipts %+v", out, e.State().Receipts)
+	}
+}
+
+// The configuration a run started with cannot change under it.
+func TestConfigChangeIsRefused(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t, testutil.FakeScript{Executor: []testutil.FakeAction{{Payload: json.RawMessage(`{}`)}}}, setup{})
+	out, e := w.run()
+	want(t, out, contract.RunPaused, "invalid_result", "payload")
+	e.Close()
+	p := filepath.Join(w.store.RunDir(w.runID), "config.json")
+	b, _ := os.ReadFile(p)
+	os.Chmod(p, 0o600)
+	if err := os.WriteFile(p, append(b, ' '), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(Options{Store: w.store, RunID: w.runID}); !errors.Is(err, ErrIntegrity) {
+		t.Fatalf("open with a changed config: %v", err)
 	}
 }

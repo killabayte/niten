@@ -53,12 +53,13 @@ func TestReducerRefusesInconsistentEvents(t *testing.T) {
 		}
 	}
 	for name, e := range map[string]store.Event{
-		"processed twice": ev(3, "2026-10-01T10:00:02Z", evProcessed, processedData{Turn: turn.ID, Outcome: OutcomeApplied}),
-		"started twice":   ev(3, "2026-10-01T10:00:02Z", evTurn, turn),
-		"unknown turn":    ev(3, "2026-10-01T10:00:02Z", evProcessed, processedData{Turn: "t999", Outcome: OutcomeApplied}),
-		"unknown unit":    ev(3, "2026-10-01T10:00:02Z", evStepState, transition{Unit: "S-404", Step: &stepStateData{State: contract.StepImplementing}}),
-		"closed gate":     ev(3, "2026-10-01T10:00:02Z", evGateReleased, gateReleasedData{Gate: "gate-x"}),
-		"bad data":        {Seq: 3, Time: "2026-10-01T10:00:02Z", Type: evTurn, Data: json.RawMessage(`"x"`)},
+		"processed twice":           ev(3, "2026-10-01T10:00:02Z", evProcessed, processedData{Turn: turn.ID, Outcome: OutcomeApplied}),
+		"started twice":             ev(3, "2026-10-01T10:00:02Z", evTurn, turn),
+		"unknown turn":              ev(3, "2026-10-01T10:00:02Z", evProcessed, processedData{Turn: "t999", Outcome: OutcomeApplied}),
+		"unknown unit":              ev(3, "2026-10-01T10:00:02Z", evStepState, transition{Unit: "S-404", Step: &stepStateData{State: contract.StepImplementing}}),
+		"closed gate":               ev(3, "2026-10-01T10:00:02Z", evGateReleased, gateReleasedData{Gate: "gate-x"}),
+		"bad data":                  {Seq: 3, Time: "2026-10-01T10:00:02Z", Type: evTurn, Data: json.RawMessage(`"x"`)},
+		"restored without metadata": ev(3, "2026-10-01T10:00:02Z", evResidue, transition{Unit: "S-001", Rejected: &rejectedData{Violations: []string{}}}),
 	} {
 		c := *s
 		if err := c.apply(e); !errors.Is(err, store.ErrCorrupt) {
@@ -183,5 +184,27 @@ func TestAcceptedChecksAreNeverReplaced(t *testing.T) {
 	u.addSpecs([]CheckSpec{{ID: "S-001/go-test"}})
 	if len(u.Specs) != 1 || len(u.Specs[0].Expected.StdoutContains) != 1 {
 		t.Fatalf("specs %+v", u.Specs)
+	}
+}
+
+// A discard is planned once and completed once; a second plan while one is
+// pending is corruption.
+func TestDiscardPlanIsCompletedOnce(t *testing.T) {
+	s := newState("r", "c", "p", "base", []string{"S-001"}, Limits{})
+	plan := &rejectedData{Name: "t001", Commit: strings.Repeat("1", 40), Snapshot: "refs/niten/rejected/t001@" + strings.Repeat("1", 40), Violations: []string{}}
+	if err := s.apply(ev(1, "2026-10-01T10:00:00Z", evDiscarding, transition{Unit: "S-001", Discard: plan})); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.apply(ev(2, "2026-10-01T10:00:01Z", evDiscarding, transition{Unit: "S-001", Discard: plan})); !errors.Is(err, store.ErrCorrupt) {
+		t.Fatalf("a second plan: %v", err)
+	}
+	done := *plan
+	done.Metadata = "fp"
+	if err := s.apply(ev(2, "2026-10-01T10:00:01Z", evResidue, transition{Unit: "S-001", Rejected: &done})); err != nil {
+		t.Fatal(err)
+	}
+	u := s.Unit("S-001")
+	if u.PendingDiscard != nil || len(u.Rejected) != 1 || s.Metadata != "fp" {
+		t.Fatalf("after completion: %+v %v %s", u.PendingDiscard, u.Rejected, s.Metadata)
 	}
 }
