@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/killabayte/niten/internal/pathglob"
@@ -470,6 +471,65 @@ func (v linkView) escapes(p string) (bool, string) {
 	return false, ""
 }
 
+// escapesOnDisk resolves the worktree symlink at rel against the worktree
+// itself: each component is looked up with Lstat, so the file system applies
+// its own name semantics (case and Unicode normalization insensitivity on
+// APFS, for example), and every symlink is followed before a later ".." is
+// applied. A component that does not exist is taken as a plain name. It
+// reports a resolution that leaves the worktree, through an absolute target, a
+// ".." above the root or a loop.
+func (c *Clone) escapesOnDisk(rel string) (bool, string, error) {
+	target, err := os.Readlink(filepath.Join(c.Work, filepath.FromSlash(rel)))
+	if err != nil {
+		return false, "", err
+	}
+	if strings.HasPrefix(target, "/") {
+		return true, "absolute target", nil
+	}
+	var stack []string
+	if dir := path.Dir(rel); dir != "." {
+		stack = strings.Split(dir, "/")
+	}
+	queue := strings.Split(target, "/")
+	hops := 0
+	for len(queue) > 0 {
+		comp := queue[0]
+		queue = queue[1:]
+		switch comp {
+		case "", ".":
+			continue
+		case "..":
+			if len(stack) == 0 {
+				return true, "resolves above the repository root", nil
+			}
+			stack = stack[:len(stack)-1]
+			continue
+		}
+		p := filepath.Join(append([]string{c.Work}, append(append([]string{}, stack...), comp)...)...)
+		fi, err := os.Lstat(p)
+		if err == nil && fi.Mode()&fs.ModeSymlink != 0 {
+			hops++
+			if hops > maxHops {
+				return true, "symlink loop", nil
+			}
+			t, err := os.Readlink(p)
+			if err != nil {
+				return false, "", err
+			}
+			if strings.HasPrefix(t, "/") {
+				return true, "resolves through " + comp + " to an absolute target", nil
+			}
+			queue = append(strings.Split(t, "/"), queue...)
+			continue
+		}
+		if err != nil && !errors.Is(err, fs.ErrNotExist) && !errors.Is(err, syscall.ENOTDIR) {
+			return false, "", err
+		}
+		stack = append(stack, comp)
+	}
+	return false, "", nil
+}
+
 // treeLinks reads the symlinks of a tree.
 func (c *Clone) treeLinks(ctx context.Context, treeish string) (linkView, error) {
 	entries, err := c.treeEntries(ctx, treeish)
@@ -496,7 +556,7 @@ func (c *Clone) treeLinks(ctx context.Context, treeish string) (linkView, error)
 }
 
 // checkLinks resolves every symlink of the snapshot and every ignored symlink
-// of the worktree together, as the file system would, and reports each one
+// of the worktree on the worktree's own file system, and reports each one
 // that leaves the repository. A symlink that is unchanged from HEAD and
 // already left the repository there is the base's own and is not a
 // violation; any other escape is, including an unchanged symlink that now
@@ -520,7 +580,10 @@ func (c *Clone) checkLinks(ctx context.Context, head string, ins *Inspection, ig
 	sort.Strings(paths)
 	bad := map[string]bool{}
 	for _, p := range paths {
-		esc, why := cur.escapes(p)
+		esc, why, err := c.escapesOnDisk(p)
+		if err != nil {
+			return err
+		}
 		if !esc {
 			continue
 		}

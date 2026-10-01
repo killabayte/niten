@@ -492,3 +492,46 @@ func TestBaseSymlinkOutsideIsNotAViolation(t *testing.T) {
 		t.Fatal("a changed outside link was accepted")
 	}
 }
+
+// Review regression (P2, round 4): name lookup follows the file system. On a
+// case-insensitive (and normalization-insensitive) file system, a target that
+// spells a symlink differently still goes through it.
+func TestSymlinkResolutionUsesTheFileSystemNames(t *testing.T) {
+	for _, tc := range []struct {
+		name, link, spelled string
+		ignored             bool
+	}{
+		{"case tracked", "alias", "ALIAS", false},
+		{"case ignored", "alias", "ALIAS", true},
+		{"unicode normalization", "café", "café", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, c := newClone(t)
+			ctx := context.Background()
+			outside := filepath.Join(filepath.Dir(c.Work), "outside")
+			os.WriteFile(outside, []byte("outside the clone"), 0o600)
+			os.Symlink(".", filepath.Join(c.Work, tc.link))
+			if _, err := os.Lstat(filepath.Join(c.Work, tc.spelled)); err != nil {
+				t.Skip("this file system distinguishes the two spellings")
+			}
+			os.Symlink(tc.spelled+"/../outside", filepath.Join(c.Work, "escape"))
+			if real, _ := filepath.EvalSymlinks(filepath.Join(c.Work, "escape")); real != outside {
+				t.Fatalf("fixture resolves to %s", real)
+			}
+			write(t, c.Work, "a.go", "package changed\n")
+			if tc.ignored {
+				write(t, c.Work, ".gitignore", tc.link+"\nescape\n")
+			}
+			ins, err := c.Inspect(ctx, rules(t, c, "a.go"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(strings.Join(ins.Violations, " "), "escape: symlink to") {
+				t.Fatalf("violations %v", ins.Violations)
+			}
+			if _, err := c.Commit(ctx, ins, "candidate", time.Now()); err == nil {
+				t.Fatal("committed")
+			}
+		})
+	}
+}

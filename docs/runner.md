@@ -57,14 +57,16 @@ the live probes are separately authorized. The engine that drives these pieces (
   pointer stops the inspection before any git command reads the worktree. Inspect also
   walks the physical worktree, independent of ignore rules: a protected or instruction
   path that git ignores, or a nested `.git` directory, is a hard violation; other ignored
-  files are listed and are not part of the candidate. Symlinks are resolved together, the
-  committed ones of the snapshot and the ignored ones of the worktree, component by
-  component as the file system does: every symlink is followed before a later `..` is
-  applied, so `alias -> .` with `escape -> alias/../x` leaves the repository even though
-  `path.Clean` would say otherwise. An absolute target, a resolution above the root or a
+  files are listed and are not part of the candidate. Symlinks, the committed ones of the
+  snapshot and the ignored ones of the worktree, are resolved on the worktree's own file
+  system, component by component with `Lstat`, so its name semantics apply (APFS treats
+  `ALIAS` as `alias` and NFC as NFD), and every symlink is followed before a later `..`
+  is applied: `alias -> .` with `escape -> ALIAS/../x` leaves the repository even though
+  an exact or lexical comparison would say otherwise. An absolute target, a resolution above the root or a
   loop is a violation, also for an unchanged symlink that starts to escape because another
   symlink changed. A symlink the base commit already had, unchanged and already pointing
-  outside, is the base's own and is not a violation. Paths outside the plan targets are
+  outside, is the base's own and is not a violation (the base is resolved from its tree
+  with exact names, so a doubtful case only removes the exemption). Paths outside the plan targets are
   off-target; they are allowed for review, not rejected here.
 - `Commit` refuses any violation (there is no partial commit of the permitted part), an
   empty snapshot and a HEAD that moved since the inspection; candidates are committed by
