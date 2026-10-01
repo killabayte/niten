@@ -77,11 +77,17 @@ Every side effect outside the store is recorded before or recognized after a cra
   under `refs/niten/rejected/` and the worktree restored, and `worktree.restored`
   records the metadata fingerprint after it. `resume` completes a plan a crash
   interrupted before it recovers attempts, so a processing never sees a restored
-  worktree as an attempt's result.
+  worktree as an attempt's result. Before any step of the completion, the git
+  metadata, without the planned ref, must equal the journal's, and the planned ref
+  may only be absent or point at the planned commit; anything else fails the run as
+  an integrity error before a git command touches the worktree. Removing only ignored
+  files must leave the metadata unchanged, and the final stage, which makes no commit,
+  starts only on the journal's metadata.
 - **A clone left by a crash before `clone.created`** is never trusted: no model ran in
   it, so it is removed and made anew, unless a process holds it.
 - **The configuration** the run started with is recorded by digest in its first session;
-  a changed `config.json` stops every later start.
+  a changed `config.json`, or a first session without the digest, stops every later
+  start.
 - **Processes that still hold an attempt** pause the run without touching them.
 
 ## Turns and what is trusted
@@ -274,7 +280,8 @@ The artifacts the gate verifies are every one the journal references by digest:
 - the configuration, the contract and the stored inputs, execution inputs and
   instruction copies included.
 
-A reference without a digest is an error, never skipped. The gate also requires that
+A reference without a digest, or a digest without a reference, is an error, never
+skipped. The gate also requires that
 no discard is pending and that every recorded rejected snapshot is still kept at its
 commit. A test checks the converse: after a run, every file of the run directory is a
 projection, the receipt itself or an artifact the receipt lists with its digest.
@@ -339,7 +346,9 @@ go-two-step fixture, a two-step plan on a small Go module published by Shogun's 
   - a recovered result checked by the final gate, a clone left by a crash before
     `clone.created` (free and held), a discard interrupted before and after its
     snapshot ref, a receipt recorded once after a crash, a changed configuration, and
-    every run file covered by the receipt.
+    every run file covered by the receipt;
+  - foreign git metadata found while a discard is pending, at both crash points, and a
+    journal reference whose digest was removed.
 
 The prompt-injection scenarios check mechanical boundaries: roles, profiles, packets and
 provenance. They do not claim that any model is robust against injection.

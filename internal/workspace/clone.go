@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"syscall"
@@ -184,7 +185,13 @@ func (c *Clone) TreeOf(ctx context.Context, commit string) (string, error) {
 // alternates. The index, logs and objects change through Niten's own commits
 // and are left out; a candidate is compared against the fingerprint taken
 // after the coordinator's last commit.
-func (c *Clone) MetadataFingerprint() (string, error) {
+func (c *Clone) MetadataFingerprint() (string, error) { return c.MetadataFingerprintExcept() }
+
+// MetadataFingerprintExcept is MetadataFingerprint without the named files of
+// the git directory (slash-separated, relative to it), whether they exist or
+// not. A recovery uses it to check that nothing changed but one ref its own
+// recorded plan expects.
+func (c *Clone) MetadataFingerprintExcept(skip ...string) (string, error) {
 	h := sha256.New()
 	var paths []string
 	for _, name := range []string{"HEAD", "config", "packed-refs", "shallow", "objects/info/alternates", "commondir"} {
@@ -201,6 +208,9 @@ func (c *Clone) MetadataFingerprint() (string, error) {
 	}
 	sort.Strings(paths)
 	for _, rel := range paths {
+		if slices.Contains(skip, rel) {
+			continue
+		}
 		p := filepath.Join(c.GitDir, filepath.FromSlash(rel))
 		fi, err := os.Lstat(p)
 		if errors.Is(err, fs.ErrNotExist) {

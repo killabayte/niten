@@ -52,6 +52,10 @@ func (e *Engine) startFinal(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	// The final stage makes no commit: the metadata must be the journal's.
+	if rec.Metadata != e.st.Metadata {
+		return fmt.Errorf("%w: the git metadata changed outside the coordinator before the final stage", ErrIntegrity)
+	}
 	e.logf("final: the whole change %s..%s", short(e.st.Base), short(head))
 	return e.emit(evFinalStarted, transition{Unit: FinalUnit, Candidate: rec, Step: &stepStateData{State: contract.StepCandidate, Start: e.st.Base, Problems: []string{}}})
 }
@@ -348,8 +352,13 @@ func (e *Engine) tracesTo(spec *CheckSpec, criterion string) bool {
 func (e *Engine) verifyArtifacts(events []store.Event) ([]artifactRef, error) {
 	seen := map[string]bool{}
 	var out []artifactRef
+	var unbound []string
 	add := func(ref, sha string) {
-		if ref != "" && sha != "" && !seen[ref] {
+		switch {
+		case ref == "" && sha == "":
+		case ref == "" || sha == "":
+			unbound = append(unbound, fmt.Sprintf("ref %q with digest %q", ref, sha))
+		case !seen[ref]:
 			seen[ref] = true
 			out = append(out, artifactRef{Ref: ref, SHA: sha})
 		}
@@ -495,6 +504,13 @@ func (e *Engine) verifyArtifacts(events []store.Event) ([]artifactRef, error) {
 	}
 	for _, in := range e.c.Repos[0].Instructions {
 		add(in.Stored, in.SHA256)
+	}
+	if cfg := firstSession(events).ConfigSHA256; cfg == "" {
+		unbound = append(unbound, "config.json has no digest in the first session")
+	}
+	if len(unbound) > 0 {
+		sort.Strings(unbound)
+		return nil, fmt.Errorf("the journal references artifacts without a digest: %s", strings.Join(unbound, "; "))
 	}
 	for _, a := range out {
 		if _, err := e.run.ReadArtifact(a.Ref, a.SHA); err != nil {

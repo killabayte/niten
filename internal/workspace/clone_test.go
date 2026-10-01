@@ -682,3 +682,31 @@ func TestCompareAndDiffOfARange(t *testing.T) {
 		t.Fatalf("FileAt of a missing path: %v %v", ok, err)
 	}
 }
+
+// The fingerprint without one ref equals the full one taken before that ref
+// existed, and still sees any other change.
+func TestMetadataFingerprintExcept(t *testing.T) {
+	_, c := newClone(t)
+	ctx := context.Background()
+	before, err := c.MetadataFingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	write(t, c.Work, "a.go", "package a\n\nfunc X() {}\n")
+	ins, _ := c.Inspect(ctx, rules(t, c, "a.go"))
+	if _, err := c.SaveRejected(ctx, ins, "t001", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if fp, _ := c.MetadataFingerprint(); fp == before {
+		t.Fatal("a new ref does not change the fingerprint")
+	}
+	if fp, err := c.MetadataFingerprintExcept("refs/niten/rejected/t001"); err != nil || fp != before {
+		t.Fatalf("without the ref: %s %v, want %s", fp, err, before)
+	}
+	f, _ := os.OpenFile(filepath.Join(c.GitDir, "config"), os.O_APPEND|os.O_WRONLY, 0o600)
+	f.WriteString("[x]\n\ty = 1\n")
+	f.Close()
+	if fp, _ := c.MetadataFingerprintExcept("refs/niten/rejected/t001"); fp == before {
+		t.Fatal("a config change is hidden by the exception")
+	}
+}

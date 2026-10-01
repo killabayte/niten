@@ -1066,7 +1066,9 @@ func TestLeftoverRootsOfAnUnrecordedTurn(t *testing.T) {
 				t.Fatal(err)
 			}
 			for _, step := range []func() error{
-				func() error { return e.emit(evSession, sessionData{Command: "run", ContractSHA256: e.contractSHA}) },
+				func() error {
+					return e.emit(evSession, sessionData{Command: "run", ContractSHA256: e.contractSHA, ConfigSHA256: e.configSHA})
+				},
 				func() error { return e.createClone(ctx) },
 				func() error { return e.emit(evRunState, runStateData{State: contract.RunRunning}) },
 			} {
@@ -1287,5 +1289,94 @@ func TestConfigChangeIsRefused(t *testing.T) {
 	}
 	if _, err := Open(Options{Store: w.store, RunID: w.runID}); !errors.Is(err, ErrIntegrity) {
 		t.Fatalf("open with a changed config: %v", err)
+	}
+}
+
+// A pending discard is completed only while the git metadata is the
+// journal's, except for the planned ref itself: a foreign change found on
+// resume fails the run before any git command touches the worktree.
+func TestPendingDiscardRefusesForeignMetadata(t *testing.T) {
+	t.Parallel()
+	for _, point := range []string{"discard.planned", "discard.kept"} {
+		t.Run(point, func(t *testing.T) {
+			t.Parallel()
+			script := happyScript(t)
+			bad := s1(t)
+			bad.Write[".claude/settings.json"] = `{"permissions":{"allow":["Bash(*)"]}}`
+			script.Executor = append([]testutil.FakeAction{bad}, script.Executor...)
+			w := newWorld(t, script, setup{})
+			e := w.open()
+			e.crashAt = func(p string) error {
+				if p == point {
+					return errors.New("simulated crash")
+				}
+				return nil
+			}
+			if _, err := e.Run(context.Background()); err == nil || e.st.Unit("S-001").PendingDiscard == nil {
+				e.Close()
+				t.Fatalf("no crash with a pending discard: %v", err)
+			}
+			gitConfig := filepath.Join(e.clone.GitDir, "config")
+			e.Close()
+			dropTrailing(t, w, evRunState)
+			f, err := os.OpenFile(gitConfig, os.O_APPEND|os.O_WRONLY, 0o600)
+			if err != nil {
+				t.Fatal(err)
+			}
+			f.WriteString("\n[foreign]\n\tunexpected = true\n")
+			f.Close()
+			e = w.open()
+			defer e.Close()
+			out, err := e.Resume(context.Background(), ResumeOptions{})
+			if !errors.Is(err, ErrIntegrity) || out.State != contract.RunFailed || w.calls("executor") != 1 {
+				t.Fatalf("foreign metadata during a pending discard: %+v %v, executor calls %d", out, err, w.calls("executor"))
+			}
+			if _, err := os.Stat(filepath.Join(e.clone.Work, ".claude", "settings.json")); err != nil {
+				t.Fatal("the worktree was restored under foreign metadata")
+			}
+		})
+	}
+}
+
+// A journal reference without its digest fails the final gate: it is never
+// skipped as if there were nothing to verify.
+func TestReferenceWithoutDigestFailsTheGate(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t, happyScript(t), setup{})
+	e := w.open()
+	defer e.Close()
+	changed := ""
+	e.crashAfter = func(id string) error {
+		if e.st.Turn(id).Kind != KindFinalReview {
+			return nil
+		}
+		for i := range e.events {
+			ev := &e.events[i]
+			if ev.Type != attempt.EvFinished {
+				continue
+			}
+			var d map[string]json.RawMessage
+			if err := json.Unmarshal(ev.Data, &d); err != nil {
+				return err
+			}
+			var aid string
+			json.Unmarshal(d["id"], &aid)
+			if aid != id {
+				continue
+			}
+			json.Unmarshal(d["stdout_ref"], &changed)
+			delete(d, "stdout_sha256")
+			ev.Data, _ = json.Marshal(d)
+			return nil
+		}
+		return errors.New("no finished event for the final review")
+	}
+	out, err := e.Run(context.Background())
+	if err != nil || changed == "" {
+		t.Fatalf("run: %+v %v, changed %q", out, err, changed)
+	}
+	want(t, out, contract.RunPaused, "final_gate", "without a digest")
+	if !strings.Contains(strings.Join(out.Detail, "\n"), changed) || len(e.State().Receipts) != 0 {
+		t.Fatalf("detail %q, receipts %d", out.Detail, len(e.State().Receipts))
 	}
 }

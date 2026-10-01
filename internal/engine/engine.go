@@ -190,8 +190,8 @@ func (e *Engine) load() error {
 		return fmt.Errorf("%w: config.json: %v", ErrIntegrity, err)
 	}
 	e.configSHA = digest(cfgBytes)
-	if recorded := firstSession(e.events).ConfigSHA256; recorded != "" && recorded != e.configSHA {
-		return fmt.Errorf("%w: config.json changed since the run started (sha256 %s, recorded %s)", ErrIntegrity, e.configSHA, recorded)
+	if first := firstSession(e.events); first.Command != "" && first.ConfigSHA256 != e.configSHA {
+		return fmt.Errorf("%w: config.json changed since the run started (sha256 %s, recorded %q)", ErrIntegrity, e.configSHA, first.ConfigSHA256)
 	}
 	var loaded config.Loaded
 	if err := json.Unmarshal(cfgBytes, &loaded); err != nil {

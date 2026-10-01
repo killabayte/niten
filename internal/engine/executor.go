@@ -210,11 +210,13 @@ func (e *Engine) cleanResidue(ctx context.Context, u *StepView) (*Outcome, error
 		if err := e.clone.Restore(ctx); err != nil {
 			return nil, err
 		}
-		fp, err := e.clone.MetadataFingerprint()
-		if err != nil {
+		// Removing ignored files changes no git metadata.
+		if fp, err := e.clone.MetadataFingerprint(); err != nil {
 			return nil, err
+		} else if fp != e.st.Metadata {
+			return nil, fmt.Errorf("%w: the git metadata changed while ignored files were removed", ErrIntegrity)
 		}
-		return nil, e.emit(evResidue, transition{Unit: u.ID, Rejected: &rejectedData{Violations: []string{}, Metadata: fp}})
+		return nil, e.emit(evResidue, transition{Unit: u.ID, Rejected: &rejectedData{Violations: []string{}, Metadata: e.st.Metadata}})
 	}
 	plan, out, err := e.planDiscard(ctx, ins, fmt.Sprintf("residue-%03d", len(e.st.Turns)+1), e.o.Now())
 	if out != nil || err != nil {
@@ -256,6 +258,22 @@ func (e *Engine) completeDiscard(ctx context.Context, u *StepView) error {
 	if err := e.crash("discard.planned"); err != nil {
 		return err
 	}
+	// Nothing may have changed in the git metadata since the plan but the
+	// planned ref itself: anything else is foreign, and no git command touches
+	// the worktree under it.
+	ref := "refs/niten/rejected/" + d.Name
+	fp, err := e.clone.MetadataFingerprintExcept(ref)
+	if err != nil {
+		return err
+	}
+	if fp != e.st.Metadata {
+		return fmt.Errorf("%w: the git metadata changed outside the coordinator while the discard %s was pending", ErrIntegrity, d.Snapshot)
+	}
+	if cur, err := e.clone.Rejected(ctx, d.Name); err != nil {
+		return err
+	} else if cur != "" && cur != d.Commit {
+		return fmt.Errorf("%w: %s points at %s, the plan recorded %s", ErrIntegrity, ref, cur, d.Commit)
+	}
 	if err := e.clone.KeepRejected(ctx, d.Name, d.Commit); err != nil {
 		return err
 	}
@@ -265,12 +283,12 @@ func (e *Engine) completeDiscard(ctx context.Context, u *StepView) error {
 	if err := e.clone.Restore(ctx); err != nil {
 		return err
 	}
-	fp, err := e.clone.MetadataFingerprint()
+	after, err := e.clone.MetadataFingerprint()
 	if err != nil {
 		return err
 	}
 	done := *d
-	done.Metadata = fp
+	done.Metadata = after
 	return e.emit(evResidue, transition{Unit: u.ID, Rejected: &done})
 }
 
