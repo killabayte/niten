@@ -124,7 +124,9 @@ func TestInspectClassifiesEveryChange(t *testing.T) {
 			testutil.Git(t, sub, "add", "-A")
 			testutil.Git(t, sub, "commit", "-qm", "x")
 		}, targets: []string{"vendored"}, violation: "nested repository"},
-		"pointer rewritten": {edit: func(t *testing.T, c *Clone) { os.WriteFile(filepath.Join(c.Work, ".git"), []byte("gitdir: /elsewhere\n"), 0o644) },
+		"pointer rewritten": {edit: func(t *testing.T, c *Clone) {
+			os.WriteFile(filepath.Join(c.Work, ".git"), []byte("gitdir: /elsewhere\n"), 0o644)
+		},
 			violation: "the .git pointer file was changed"},
 		"metadata changed": {edit: func(t *testing.T, c *Clone) {
 			os.WriteFile(filepath.Join(c.GitDir, "refs", "heads", "smuggled"), []byte(testutil.FixtureHead+"\n"), 0o644)
