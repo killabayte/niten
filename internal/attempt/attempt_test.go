@@ -3,6 +3,7 @@ package attempt
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -129,9 +130,20 @@ func deadIdentity(t *testing.T) provider.Identity {
 // writeIntent records an intent (and the stream files, if given) by hand.
 func (w *world) writeIntent(id, stdout string, createFiles bool) {
 	w.t.Helper()
+	w.writeIntentAt(id, stdout, createFiles, "")
+}
+
+// writeIntentIn records an intent whose working directory is dir.
+func (w *world) writeIntentIn(id, stdout, dir string) {
+	w.t.Helper()
+	w.writeIntentAt(id, stdout, true, dir)
+}
+
+func (w *world) writeIntentAt(id, stdout string, createFiles bool, workDir string) {
+	w.t.Helper()
 	dir := "attempts/" + id
 	w.run.WriteArtifact(dir+"/prompt", []byte("prompt"), 0o600)
-	w.run.Append(EvIntent, intent{ID: id, Role: "executor", Bin: "claude", PromptRef: dir + "/prompt", StdoutRef: dir + "/stdout.jsonl", StderrRef: dir + "/stderr.log"})
+	w.run.Append(EvIntent, intent{ID: id, Role: "executor", Bin: "claude", Dir: workDir, PromptRef: dir + "/prompt", StdoutRef: dir + "/stdout.jsonl", StderrRef: dir + "/stderr.log"})
 	if createFiles {
 		p, _ := w.run.Path(dir + "/stdout.jsonl")
 		os.WriteFile(p, []byte(stdout), 0o600)
@@ -186,8 +198,8 @@ func TestCrashAfterFinishBeforeCheckpoint(t *testing.T) {
 }
 
 // A crash in the middle of writing attempt.finished leaves a torn line. The
-// saved stream still holds the result, which is recovered without calling the
-// model again.
+// outcome and result artifacts were saved before it, so the protocol is
+// completed from them with the known outcome; the model is not called again.
 func TestCrashDuringTheFinishWrite(t *testing.T) {
 	w := newWorld(t)
 	(&Runner{Store: w.run}).Run(context.Background(), w.spec("a0001-executor"))
@@ -203,15 +215,114 @@ func TestCrashDuringTheFinishWrite(t *testing.T) {
 	}
 	w.run = run
 	r := w.recover()["a0001-executor"]
-	if r.Status != StatusRecovered || r.Result == nil || w.invocations() != 1 {
+	if r.Status != StatusFinished || r.Result == nil || w.invocations() != 1 || len(r.Result.Degraded) != 0 {
 		t.Fatalf("%+v invocations %d", r, w.invocations())
 	}
-	if !strings.Contains(strings.Join(r.Result.Degraded, " "), "exit status is unknown") {
-		t.Fatalf("degraded %v", r.Result.Degraded)
-	}
-	// The resolution is durable: a second recovery reads it back.
-	if again := w.recover()["a0001-executor"]; again.Status != StatusRecovered || w.invocations() != 1 {
+	if again := w.recover()["a0001-executor"]; again.Status != StatusFinished || w.invocations() != 1 {
 		t.Fatalf("second recovery %+v", again)
+	}
+}
+
+// dropLastEvent removes the last journal line, as if the crash came just
+// before it was written.
+func (w *world) dropLastEvent() {
+	w.t.Helper()
+	w.run.Close()
+	journal := filepath.Join(w.st.RunDir(w.id), "events.jsonl")
+	b, _ := os.ReadFile(journal)
+	lines := strings.SplitAfter(string(b), "\n")
+	os.WriteFile(journal, []byte(strings.Join(lines[:len(lines)-2], "")), 0o600)
+	run, _, err := w.st.OpenRun(w.id)
+	if err != nil {
+		w.t.Fatal(err)
+	}
+	w.run = run
+}
+
+// Review regression (P2): a failure that was already known (saved outcome and
+// result) stays a failure; recovery never replaces it with an assumed exit 0.
+func TestRecoveryKeepsAKnownFailure(t *testing.T) {
+	w := newWorld(t)
+	full, _ := os.ReadFile(w.stream)
+	w.writeIntent("a0001-executor", string(full), true)
+	id := deadIdentity(t)
+	w.run.Append(EvStarted, started{ID: "a0001-executor", Identity: id})
+	so, _ := w.run.Path("attempts/a0001-executor/stdout.jsonl")
+	se, _ := w.run.Path("attempts/a0001-executor/stderr.log")
+	out := provider.Outcome{Exit: 17, Identity: id}
+	res, perr := claudeParse()(so, se, out)
+	if res != nil || perr == nil {
+		t.Fatalf("fixture: %+v %v", res, perr)
+	}
+	if err := (&Runner{Store: w.run}).finish("a0001-executor", out, res, perr); err != nil {
+		t.Fatal(err)
+	}
+	w.dropLastEvent()
+	r := w.recover()["a0001-executor"]
+	if r.Result != nil || r.Err == nil || r.Status != StatusFinished {
+		t.Fatalf("a known failure became %+v", r)
+	}
+	// Crash between the outcome and the result: the stream is parsed against
+	// the saved outcome, not an assumed clean exit.
+	w2 := newWorld(t)
+	w2.writeIntent("a0002-executor", string(full), true)
+	w2.run.Append(EvStarted, started{ID: "a0002-executor", Identity: id})
+	ob, _ := json.Marshal(provider.Outcome{Exit: 17, Identity: id})
+	w2.run.WriteArtifact("attempts/a0002-executor/outcome.json", ob, 0o600)
+	if r := w2.recover()["a0002-executor"]; r.Result != nil || r.Err == nil || r.Status != StatusFinished {
+		t.Fatalf("outcome without result: %+v", r)
+	}
+}
+
+// Review regression (P2): without a recorded start the process may still be
+// alive. Its stream is never accepted, and while anything holds the attempt's
+// directory the run is blocked.
+func TestIntentOnlyNeverAcceptsAStream(t *testing.T) {
+	w := newWorld(t)
+	dir, _ := filepath.EvalSymlinks(t.TempDir())
+	full, _ := os.ReadFile(w.stream)
+	w.writeIntentIn("a0001-executor", string(full), dir)
+	cli := exec.Command("/bin/sleep", "60")
+	cli.Dir = dir
+	cli.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cli.Start()
+	defer func() { syscall.Kill(-cli.Process.Pid, syscall.SIGKILL); cli.Wait() }()
+	r := w.recover()["a0001-executor"]
+	if r.Result != nil || !r.Blocking() || r.Status != StatusUnknown || syscall.Kill(cli.Process.Pid, 0) != nil {
+		t.Fatalf("live CLI without a recorded start: %+v", r)
+	}
+	syscall.Kill(-cli.Process.Pid, syscall.SIGKILL)
+	cli.Wait()
+	if r := w.recover()["a0001-executor"]; r.Result != nil || r.Blocking() || r.Status != StatusUnknown {
+		t.Fatalf("after the process left: %+v", r)
+	}
+}
+
+// Review regression (P2): a crash during recovery itself, after the
+// recovered result was written but before its event, is resumed.
+func TestRecoverySurvivesASecondCrash(t *testing.T) {
+	w := newWorld(t)
+	full, _ := os.ReadFile(w.stream)
+	w.writeIntent("a0001-executor", string(full), true)
+	w.run.Append(EvStarted, started{ID: "a0001-executor", Identity: deadIdentity(t)})
+	if r := w.recover()["a0001-executor"]; r.Status != StatusRecovered {
+		t.Fatalf("first recovery %+v", r)
+	}
+	w.dropLastEvent()
+	if r := w.recover()["a0001-executor"]; r.Status != StatusRecovered || r.Result == nil {
+		t.Fatalf("second recovery %+v", r)
+	}
+}
+
+// Review regression (P2): a finished attempt needs both of its artifacts.
+func TestFinishedNeedsItsOutcomeArtifact(t *testing.T) {
+	w := newWorld(t)
+	(&Runner{Store: w.run}).Run(context.Background(), w.spec("a0001-executor"))
+	p, _ := w.run.Path("attempts/a0001-executor/outcome.json")
+	os.Remove(p)
+	events := w.reopen()
+	if _, err := Recover(w.run, events, map[string]ParseFunc{"executor": claudeParse()}, time.Second); !errors.Is(err, store.ErrCorrupt) {
+		t.Fatalf("a missing outcome artifact: %v", err)
 	}
 }
 

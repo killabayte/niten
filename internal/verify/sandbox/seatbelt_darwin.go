@@ -3,6 +3,8 @@
 package sandbox
 
 import (
+	"github.com/killabayte/niten/internal/holders"
+
 	"bytes"
 	"context"
 	"errors"
@@ -42,8 +44,8 @@ func newSeatbelt(launcher, profileDir string) (*Seatbelt, error) {
 	if sys, ok := st.Sys().(*syscall.Stat_t); !ok || sys.Uid != 0 {
 		return nil, fmt.Errorf("%w: %s is not owned by root", ErrUnavailable, launcher)
 	}
-	if lst, err := os.Stat(lsofPath); err != nil || !lst.Mode().IsRegular() || lst.Mode().Perm()&0o111 == 0 {
-		return nil, fmt.Errorf("%w: %s is required to detect processes that outlive a run", ErrUnavailable, lsofPath)
+	if err := holders.Available(); err != nil {
+		return nil, fmt.Errorf("%w: lsof is required to detect processes that outlive a run: %v", ErrUnavailable, err)
 	}
 	if profileDir == "" || !filepath.IsAbs(profileDir) {
 		return nil, fmt.Errorf("%w: profile directory must be absolute", ErrPolicy)

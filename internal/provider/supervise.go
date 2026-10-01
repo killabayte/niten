@@ -12,6 +12,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"sync"
@@ -55,6 +56,8 @@ type Spec struct {
 	// durable), the group is killed and Supervise returns the error.
 	OnStart func(Identity) error
 }
+
+// The prompt reaches stdin only after OnStart succeeded.
 
 // Outcome is what happened to the process; the streams are in the files.
 type Outcome struct {
@@ -103,7 +106,12 @@ func Supervise(ctx context.Context, s Spec) (Outcome, error) {
 
 	cmd := exec.Command(s.Bin, s.Args...)
 	cmd.Dir, cmd.Env = s.Dir, s.Env
-	cmd.Stdin = bytes.NewReader(s.Stdin)
+	// The prompt is delivered only after the identity is recorded: a CLI
+	// started in the window before attempt.started has no task to work on.
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return Outcome{Exit: -1}, err
+	}
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	st := &streamState{}
 	st.kill = func() { killGroup(cmd, syscall.SIGKILL) }
@@ -125,12 +133,17 @@ func Supervise(ctx context.Context, s Spec) (Outcome, error) {
 	go func() { done <- cmd.Wait() }()
 	if s.OnStart != nil {
 		if err := s.OnStart(out.Identity); err != nil {
+			stdin.Close()
 			killGroup(cmd, syscall.SIGKILL)
 			<-done
 			reap(pid)
 			return out, fmt.Errorf("record the started process: %w", err)
 		}
 	}
+	go func() {
+		_, _ = io.Copy(stdin, bytes.NewReader(s.Stdin))
+		stdin.Close()
+	}()
 	var deadline <-chan time.Time
 	if !s.Deadline.IsZero() {
 		t := time.NewTimer(time.Until(s.Deadline))

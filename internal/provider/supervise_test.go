@@ -299,3 +299,24 @@ func TestFilterEnvNeverReturnsValues(t *testing.T) {
 		}
 	}
 }
+
+// The prompt is written only after the start was recorded: OnStart sees a
+// process that has not received its task yet.
+func TestPromptFollowsTheRecordedStart(t *testing.T) {
+	s := spec(t, "echo-stdin")
+	s.Stdin = []byte("the task")
+	s.OnStart = func(Identity) error {
+		time.Sleep(200 * time.Millisecond) // the child would have echoed by now if it had input
+		if b, _ := os.ReadFile(s.StdoutPath); len(b) != 0 {
+			return fmt.Errorf("the child received its prompt before the start was recorded: %q", b)
+		}
+		return nil
+	}
+	out, err := Supervise(context.Background(), s)
+	if err != nil || !out.Clean() {
+		t.Fatalf("%+v %v", out, err)
+	}
+	if b, _ := os.ReadFile(s.StdoutPath); string(b) != "the task" {
+		t.Fatalf("stdout %q", b)
+	}
+}

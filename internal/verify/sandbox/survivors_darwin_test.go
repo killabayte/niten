@@ -15,6 +15,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/killabayte/niten/internal/holders"
 )
 
 // detachedSource is a helper program for the cleanup regressions.
@@ -290,9 +292,7 @@ func TestIncompleteListingFailsClosed(t *testing.T) {
 	if err := os.Chmod(fake, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	old := lsofPath
-	lsofPath = fake
-	t.Cleanup(func() { lsofPath = old })
+	t.Cleanup(holders.SetLsofForTest(fake))
 	if _, _, err := h.runErr(t, s, "/usr/bin/true"); !errors.Is(err, ErrUnavailable) || !strings.Contains(err.Error(), "incomplete listing") {
 		t.Fatalf("run with an incomplete listing: %v", err)
 	}

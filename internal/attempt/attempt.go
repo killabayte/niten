@@ -17,6 +17,7 @@
 package attempt
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -25,10 +26,12 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"time"
 
+	"github.com/killabayte/niten/internal/holders"
 	"github.com/killabayte/niten/internal/provider"
 	"github.com/killabayte/niten/internal/store"
 )
@@ -97,6 +100,7 @@ type resolved struct {
 	ResultRef string `json:"result_ref,omitempty"`
 	ResultSHA string `json:"result_sha256,omitempty"`
 	Remains   []int  `json:"remaining_pids,omitempty"`
+	Blocked   bool   `json:"blocked,omitempty"`
 }
 
 // stored is the result artifact.
@@ -185,36 +189,47 @@ func (r *Runner) finish(id string, out provider.Outcome, res *provider.Result, p
 type Status string
 
 const (
-	StatusFinished   Status = "finished"        // the protocol completed before the crash
-	StatusRecovered  Status = "recovered"       // the saved stream held a complete result; no model was called
+	StatusFinished   Status = "finished"        // the protocol completed, before the crash or from its saved artifacts
+	StatusRecovered  Status = "recovered"       // the process died with the coordinator; its saved stream held a complete result
 	StatusUnknown    Status = "outcome_unknown" // what the attempt did cannot be established
 	StatusNotStarted Status = "not_started"     // the process provably never started
 )
 
 // Recovered is one attempt's state after Recover.
 type Recovered struct {
-	ID      string
-	Role    string
-	Status  Status
-	Result  *provider.Result
-	Err     *provider.Error
-	Reason  string
-	Remains []int // processes left in a recorded group, never signalled
+	ID     string
+	Role   string
+	Status Status
+	Result *provider.Result
+	Err    *provider.Error
+	Reason string
+	// Remains lists processes that hold the attempt's directory or are left in
+	// its recorded group; their ownership is not provable, so they are never
+	// signalled. Blocked is also set when they could not be listed.
+	Remains []int
+	Blocked bool
 }
 
-// Blocking reports whether the run must not continue: processes of unproven
-// ownership remain from the attempt.
-func (r Recovered) Blocking() bool { return len(r.Remains) > 0 }
+// Blocking reports whether the run must not continue: something may still be
+// working on the attempt's directory.
+func (r Recovered) Blocking() bool { return r.Blocked || len(r.Remains) > 0 }
 
-// Recover resolves every attempt of the replayed journal. Finished attempts
-// are read back and checked against their digests. An attempt that started
-// but did not finish is stopped if its recorded process is still alive with
-// the recorded identity; processes left in its group whose ownership is not
-// provable are reported, never signalled. Its saved stream is then parsed
-// with the role's parser: a complete result is recovered without a new model
-// call, anything else is outcome_unknown. An attempt with only an intent is
-// not_started when its stream files were never created. Each resolution is
-// written to the journal, so recovery is not repeated.
+// Recover resolves every attempt of the replayed journal and records each
+// answer, so it is not repeated:
+//
+//   - finished attempts are read back; both artifacts must match their digests;
+//   - an attempt whose outcome artifact was saved before the crash is
+//     completed from it: the known outcome decides, never a guess;
+//   - an attempt that started but saved no outcome has its recorded process
+//     stopped if it is still alive with the recorded start time; then any
+//     process still holding the attempt's directory (or left in a group whose
+//     leader is gone) blocks the run, and otherwise the saved stream is parsed:
+//     a complete result is recovered without a new model call, anything else
+//     is outcome_unknown;
+//   - an attempt with only an intent never yields a result (its prompt is
+//     delivered only after attempt.started), is not_started when its stream
+//     files were never created, and blocks the run while anything holds its
+//     directory.
 func Recover(run *store.Run, events []store.Event, parsers map[string]ParseFunc, grace time.Duration) ([]Recovered, error) {
 	type state struct {
 		in       *intent
@@ -233,32 +248,37 @@ func Recover(run *store.Run, events []store.Event, parsers map[string]ParseFunc,
 		return byID[id]
 	}
 	for _, ev := range events {
+		var target any
+		var id *string
 		switch ev.Type {
 		case EvIntent:
-			var v intent
-			if err := json.Unmarshal(ev.Data, &v); err != nil {
-				return nil, fmt.Errorf("%w: event %d: %v", store.ErrCorrupt, ev.Seq, err)
-			}
-			get(v.ID).in = &v
+			v := &intent{}
+			target, id = v, &v.ID
 		case EvStarted:
-			var v started
-			if err := json.Unmarshal(ev.Data, &v); err != nil {
-				return nil, fmt.Errorf("%w: event %d: %v", store.ErrCorrupt, ev.Seq, err)
-			}
-			get(v.ID).st = &v
+			v := &started{}
+			target, id = v, &v.ID
 		case EvFinished:
-			var v finished
-			if err := json.Unmarshal(ev.Data, &v); err != nil {
-				return nil, fmt.Errorf("%w: event %d: %v", store.ErrCorrupt, ev.Seq, err)
-			}
-			get(v.ID).fin = &v
+			v := &finished{}
+			target, id = v, &v.ID
 		case EvRecovered, EvUnknown, EvNotStarted:
-			var v resolved
-			if err := json.Unmarshal(ev.Data, &v); err != nil {
-				return nil, fmt.Errorf("%w: event %d: %v", store.ErrCorrupt, ev.Seq, err)
-			}
-			s := get(v.ID)
-			s.resolved, s.res = ev.Type, &v
+			v := &resolved{}
+			target, id = v, &v.ID
+		default:
+			continue
+		}
+		if err := json.Unmarshal(ev.Data, target); err != nil {
+			return nil, fmt.Errorf("%w: event %d: %v", store.ErrCorrupt, ev.Seq, err)
+		}
+		s := get(*id)
+		switch v := target.(type) {
+		case *intent:
+			s.in = v
+		case *started:
+			s.st = v
+		case *finished:
+			s.fin = v
+		case *resolved:
+			s.resolved, s.res = ev.Type, v
 		}
 	}
 	var out []Recovered
@@ -270,6 +290,9 @@ func Recover(run *store.Run, events []store.Event, parsers map[string]ParseFunc,
 		rec := Recovered{ID: id, Role: s.in.Role}
 		switch {
 		case s.fin != nil:
+			if _, err := run.ReadArtifact(s.fin.OutcomeRef, s.fin.OutcomeSHA); err != nil {
+				return nil, fmt.Errorf("%w: attempt %s outcome: %v", store.ErrCorrupt, id, err)
+			}
 			st, err := readStored(run, s.fin.ResultRef, s.fin.ResultSHA)
 			if err != nil {
 				return nil, err
@@ -281,28 +304,21 @@ func Recover(run *store.Run, events []store.Event, parsers map[string]ParseFunc,
 				return nil, err
 			}
 			rec.Status, rec.Result, rec.Err, rec.Reason = StatusRecovered, st.Result, st.Error, s.res.Reason
-		case s.resolved == EvUnknown:
-			rec.Status, rec.Reason, rec.Remains = StatusUnknown, s.res.Reason, s.res.Remains
-			if len(rec.Remains) > 0 {
-				// The remaining processes may have exited since: resolve again
-				// and record the new answer once nothing blocks.
-				rec = resolveStarted(run, s.in, s.st, parsers, grace)
-				if !rec.Blocking() {
-					if err := record(run, rec); err != nil {
-						return nil, err
-					}
-				}
-			}
 		case s.resolved == EvNotStarted:
 			rec.Status, rec.Reason = StatusNotStarted, s.res.Reason
+		case s.resolved == EvUnknown && !s.res.Blocked && len(s.res.Remains) == 0:
+			rec.Status, rec.Reason = StatusUnknown, s.res.Reason
 		default:
-			if s.st != nil {
-				rec = resolveStarted(run, s.in, s.st, parsers, grace)
-			} else {
-				rec = resolveIntentOnly(run, s.in, parsers)
-			}
-			if err := record(run, rec); err != nil {
+			// Unresolved, or recorded as blocked: resolve (again).
+			var err error
+			if rec, err = resolve(run, s.in, s.st, parsers, grace); err != nil {
 				return nil, err
+			}
+			prevBlocked := s.res != nil && (s.res.Blocked || len(s.res.Remains) > 0)
+			if rec.Status != StatusFinished && !(prevBlocked && rec.Blocking()) {
+				if err := record(run, rec); err != nil {
+					return nil, err
+				}
 			}
 		}
 		out = append(out, rec)
@@ -310,31 +326,85 @@ func Recover(run *store.Run, events []store.Event, parsers map[string]ParseFunc,
 	return out, nil
 }
 
-func resolveStarted(run *store.Run, in *intent, st *started, parsers map[string]ParseFunc, grace time.Duration) Recovered {
+// resolve decides an attempt that has no finished event.
+func resolve(run *store.Run, in *intent, st *started, parsers map[string]ParseFunc, grace time.Duration) (Recovered, error) {
 	rec := Recovered{ID: in.ID, Role: in.Role}
+	dir := "attempts/" + in.ID
 	if st != nil {
+		if ob, err := run.ReadArtifact(dir+"/outcome.json", ""); err == nil {
+			return completeFromArtifacts(run, in, ob, parsers)
+		}
 		err := provider.TerminateRecorded(st.Identity, grace)
 		var remains *provider.GroupRemainsError
 		if errors.As(err, &remains) {
 			rec.Status, rec.Remains = StatusUnknown, remains.PIDs
-			rec.Reason = "processes of the attempt's group remain and their ownership cannot be proven; the run must not continue until they are gone"
-			return rec
+			rec.Reason = "processes of the attempt's group remain and their ownership cannot be proven"
+			return rec, nil
 		}
 	}
-	return parseSaved(run, in, st, parsers, rec)
+	if pids, err := holdersOf(in.Dir); err != nil || len(pids) > 0 {
+		rec.Status, rec.Remains, rec.Blocked = StatusUnknown, pids, true
+		rec.Reason = "the attempt's directory is still held by processes whose ownership cannot be proven"
+		if err != nil {
+			rec.Reason = "the holders of the attempt's directory could not be listed: " + err.Error()
+		}
+		return rec, nil
+	}
+	if st == nil {
+		so, _ := run.Path(in.StdoutRef)
+		se, _ := run.Path(in.StderrRef)
+		_, e1 := os.Lstat(so)
+		_, e2 := os.Lstat(se)
+		if errors.Is(e1, fs.ErrNotExist) && errors.Is(e2, fs.ErrNotExist) {
+			rec.Status, rec.Reason = StatusNotStarted, "the stream files were never created, so the process never started"
+		} else {
+			rec.Status, rec.Reason = StatusUnknown, "the start was never recorded, so the process never received its prompt; its stream is not a result"
+		}
+		return rec, nil
+	}
+	return parseSaved(run, in, st, parsers, rec), nil
 }
 
-func resolveIntentOnly(run *store.Run, in *intent, parsers map[string]ParseFunc) Recovered {
-	rec := Recovered{ID: in.ID, Role: in.Role}
-	so, _ := run.Path(in.StdoutRef)
-	se, _ := run.Path(in.StderrRef)
-	_, e1 := os.Lstat(so)
-	_, e2 := os.Lstat(se)
-	if errors.Is(e1, fs.ErrNotExist) && errors.Is(e2, fs.ErrNotExist) {
-		rec.Status, rec.Reason = StatusNotStarted, "the stream files were never created, so the process never started"
-		return rec
+// completeFromArtifacts finishes the protocol from the outcome (and result)
+// the attempt saved before the crash. The saved outcome is what happened; the
+// stream is parsed against it, never against an assumed clean exit.
+func completeFromArtifacts(run *store.Run, in *intent, outcomeBytes []byte, parsers map[string]ParseFunc) (Recovered, error) {
+	rec := Recovered{ID: in.ID, Role: in.Role, Status: StatusFinished, Reason: "completed from the artifacts saved before the crash"}
+	dir := "attempts/" + in.ID
+	var o provider.Outcome
+	if err := json.Unmarshal(outcomeBytes, &o); err != nil {
+		return rec, fmt.Errorf("%w: %s/outcome.json: %v", store.ErrCorrupt, dir, err)
 	}
-	return parseSaved(run, in, nil, parsers, rec)
+	var st stored
+	resultBytes, err := run.ReadArtifact(dir+"/result.json", "")
+	if err == nil {
+		if err := json.Unmarshal(resultBytes, &st); err != nil {
+			return rec, fmt.Errorf("%w: %s/result.json: %v", store.ErrCorrupt, dir, err)
+		}
+	} else {
+		parse := parsers[in.Role]
+		if parse == nil {
+			return rec, fmt.Errorf("no parser for role %s", in.Role)
+		}
+		so, _ := run.Path(in.StdoutRef)
+		se, _ := run.Path(in.StderrRef)
+		st.Result, st.Error = parse(so, se, o)
+		b, _ := json.MarshalIndent(st, "", " ")
+		resultBytes = append(b, '\n')
+		if _, err := writeOrReuse(run, dir+"/result.json", resultBytes); err != nil {
+			return rec, err
+		}
+	}
+	f := finished{ID: in.ID, OK: st.Result != nil, OutcomeRef: dir + "/outcome.json", OutcomeSHA: digest(outcomeBytes),
+		ResultRef: dir + "/result.json", ResultSHA: digest(resultBytes)}
+	if st.Error != nil {
+		f.Class = string(st.Error.Class)
+	}
+	if _, err := run.Append(EvFinished, f); err != nil {
+		return rec, err
+	}
+	rec.Result, rec.Err = st.Result, st.Error
+	return rec, nil
 }
 
 func parseSaved(run *store.Run, in *intent, st *started, parsers map[string]ParseFunc, rec Recovered) Recovered {
@@ -345,11 +415,7 @@ func parseSaved(run *store.Run, in *intent, st *started, parsers map[string]Pars
 	}
 	so, _ := run.Path(in.StdoutRef)
 	se, _ := run.Path(in.StderrRef)
-	o := provider.Outcome{Exit: 0}
-	if st != nil {
-		o.Identity = st.Identity
-		o.Started = time.UnixMicro(st.Identity.StartMicros)
-	}
+	o := provider.Outcome{Exit: 0, Identity: st.Identity, Started: time.UnixMicro(st.Identity.StartMicros)}
 	res, perr := parse(so, se, o)
 	if res == nil {
 		reason := "the saved stream holds no complete result"
@@ -364,15 +430,26 @@ func parseSaved(run *store.Run, in *intent, st *started, parsers map[string]Pars
 	return rec
 }
 
+// holdersOf lists processes holding the attempt's working directory.
+func holdersOf(dir string) ([]int, error) {
+	if dir == "" || !filepath.IsAbs(dir) {
+		return nil, nil
+	}
+	if real, err := filepath.EvalSymlinks(dir); err == nil {
+		dir = real
+	}
+	return holders.List([]string{dir})
+}
+
 func record(run *store.Run, rec Recovered) error {
-	v := resolved{ID: rec.ID, Reason: rec.Reason, Remains: rec.Remains}
+	v := resolved{ID: rec.ID, Reason: rec.Reason, Remains: rec.Remains, Blocked: rec.Blocked}
 	typ := EvUnknown
 	switch rec.Status {
 	case StatusRecovered:
 		typ = EvRecovered
 		b, _ := json.MarshalIndent(stored{Result: rec.Result}, "", " ")
 		ref := "attempts/" + rec.ID + "/recovered-result.json"
-		sha, err := run.WriteArtifact(ref, append(b, '\n'), 0o600)
+		sha, err := writeOrReuse(run, ref, append(b, '\n'))
 		if err != nil {
 			return err
 		}
@@ -382,6 +459,23 @@ func record(run *store.Run, rec Recovered) error {
 	}
 	_, err := run.Append(typ, v)
 	return err
+}
+
+// writeOrReuse writes a write-once artifact, or accepts an identical one that
+// an interrupted recovery already wrote. Different bytes are an error.
+func writeOrReuse(run *store.Run, ref string, data []byte) (string, error) {
+	sha, err := run.WriteArtifact(ref, data, 0o600)
+	if err == nil {
+		return sha, nil
+	}
+	existing, rerr := run.ReadArtifact(ref, "")
+	if rerr != nil {
+		return "", err
+	}
+	if !bytes.Equal(existing, data) {
+		return "", fmt.Errorf("%w: %s exists with different content", store.ErrCorrupt, ref)
+	}
+	return digest(existing), nil
 }
 
 func readStored(run *store.Run, ref, sha string) (stored, error) {
@@ -394,6 +488,11 @@ func readStored(run *store.Run, ref, sha string) (stored, error) {
 		return st, fmt.Errorf("%w: %s: %v", store.ErrCorrupt, ref, err)
 	}
 	return st, nil
+}
+
+func digest(b []byte) string {
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
 }
 
 func names(env []string) []string {

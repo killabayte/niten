@@ -16,6 +16,7 @@ the live probes are separately authorized. The engine that drives these pieces (
 | `internal/provider` | Process supervisor, environment filter, Claude and Codex adapters, settings renderer |
 | `internal/attempt` | The durable attempt protocol and crash recovery |
 | `internal/procinfo` | Kernel process identity on macOS: start time, parent, process group |
+| `internal/holders` | Processes holding a directory tree (lsof, failing closed on an incomplete listing) |
 
 ## Run store
 
@@ -43,13 +44,20 @@ the live probes are separately authorized. The engine that drives these pieces (
   hooks are disabled in the config, and the base is checked out on branch `niten`.
   The worktree's `.git` is a pointer file; the git directory is private and outside the
   worktree. Every later command runs with an explicit git dir and work tree,
-  `--no-replace-objects`, `--no-lazy-fetch` and hooks disabled.
+  `--no-replace-objects`, `--no-lazy-fetch` and hooks disabled, and with the user's
+  global and system configuration, system attributes and the user's attribute and
+  exclude files ignored. The only configuration is the clone's own, so attributes a
+  candidate writes can name no filter, diff or merge program that git would run.
 - `Inspect` snapshots the whole worktree through a private index in the git directory
   (the real index is not touched) and classifies every change against HEAD. Hard
   violations: a protected path, an instruction path without an explicit plan target, a
   symlink leaving the repository, a nested repository or submodule, a rewritten `.git`
   pointer, and changed git metadata (HEAD, config, refs, info, hooks, alternates,
-  fingerprinted after the coordinator's last commit). Paths outside the plan targets are
+  fingerprinted after the coordinator's last commit). Changed metadata or a rewritten
+  pointer stops the inspection before any git command reads the worktree. Inspect also
+  walks the physical worktree, independent of ignore rules: a protected or instruction
+  path that git ignores, or a nested `.git` directory, is a hard violation; other ignored
+  files are listed and are not part of the candidate. Paths outside the plan targets are
   off-target; they are allowed for review, not rejected here.
 - `Commit` refuses any violation (there is no partial commit of the permitted part), an
   empty snapshot and a HEAD that moved since the inspection; candidates are committed by
@@ -72,11 +80,14 @@ paths:
 | Status | When |
 |---|---|
 | `unknown` | the sandboxed run failed (a holder outside the attempt's group, a scan error, an unavailable backend), or `Seal` failed |
-| `invalidated` | the check edited the code under test, or group members outlived it |
+| `invalidated` | the check edited or removed the code under test, added a file to the source tree that is not a declared output, or group members outlived it |
 | `failed` | timeout, wrong exit code or signal, truncated output, an unmet stdout expectation |
 | `passed` | none of the above |
 
-The evidence is schema-validated, stored with both streams as artifacts and announced by
+Build caches and temporary files live in the scratch root, so a new file in the source
+tree is code the check added; a check declares the outputs it may create there (a
+coverage profile, for example) as patterns. The evidence is schema-validated, stored with
+both streams as artifacts and announced by
 a `check.recorded` event. If the store refuses any write, `Run` returns an error and
 records nothing. The environment digest leaves out the per-attempt paths, so equal
 environments give equal check keys.
@@ -84,7 +95,9 @@ environments give equal check keys.
 ## Supervisor
 
 `Supervise` starts a CLI as the leader of a new process group, delivers the prompt on
-stdin with EOF, and drains stdout and stderr concurrently into files it creates
+stdin with EOF only after the start was recorded (so a CLI started in the window before
+`attempt.started` has no task to work on), and drains stdout and stderr concurrently into
+files it creates
 exclusively, so a stream of another attempt can never be read as this one. Limits: one
 JSONL event (16 MiB by default) and each stream (64 MiB). Cancellation and the deadline
 send TERM to the group and KILL after a grace period; after exit the group is killed and
@@ -133,19 +146,22 @@ result artifacts; `attempt.finished` with both digests. A store failure before t
 means the model is never started.
 
 `Recover` resolves every attempt of the replayed journal and records its answer, so it
-is not repeated:
+is not repeated; an interrupted recovery reuses its own identical artifact:
 
 | Journal state after a crash | Resolution |
 |---|---|
-| `attempt.finished` present | `finished`, read back and checked against its digests |
-| started, recorded process alive with its recorded start time | the group is stopped, then the saved stream is parsed |
-| started, members of a dead leader's group remain | `outcome_unknown`, processes reported, never signalled; the run is blocked until they are gone |
-| started or intent with stream files, complete result in the saved stream | `recovered` without a new model call; the result notes that the exit status is unknown |
-| started or intent with an incomplete or empty stream | `outcome_unknown` |
+| `attempt.finished` present | `finished`; both artifacts must match their digests |
+| started, outcome artifact saved | `finished`, completed from the saved outcome (and result, or a parse against the saved outcome); a known failure stays a failure |
+| started, no outcome, recorded process alive with its recorded start time | the group is stopped, then as below |
+| started, members of a dead leader's group remain | `outcome_unknown`, processes reported, never signalled; the run is blocked |
+| started or intent, the attempt's directory is held by any process, or the holders cannot be listed | `outcome_unknown`, blocked until nothing holds it |
+| started, no outcome, nothing holds the directory, complete result in the saved stream | `recovered` without a new model call; the result notes that the exit status is unknown |
+| started, no outcome, incomplete or empty stream | `outcome_unknown` |
+| intent only, stream files exist | `outcome_unknown`: the prompt is delivered only after `attempt.started`, so the stream is never a result |
 | intent only, stream files never created | `not_started` |
 
-A torn `attempt.finished` line falls into the started rows: the tail is kept aside by the
-store and the saved stream decides.
+A torn `attempt.finished` line falls into the "outcome artifact saved" row: the tail is
+kept aside by the store and the saved outcome decides.
 
 ## Doctor
 
