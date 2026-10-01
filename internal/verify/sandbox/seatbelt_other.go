@@ -20,3 +20,6 @@ func (s *Seatbelt) SelfTest(ctx context.Context) error { return ErrUnsupportedOS
 func (s *Seatbelt) Run(ctx context.Context, p Policy, cmd Command) (Result, error) {
 	return Result{}, ErrUnsupportedOS
 }
+
+// Seal always fails off macOS.
+func (s *Seatbelt) Seal(p Policy) (Sealed, error) { return Sealed{}, ErrUnsupportedOS }

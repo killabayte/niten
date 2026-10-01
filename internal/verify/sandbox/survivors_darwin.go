@@ -3,80 +3,24 @@
 package sandbox
 
 import (
-	"bytes"
-	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"slices"
 	"sort"
-	"strconv"
-	"strings"
 	"syscall"
 	"time"
+
+	"github.com/killabayte/niten/internal/holders"
 )
 
-// lsofPath is the fixed system tool used to find processes that still hold
-// the sandbox roots. Killing the child's process group is not enough: a
-// descendant that calls setsid leaves the group while keeping the Seatbelt
-// profile, so it can go on writing inside the roots after Run returns. It is a
-// variable only so tests can substitute a failing tool.
-var lsofPath = "/usr/sbin/lsof"
-
-// Sealed describes the roots after Seal: their new paths and the holders that
-// were found there. Holders are never killed by Seal; any holder refuses it.
-type Sealed struct {
-	SourceRoot  string
-	ScratchRoot string
-	Foreign     []int
-}
-
-// survivors returns the PIDs of the caller's other processes that have an
-// open file, cwd, root or mapped binary under any of the roots.
-func survivors(roots []string) ([]int, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, lsofPath, "-w", "-n", "-P", "-F", "pn", "-u", strconv.Itoa(os.Getuid()))
-	var out, errb bytes.Buffer
-	cmd.Stdout, cmd.Stderr = &out, &errb
-	// The listing covers every process of the user, the caller included, so a
-	// complete run always exits 0. Any other exit means some entries could not
-	// be listed; a holder may be among them, and an open descriptor keeps
-	// writing into a tree even after Seal renames it, so the scan fails closed.
-	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("%s: incomplete listing: %v: %s", lsofPath, err, bytes.TrimSpace(errb.Bytes()))
-	}
-	self := os.Getpid()
-	seen := map[int]bool{}
-	var pids []int
-	cur := 0
-	for _, line := range strings.Split(out.String(), "\n") {
-		if line == "" {
-			continue
-		}
-		switch line[0] {
-		case 'p':
-			cur, _ = strconv.Atoi(line[1:])
-		case 'n':
-			if cur == 0 || cur == self || seen[cur] {
-				continue
-			}
-			name := line[1:]
-			for _, r := range roots {
-				if name == r || strings.HasPrefix(name, r+"/") {
-					seen[cur] = true
-					pids = append(pids, cur)
-					break
-				}
-			}
-		}
-	}
-	sort.Ints(pids)
-	return pids, nil
-}
+// survivors returns the processes that hold the roots (see package holders,
+// which fails closed on an incomplete listing). Killing the child's process
+// group is not enough on its own: a descendant can leave the group through
+// posix_spawn attributes while keeping the Seatbelt profile.
+func survivors(roots []string) ([]int, error) { return holders.List(roots) }
 
 // classify splits holders into members of the attempt's process group and
 // everything else. The group is the only proof of membership: the sandbox

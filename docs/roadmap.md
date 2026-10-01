@@ -168,6 +168,18 @@ Acceptance:
   are denied, and a descendant that escapes through `posix_spawn` attributes can
   survive under the profile).
 
+P2 status: implemented offline on 2026-10-01, see [runner](runner.md). Every acceptance
+item above has tests with fake CLIs: the clone leaves the source untouched and refuses a
+partial commit; instructions come from the base commit; streams, limits, exits and
+missing terminal events never yield a false result; cancel stops the group; stream files
+are never reused; the environment filter records names only; store write and sync
+failures stop without claims; each crash point of the attempt protocol is recovered or
+recorded as `outcome_unknown`; a second coordinator is locked out; a reused PID is never
+signalled; a saved result is recovered without a new model call; and checks get new
+roots, are sealed before reading, and never pass with an unknown holder or a failed
+scan. The live adapter certification (`doctor --live`) remains a separately authorized
+step.
+
 Dependencies: P0a, plus P0b only for extra context roots. P2 automates the profile
 harness: verifier checks remain offline, model checks require `doctor --live`.
 When the launcher/settings/CLI fingerprint changes, a new separately

@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/killabayte/niten/internal/config"
 	"github.com/killabayte/niten/internal/contract"
 	"github.com/killabayte/niten/internal/verify/sandbox"
 )
@@ -82,11 +83,12 @@ func doctor(args []string, stdout, stderr io.Writer) contract.ExitCode {
 	fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	live := fs.Bool("live", false, "run the separately authorized live model probes (not available in this build)")
+	configPath := fs.String("config", "", "config file (default: $XDG_CONFIG_HOME/niten/config.toml or ~/.config/niten/config.toml)")
 	if err := fs.Parse(args); err != nil {
 		return contract.ExitFormat
 	}
 	if fs.NArg() != 0 {
-		fmt.Fprintln(stderr, "usage: niten doctor [--live]")
+		fmt.Fprintln(stderr, "usage: niten doctor [--config FILE] [--live]")
 		return contract.ExitFormat
 	}
 	if *live {
@@ -98,6 +100,16 @@ func doctor(args []string, stdout, stderr io.Writer) contract.ExitCode {
 	fmt.Fprintf(stdout, "niten %s, %s/%s, %s\n", version, runtime.GOOS, runtime.GOARCH, runtime.Version())
 	fmt.Fprintf(stdout, "contract schemas: %d embedded (%s)\n", len(contract.Schemas()), strings.Join(contract.Schemas(), ", "))
 	fmt.Fprintln(stdout, "models: not checked; the offline doctor never calls Claude or Codex")
+	path, explicit := *configPath, *configPath != ""
+	if !explicit {
+		path, _ = config.DefaultPath(getenv)
+	}
+	if loaded, err := config.Load(path, explicit, getenv); err != nil {
+		fmt.Fprintf(stdout, "config: invalid: %v\n", err)
+		ok = false
+	} else {
+		environment(stdout, loaded)
+	}
 
 	profileDir, err := os.MkdirTemp("", "niten-doctor-")
 	if err != nil {

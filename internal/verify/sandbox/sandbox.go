@@ -92,6 +92,14 @@ type Result struct {
 	ForeignPIDs []int
 }
 
+// Sealed describes the roots after Seal: their new paths and the holders that
+// were found there. Holders are never killed by Seal; any holder refuses it.
+type Sealed struct {
+	SourceRoot  string
+	ScratchRoot string
+	Foreign     []int
+}
+
 // systemReadRoots are read-only system prefixes every process needs. The root
 // directory itself must be readable: dyld opens "/" and aborts otherwise.
 var systemReadRoots = []string{
