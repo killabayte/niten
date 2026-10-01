@@ -135,8 +135,9 @@ text and forged headings are handled without guessing; every `check_spec` is nul
 prepare starts no model and leaves the plan and the repository unchanged; owners are
 `niten` unless the user assigns `human`; `measure` is `needs_input` unless assigned to
 a human. The same scenarios pass against a real Shogun build of the S0 branch. All four
-archived plans parse with the strict grammar. Formal P1 acceptance still depends on
-S0 being reviewed and merged in Shogun.
+archived plans parse with the strict grammar. An external review accepted the offline
+P0a/P1 slice on 2026-10-01 (Niten `467ff7c`, Shogun S0 `29d03b3`); merging both
+branches is the remaining step.
 
 ## P2 Isolated work and a recoverable runner
 
@@ -160,7 +161,12 @@ Acceptance:
 - a crash before start, during a write, after the result and before the state checkpoint
   recovers the known outcomes or honestly leaves `outcome_unknown`;
 - a second coordinator does not get the same run; a stale PID does not kill someone else's process;
-- a saved result is recovered without a new model call.
+- a saved result is recovered without a new model call;
+- every verification attempt gets new, unique roots, and its outputs are read only
+  after a successful `Seal`; an unknown holder of the roots or a failed scan in `Run`
+  or `Seal` forbids accepting the evidence (accepted P0a limits: `setsid`/`setpgid`
+  are denied, and a descendant that escapes through `posix_spawn` attributes can
+  survive under the profile).
 
 Dependencies: P0a, plus P0b only for extra context roots. P2 automates the profile
 harness: verifier checks remain offline, model checks require `doctor --live`.
