@@ -491,6 +491,51 @@ func TestBaseSymlinkOutsideIsNotAViolation(t *testing.T) {
 	if ins, _ := c.Inspect(context.Background(), rules(t, c, "a.go", "shared")); len(ins.Violations) == 0 {
 		t.Fatal("a changed outside link was accepted")
 	}
+	// Any other change to the set of symlinks removes the exemption too: the
+	// base's own outside link is then refused like any other.
+	os.Remove(filepath.Join(c.Work, "shared"))
+	os.Symlink("../shared", filepath.Join(c.Work, "shared"))
+	os.Symlink("a.go", filepath.Join(c.Work, "alias.go"))
+	ins, err = c.Inspect(context.Background(), rules(t, c, "a.go", "alias.go"))
+	if err != nil || !strings.Contains(strings.Join(ins.Violations, " "), "shared: symlink to \"../shared\" leaves the repository") {
+		t.Fatalf("a changed symlink set kept the exemption: %v %v", ins.Violations, err)
+	}
+}
+
+// Review regression (P2, round 5): an unchanged symlink whose target was
+// inside the base (through a link spelled with another case or Unicode form)
+// and now leaves the repository because the other link changed is refused.
+func TestBaseExemptionCannotHideANewEscape(t *testing.T) {
+	for _, tc := range []struct{ name, link, spelled string }{
+		{"case", "alias", "ALIAS"},
+		{"normalization", "caf\u00e9", "cafe\u0301"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, c := newClone(t)
+			ctx := context.Background()
+			write(t, c.Work, "d/e/keep.txt", "keep\n")
+			write(t, c.Work, "outside", "inside the clone\n")
+			os.Symlink("d/e", filepath.Join(c.Work, tc.link))
+			if _, err := os.Lstat(filepath.Join(c.Work, tc.spelled)); err != nil {
+				t.Skip("this file system distinguishes the two spellings")
+			}
+			os.Symlink(tc.spelled+"/../../outside", filepath.Join(c.Work, "escape"))
+			ins, err := c.Inspect(ctx, rules(t, c))
+			if err != nil || len(ins.Violations) != 0 {
+				t.Fatalf("an inside base was refused: %v %v", ins.Violations, err)
+			}
+			if _, err := c.Commit(ctx, ins, "base links", time.Now()); err != nil {
+				t.Fatal(err)
+			}
+			os.WriteFile(filepath.Join(filepath.Dir(c.Work), "outside"), []byte("outside"), 0o600)
+			os.Remove(filepath.Join(c.Work, tc.link))
+			os.Symlink("d", filepath.Join(c.Work, tc.link))
+			ins, err = c.Inspect(ctx, rules(t, c, tc.link))
+			if err != nil || !strings.Contains(strings.Join(ins.Violations, " "), "escape: symlink to") {
+				t.Fatalf("a new escape was exempted: %v %v", ins.Violations, err)
+			}
+		})
+	}
 }
 
 // Review regression (P2, round 4): name lookup follows the file system. On a

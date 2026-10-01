@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"maps"
 	"os"
 	"os/exec"
 	"path"
@@ -421,56 +422,6 @@ type linkView map[string]string
 // maxHops bounds symlink resolution; a longer chain is treated as a loop.
 const maxHops = 40
 
-// escapes resolves the symlink at p the way the file system does: component
-// by component from the symlink's directory, following every symlink of the
-// view before a later ".." is applied. It reports whether the resolution
-// leaves the repository, through an absolute target, a ".." above the root or
-// a loop. Components that are not symlinks of the view are taken as
-// directories.
-func (v linkView) escapes(p string) (bool, string) {
-	target, ok := v[p]
-	if !ok {
-		return false, ""
-	}
-	var stack []string
-	if dir := path.Dir(p); dir != "." {
-		stack = strings.Split(dir, "/")
-	}
-	if strings.HasPrefix(target, "/") {
-		return true, "absolute target"
-	}
-	queue := strings.Split(target, "/")
-	hops := 0
-	for len(queue) > 0 {
-		c := queue[0]
-		queue = queue[1:]
-		switch c {
-		case "", ".":
-			continue
-		case "..":
-			if len(stack) == 0 {
-				return true, "resolves above the repository root"
-			}
-			stack = stack[:len(stack)-1]
-			continue
-		}
-		cur := strings.Join(append(append([]string{}, stack...), c), "/")
-		if t, isLink := v[cur]; isLink {
-			hops++
-			if hops > maxHops {
-				return true, "symlink loop"
-			}
-			if strings.HasPrefix(t, "/") {
-				return true, "resolves through " + cur + " to an absolute target"
-			}
-			queue = append(strings.Split(t, "/"), queue...)
-			continue
-		}
-		stack = append(stack, c)
-	}
-	return false, ""
-}
-
 // escapesOnDisk resolves the worktree symlink at rel against the worktree
 // itself: each component is looked up with Lstat, so the file system applies
 // its own name semantics (case and Unicode normalization insensitivity on
@@ -557,10 +508,12 @@ func (c *Clone) treeLinks(ctx context.Context, treeish string) (linkView, error)
 
 // checkLinks resolves every symlink of the snapshot and every ignored symlink
 // of the worktree on the worktree's own file system, and reports each one
-// that leaves the repository. A symlink that is unchanged from HEAD and
-// already left the repository there is the base's own and is not a
-// violation; any other escape is, including an unchanged symlink that now
-// escapes because another symlink changed.
+// that leaves the repository. Where a symlink resolves depends only on the
+// set of symlinks (their paths and targets) and the file system's name
+// lookup, so when that set is exactly the base commit's, nothing can resolve
+// differently from the base and an escape is the base's own. Any difference
+// in the set (a symlink added, removed or retargeted, or an ignored one)
+// removes that exemption: then every escaping symlink is a violation.
 func (c *Clone) checkLinks(ctx context.Context, head string, ins *Inspection, ignoredLinks linkView) error {
 	base, err := c.treeLinks(ctx, head)
 	if err != nil {
@@ -572,6 +525,9 @@ func (c *Clone) checkLinks(ctx context.Context, head string, ins *Inspection, ig
 	}
 	for p, t := range ignoredLinks {
 		cur[p] = t
+	}
+	if maps.Equal(base, cur) {
+		return nil
 	}
 	paths := make([]string, 0, len(cur))
 	for p := range cur {
@@ -586,11 +542,6 @@ func (c *Clone) checkLinks(ctx context.Context, head string, ins *Inspection, ig
 		}
 		if !esc {
 			continue
-		}
-		if bt, ok := base[p]; ok && bt == cur[p] {
-			if besc, _ := base.escapes(p); besc {
-				continue
-			}
 		}
 		where := ""
 		if _, ignored := ignoredLinks[p]; ignored {

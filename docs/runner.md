@@ -64,9 +64,10 @@ the live probes are separately authorized. The engine that drives these pieces (
   is applied: `alias -> .` with `escape -> ALIAS/../x` leaves the repository even though
   an exact or lexical comparison would say otherwise. An absolute target, a resolution above the root or a
   loop is a violation, also for an unchanged symlink that starts to escape because another
-  symlink changed. A symlink the base commit already had, unchanged and already pointing
-  outside, is the base's own and is not a violation (the base is resolved from its tree
-  with exact names, so a doubtful case only removes the exemption). Paths outside the plan targets are
+  symlink changed. Where a symlink resolves depends only on the set of symlinks and the
+  file system's name lookup, so a base commit's own outside symlink is tolerated only while
+  that set (snapshot plus ignored symlinks) is exactly the base's; once any symlink is
+  added, removed or retargeted, every escaping symlink is a violation, the base's included. Paths outside the plan targets are
   off-target; they are allowed for review, not rejected here.
 - `Commit` refuses any violation (there is no partial commit of the permitted part), an
   empty snapshot and a HEAD that moved since the inspection; candidates are committed by
