@@ -3,6 +3,7 @@ package provider
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -59,6 +60,34 @@ func fakeCLI(mode string) int {
 		fmt.Println("ready")
 		time.Sleep(60 * time.Second)
 		return 0
+	case "replay":
+		if p := os.Getenv("NITEN_FAKE_ARGV"); p != "" {
+			b, _ := json.Marshal(os.Args[1:])
+			os.WriteFile(p, b, 0o600)
+		}
+		if p := os.Getenv("NITEN_FAKE_COUNT"); p != "" {
+			f, _ := os.OpenFile(p, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+			f.WriteString("1\n")
+			f.Close()
+		}
+		if p := os.Getenv("NITEN_FAKE_STREAM"); p != "" {
+			b, _ := os.ReadFile(p)
+			os.Stdout.Write(b)
+		}
+		if p := os.Getenv("NITEN_FAKE_STDERR"); p != "" {
+			b, _ := os.ReadFile(p)
+			os.Stderr.Write(b)
+		}
+		if src := os.Getenv("NITEN_FAKE_LAST"); src != "" {
+			for i, a := range os.Args {
+				if a == "-o" && i+1 < len(os.Args) {
+					b, _ := os.ReadFile(src)
+					os.WriteFile(os.Args[i+1], b, 0o600)
+				}
+			}
+		}
+		code, _ := strconv.Atoi(os.Getenv("NITEN_FAKE_EXIT"))
+		return code
 	case "stray":
 		c := exec.Command("/bin/sleep", "60")
 		c.Stdout = os.Stdout
