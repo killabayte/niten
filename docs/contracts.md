@@ -59,7 +59,8 @@ architecture: 0, 1, 2, 3, 4, 5 and 130.
 - Finding IDs match `F-NNN`; a location is `{path, line_start?, line_end?}`.
 - Off-target vocabulary is split: the reviewer's verdict is `accept` or `reject`,
   the coordinator's disposition is `pending`, `accepted` or `rejected`.
-- `check_evidence` nests its key under `key{…}`; `finished_at` and `exit_code` are
+- `check_evidence` binds its streams by digest, `stdout_sha256` and `stderr_sha256` next
+  to the refs (P3 review finding, fixed 2026-10-01), and nests its key under `key{…}`; `finished_at` and `exit_code` are
   nullable; `status: passed` requires `sources_unchanged: true`, an integer exit
   code, a non-null `finished_at` and every assertion with `passed: true`. A record
   that claims `passed` while one assertion failed is rejected at validation

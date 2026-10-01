@@ -13,6 +13,7 @@ import (
 	"github.com/killabayte/niten/internal/contract"
 	"github.com/killabayte/niten/internal/holders"
 	"github.com/killabayte/niten/internal/plan"
+	"github.com/killabayte/niten/internal/store"
 )
 
 // ReceiptKind identifies execution.json.
@@ -186,20 +187,12 @@ func (e *Engine) finish(ctx context.Context) (*Outcome, error) {
 	}
 	pids, err := holders.List([]string{e.work})
 	gate(err == nil && len(pids) == 0, "processes still hold the run's work area: %v %v", pids, err)
-	covered := map[string]bool{}
-	if f.Review != nil {
-		var rr contract.ReviewResult
-		if err := e.message(fmt.Sprintf("m-%s-01", f.Review.Turn), &rr); err == nil {
-			for _, c := range rr.Coverage.CriterionIDsChecked {
-				covered[c] = true
-			}
-		}
-	}
-	crit, pending := e.criteriaStatus(covered)
+	covered := e.finalCoverage(e.st)
+	crit, pending := e.criteriaStatus(e.st, covered)
 	for _, c := range crit {
 		gate(c.Status != "uncovered", "criterion %s has no evidence", c.ID)
 	}
-	arts, err := e.verifyArtifacts()
+	_, err = e.verifyArtifacts(e.events)
 	gate(err == nil, "an artifact does not match its digest: %v", err)
 	if len(failed) > 0 {
 		return e.stop(contract.RunPaused, "final_gate", failed, contract.ExitRejected)
@@ -208,7 +201,7 @@ func (e *Engine) finish(ctx context.Context) (*Outcome, error) {
 	if len(pending) > 0 {
 		status = contract.RunImplemented
 	}
-	if err := e.saveReceipt(status, crit, pending, arts); err != nil {
+	if err := e.saveReceipt(status); err != nil {
 		return nil, err
 	}
 	if status == contract.RunImplemented {
@@ -217,10 +210,38 @@ func (e *Engine) finish(ctx context.Context) (*Outcome, error) {
 	return e.stop(status, "", nil, contract.ExitOK)
 }
 
+// finalCoverage is the criteria the approving final review checked.
+func (e *Engine) finalCoverage(s *State) map[string]bool {
+	covered := map[string]bool{}
+	if f := s.Final.Review; f != nil {
+		var rr contract.ReviewResult
+		if err := e.message(fmt.Sprintf("m-%s-01", f.Turn), &rr); err == nil {
+			for _, c := range rr.Coverage.CriterionIDsChecked {
+				covered[c] = true
+			}
+		}
+	}
+	return covered
+}
+
+// decisiveSeq is the last event the receipt depends on: the final acceptance,
+// or a later attestation. Events after it (a new session after a crash, a limit
+// raise) do not change the receipt, so a receipt rebuilt after a crash in the
+// middle of saving it has the same bytes.
+func (e *Engine) decisiveSeq() int64 {
+	seq := e.st.Final.AcceptedSeq
+	for _, a := range e.st.Attestations {
+		if a.Seq > seq {
+			seq = a.Seq
+		}
+	}
+	return seq
+}
+
 // criteriaStatus decides every criterion: coordinator-owned ones are covered by
 // the approving final review and the passed final checks; human-owned ones, and
 // criteria traced to a human-owned verification, need a passed attestation.
-func (e *Engine) criteriaStatus(covered map[string]bool) ([]receiptCrit, []string) {
+func (e *Engine) criteriaStatus(s *State, covered map[string]bool) ([]receiptCrit, []string) {
 	humanVerif := map[string]bool{}
 	for _, c := range e.c.Checks {
 		if c.Owner == string(contract.OwnerHuman) {
@@ -236,8 +257,8 @@ func (e *Engine) criteriaStatus(covered map[string]bool) ([]receiptCrit, []strin
 		}
 	}
 	attested := map[string]bool{}
-	for _, a := range e.st.Attestations {
-		if a.Candidate == e.st.Head && a.Result == string(contract.AttestationPassed) {
+	for _, a := range s.Attestations {
+		if a.Candidate == s.Head && a.Result == string(contract.AttestationPassed) {
 			attested[a.Criterion] = true
 		}
 	}
@@ -249,8 +270,8 @@ func (e *Engine) criteriaStatus(covered map[string]bool) ([]receiptCrit, []strin
 		switch {
 		case needsHuman && attested[c.ID]:
 			rc.Status = "attested"
-			for _, a := range e.st.Attestations {
-				if a.Criterion == c.ID && a.Candidate == e.st.Head {
+			for _, a := range s.Attestations {
+				if a.Criterion == c.ID && a.Candidate == s.Head {
 					rc.Evidence = append(rc.Evidence, a.Ref)
 				}
 			}
@@ -261,12 +282,12 @@ func (e *Engine) criteriaStatus(covered map[string]bool) ([]receiptCrit, []strin
 			rc.Status = "not_mandatory"
 		case covered[c.ID]:
 			rc.Status = "covered"
-			if e.st.Final.Review != nil {
-				rc.Evidence = append(rc.Evidence, "turn:"+e.st.Final.Review.Turn)
+			if s.Final.Review != nil {
+				rc.Evidence = append(rc.Evidence, "turn:"+s.Final.Review.Turn)
 			}
-			if ch := e.st.Final.Checks; ch != nil {
+			if ch := s.Final.Checks; ch != nil {
 				for _, r := range ch.Results {
-					spec := e.specByID(r.ID)
+					spec := specByID(s, r.ID)
 					if spec != nil && (slices.Contains(spec.CriterionIDs, c.ID) || e.tracesTo(spec, c.ID)) {
 						rc.Evidence = append(rc.Evidence, r.EvidenceRef)
 					}
@@ -280,8 +301,8 @@ func (e *Engine) criteriaStatus(covered map[string]bool) ([]receiptCrit, []strin
 	return out, pending
 }
 
-func (e *Engine) specByID(id string) *CheckSpec {
-	for _, u := range append(slices.Clone(e.st.Steps), e.st.Final) {
+func specByID(s *State, id string) *CheckSpec {
+	for _, u := range append(slices.Clone(s.Steps), s.Final) {
 		for i := range u.Specs {
 			if u.Specs[i].ID == id {
 				return &u.Specs[i]
@@ -306,8 +327,11 @@ func (e *Engine) tracesTo(spec *CheckSpec, criterion string) bool {
 	return false
 }
 
-// verifyArtifacts re-reads every artifact the journal references with its digest.
-func (e *Engine) verifyArtifacts() ([]artifactRef, error) {
+// verifyArtifacts re-reads every artifact the events reference with its
+// recorded digest: candidate records, messages, check evidence and the streams
+// each evidence record binds, attempt prompts, streams, outcomes and results,
+// collected reviewer evidence, answers, attestations, receipts and the inputs.
+func (e *Engine) verifyArtifacts(events []store.Event) ([]artifactRef, error) {
 	seen := map[string]bool{}
 	var out []artifactRef
 	add := func(ref, sha string) {
@@ -316,7 +340,8 @@ func (e *Engine) verifyArtifacts() ([]artifactRef, error) {
 			out = append(out, artifactRef{Ref: ref, SHA: sha})
 		}
 	}
-	for _, ev := range e.events {
+	var evidence []CheckOutcome
+	for _, ev := range events {
 		switch ev.Type {
 		case evProcessed, evChecks, evFinalStarted, evResidue, evStepState:
 			var d processedData
@@ -329,30 +354,80 @@ func (e *Engine) verifyArtifacts() ([]artifactRef, error) {
 			for _, m := range d.Messages {
 				add(m.Ref, m.SHA)
 			}
-			if d.Checks != nil {
-				for _, r := range d.Checks.Results {
-					add(r.EvidenceRef, r.EvidenceSHA)
-				}
+			for _, c := range d.Collected {
+				add(c.Ref, c.SHA)
 			}
+			if d.Checks != nil {
+				evidence = append(evidence, d.Checks.Results...)
+			}
+		case attempt.EvIntent:
+			var d struct {
+				PromptRef string `json:"prompt_ref"`
+				PromptSHA string `json:"prompt_sha256"`
+			}
+			if err := json.Unmarshal(ev.Data, &d); err != nil {
+				return nil, err
+			}
+			add(d.PromptRef, d.PromptSHA)
 		case attempt.EvFinished:
 			var d struct {
 				OutcomeRef string `json:"outcome_ref"`
 				OutcomeSHA string `json:"outcome_sha256"`
 				ResultRef  string `json:"result_ref"`
 				ResultSHA  string `json:"result_sha256"`
+				StdoutRef  string `json:"stdout_ref"`
+				StdoutSHA  string `json:"stdout_sha256"`
+				StderrRef  string `json:"stderr_ref"`
+				StderrSHA  string `json:"stderr_sha256"`
 			}
 			if err := json.Unmarshal(ev.Data, &d); err != nil {
 				return nil, err
 			}
 			add(d.OutcomeRef, d.OutcomeSHA)
 			add(d.ResultRef, d.ResultSHA)
+			add(d.StdoutRef, d.StdoutSHA)
+			add(d.StderrRef, d.StderrSHA)
 		case evAttestation:
 			var d AttestationView
 			if err := json.Unmarshal(ev.Data, &d); err != nil {
 				return nil, err
 			}
 			add(d.Ref, d.SHA)
+		case evGateReleased:
+			var d gateReleasedData
+			if err := json.Unmarshal(ev.Data, &d); err != nil {
+				return nil, err
+			}
+			add(d.AnswerRef, d.AnswerSHA)
+		case evAnswer:
+			var d answerData
+			if err := json.Unmarshal(ev.Data, &d); err != nil {
+				return nil, err
+			}
+			add(d.Ref, d.SHA)
+		case evReceipt:
+			var d ReceiptView
+			if err := json.Unmarshal(ev.Data, &d); err != nil {
+				return nil, err
+			}
+			add(d.Ref, d.SHA)
+			add(d.MDRef, d.MDSHA)
 		}
+	}
+	for _, r := range evidence {
+		if seen[r.EvidenceRef] {
+			continue
+		}
+		add(r.EvidenceRef, r.EvidenceSHA)
+		_, ev, err := e.evidence(r)
+		if err != nil {
+			return nil, err
+		}
+		if ev.StdoutSHA256 == "" || ev.StderrSHA256 == "" {
+			return nil, fmt.Errorf("%s records no digest of its streams", r.EvidenceRef)
+		}
+		add(ev.StdoutRef, ev.StdoutSHA256)
+		add(ev.StderrRef, ev.StderrSHA256)
 	}
 	add(e.c.Inputs.Plan.Stored, e.c.Inputs.Plan.SHA256)
 	add(e.c.Inputs.Receipt.Stored, e.c.Inputs.Receipt.SHA256)
@@ -368,18 +443,29 @@ func (e *Engine) verifyArtifacts() ([]artifactRef, error) {
 }
 
 // saveReceipt writes the receipt as a new immutable version, makes it the
-// current execution.json and execution.md, and records it.
-func (e *Engine) saveReceipt(status contract.RunState, crit []receiptCrit, pending []string, arts []artifactRef) error {
-	f := e.st.Final
+// current execution.json and execution.md, and records it. The receipt is
+// built from the journal folded up to the decisive event, never from the clock
+// or from later events, so rebuilding it after a crash gives the same bytes.
+func (e *Engine) saveReceipt(status contract.RunState) error {
+	snap, events, err := e.snapshot(e.decisiveSeq())
+	if err != nil {
+		return err
+	}
+	crit, pending := e.criteriaStatus(snap, e.finalCoverage(snap))
+	arts, err := e.verifyArtifacts(events)
+	if err != nil {
+		return err
+	}
+	f := snap.Final
 	repo := e.c.Repos[0]
-	r := Receipt{SchemaVersion: 1, Kind: ReceiptKind, Version: len(e.st.Receipts) + 1, Status: status, RunID: e.st.RunID,
-		CreatedAt: e.o.Now().UTC().Format(time.RFC3339), Plan: e.c.Plan, PlanDigest: e.c.PlanDigest, ContractDigest: e.contractSHA,
+	r := Receipt{SchemaVersion: 1, Kind: ReceiptKind, Version: len(snap.Receipts) + 1, Status: status, RunID: snap.RunID,
+		CreatedAt: events[len(events)-1].Time, Plan: e.c.Plan, PlanDigest: e.c.PlanDigest, ContractDigest: e.contractSHA,
 		SemanticsDigest: e.c.SemanticsDigest, Repository: receiptRepo{ID: repo.ID, Path: repo.Path, BaseCommit: repo.BaseCommit, BaseTree: repo.BaseTree},
-		Final:    receiptFinal{Commit: f.Candidate.Commit, Tree: f.Candidate.Tree, Branch: "niten", Clone: e.st.CloneWork, GitDir: e.st.CloneGitDir},
-		Criteria: crit, Checks: f.Checks.Results, FinalReview: *f.Review, Findings: e.st.Findings, PendingExternal: nonNil(pending),
-		Attestations: e.st.Attestations, Turns: e.st.Turns, Artifacts: arts,
-		Limits: receiptLimits{Effective: e.st.Limits, History: e.st.LimitHistory, Invocations: e.st.Invocations, ActiveMS: e.st.ActiveMS}}
-	for _, s := range e.st.Steps {
+		Final:    receiptFinal{Commit: f.Candidate.Commit, Tree: f.Candidate.Tree, Branch: "niten", Clone: snap.CloneWork, GitDir: snap.CloneGitDir},
+		Criteria: crit, Checks: f.Checks.Results, FinalReview: *f.Review, Findings: snap.Findings, PendingExternal: nonNil(pending),
+		Attestations: snap.Attestations, Turns: snap.Turns, Artifacts: arts,
+		Limits: receiptLimits{Effective: snap.Limits, History: snap.LimitHistory, Invocations: snap.Invocations, ActiveMS: snap.ActiveMS}}
+	for _, s := range snap.Steps {
 		rs := receiptStep{ID: s.ID, AcceptedAt: s.AcceptedAt, Repairs: s.Repairs, Reviews: s.Reviews}
 		if s.Review != nil {
 			rs.Review, rs.Evidence = s.Review.Turn, s.Review.Evidence
@@ -389,13 +475,13 @@ func (e *Engine) saveReceipt(status contract.RunState, crit []receiptCrit, pendi
 	var rr contract.ReviewResult
 	if err := e.message(fmt.Sprintf("m-%s-01", f.Review.Turn), &rr); err == nil {
 		for _, d := range rr.Coverage.OffTargetDispositions {
-			r.OffTarget = append(r.OffTarget, receiptOff{Path: d.Path, Reason: e.justification(d.Path), Disposition: string(d.Disposition), Review: f.Review.Turn})
+			r.OffTarget = append(r.OffTarget, receiptOff{Path: d.Path, Reason: justification(snap, d.Path), Disposition: string(d.Disposition), Review: f.Review.Turn})
 		}
 	}
 	r.OffTarget = nonNil(r.OffTarget)
 	r.Models.Executor = modelFacts{Requested: e.exec.Model, Effort: e.exec.Effort, EffortReported: "unknown", Reported: []string{}}
 	r.Models.Reviewer = modelFacts{Requested: e.rev.Model, Effort: e.rev.Effort, EffortReported: e.rev.Effort, Reported: []string{}}
-	for _, t := range e.st.Turns {
+	for _, t := range snap.Turns {
 		if t.Reported == "" {
 			continue
 		}
@@ -418,10 +504,11 @@ func (e *Engine) saveReceipt(status contract.RunState, crit []receiptCrit, pendi
 	if err != nil {
 		return err
 	}
-	if _, err := e.writeOrReuse(base+".md", md); err != nil {
+	mdSHA, err := e.writeOrReuse(base+".md", md)
+	if err != nil {
 		return err
 	}
-	if err := e.emit(evReceipt, ReceiptView{Status: string(status), Ref: base + ".json", SHA: sha, MDRef: base + ".md", Candidate: r.Final.Commit}); err != nil {
+	if err := e.emit(evReceipt, ReceiptView{Status: string(status), Ref: base + ".json", SHA: sha, MDRef: base + ".md", MDSHA: mdSHA, Candidate: r.Final.Commit}); err != nil {
 		return err
 	}
 	if _, err := e.run.Replace("execution.json", b); err != nil {
@@ -431,13 +518,13 @@ func (e *Engine) saveReceipt(status contract.RunState, crit []receiptCrit, pendi
 	return err
 }
 
-func (e *Engine) justification(path string) string {
-	for _, s := range e.st.Steps {
-		if r, ok := s.Justifications[path]; ok {
+func justification(s *State, path string) string {
+	for _, u := range s.Steps {
+		if r, ok := u.Justifications[path]; ok {
 			return r
 		}
 	}
-	if r, ok := e.st.Final.Justifications[path]; ok {
+	if r, ok := s.Final.Justifications[path]; ok {
 		return r
 	}
 	return ""
@@ -507,7 +594,7 @@ func (e *Engine) completeExternal(ctx context.Context) (Outcome, error) {
 			return Outcome{State: e.st.State, Reason: "attestation_failed", Detail: []string{fmt.Sprintf("%s was attested as failed; a new code change needs a new revision", a.Criterion)}, Exit: contract.ExitRejected}, nil
 		}
 	}
-	if _, pending := e.criteriaStatus(map[string]bool{}); len(pending) > 0 {
+	if _, pending := e.criteriaStatus(e.st, map[string]bool{}); len(pending) > 0 {
 		return Outcome{State: e.st.State, Reason: "pending_external", Detail: pending, Exit: contract.ExitImplemented}, nil
 	}
 	out, err := e.finish(ctx)

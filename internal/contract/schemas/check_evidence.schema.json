@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "check_evidence.schema.json",
   "type": "object", "additionalProperties": false,
-  "required": ["schema_version", "key", "argv", "cwd", "tool_version", "env_names", "started_at", "finished_at", "exit_code", "stdout_ref", "stderr_ref", "assertions", "sources_unchanged", "status"],
+  "required": ["schema_version", "key", "argv", "cwd", "tool_version", "env_names", "started_at", "finished_at", "exit_code", "stdout_ref", "stdout_sha256", "stderr_ref", "stderr_sha256", "assertions", "sources_unchanged", "status"],
   "properties": {
     "schema_version": {"type": "integer", "const": 1},
     "key": {
@@ -26,7 +26,9 @@
     "finished_at": {"oneOf": [{"type": "null"}, {"$ref": "common.schema.json#/$defs/timestamp"}]},
     "exit_code": {"oneOf": [{"type": "null"}, {"type": "integer"}]},
     "stdout_ref": {"$ref": "common.schema.json#/$defs/nonempty"},
+    "stdout_sha256": {"$ref": "common.schema.json#/$defs/digest"},
     "stderr_ref": {"$ref": "common.schema.json#/$defs/nonempty"},
+    "stderr_sha256": {"$ref": "common.schema.json#/$defs/digest"},
     "assertions": {
       "type": "array",
       "items": {

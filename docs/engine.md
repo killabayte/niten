@@ -72,12 +72,15 @@ without an outcome is resolved without calling the model again:
 
 ## Turns and what is trusted
 
-A turn is one model invocation: the attempt id is the turn id (`t003-s-001-repair`).
-Its structured output is one document. `executor_turn` holds the candidate announcement,
-responses to findings and blocking questions. `reviewer_turn` holds the reviewed commit,
-the review result, findings, check requests, test assessments and questions. The
-coordinator splits the document into envelopes of the [contract](contracts.md) message
-kinds and sets every envelope field except the payload.
+A turn is one model invocation: the attempt id is the turn id (`t003-s-001-repair`). A
+turn is recorded before any of its roots is created, so a crash while they are prepared
+never makes the next turn reuse an id. Roots left under the id of a turn the journal
+never recorded are removed before the turn starts, unless a process holds them; then the
+run does not continue. Its structured output is one document. `executor_turn` holds the
+candidate announcement, responses to findings and blocking questions. `reviewer_turn`
+holds the reviewed commit, the review result, findings, check requests, test assessments
+and questions. The coordinator splits the document into envelopes of the
+[contract](contracts.md) message kinds and sets every envelope field except the payload.
 
 Nothing a model writes is evidence until the coordinator has resolved it.
 
@@ -115,17 +118,26 @@ needs input.
 ## Checks
 
 The check set of a unit is the policy's required checks plus the unit's accepted
-proposals, accumulated across turns: a check, once accepted, keeps running and cannot be
-withdrawn. A proposal is accepted when its argv equals an allowed command exactly, its
-cwd is a clean relative directory, its timeout is at most the command's, and its
-expectations compile. Any other proposal is refused and stays with the unit as a problem
-for the repair. Every coordinator-owned `test` or `command` verification of the unit
-must be covered by an accepted check; a missing one keeps the candidate from review.
-Equal specs run once per evaluation and share their evidence. The evidence digest binds
-the candidate, every check's evidence digest and status, and the problems; a review is
-bound to it. Reviewer check requests are validated the same way and join the unit's
-check set from the next evaluation on, at the latest in the final checks. A check whose
+proposals, accumulated across turns. An accepted check is never replaced or withdrawn: the
+same proposal again is no change, and a changed definition under an accepted id is
+refused while the original keeps running. Checks are scoped to their unit and their role,
+`S-001/go-test` for the executor and `S-001/review/go-test` for the reviewer, so one role
+can never name, and so never weaken, the other's check. A proposal is accepted when its
+argv equals an allowed command exactly, its cwd is a clean relative directory, its
+timeout is at most the command's, and its expectations compile. Any other proposal is
+refused and stays with the unit as a problem for the repair. Every coordinator-owned
+`test` or `command` verification of the unit must be covered by an accepted check; a
+missing one keeps the candidate from review. Equal specs run once per evaluation and
+share their evidence. The evidence digest binds the candidate, every check's evidence
+digest and status, and the problems; a review is bound to it. Reviewer check requests
+are validated the same way. A review that requests a new check cannot accept the unit
+on the evidence it saw: the unit goes back to `candidate`, the check runs on the same
+candidate, and the unit is reviewed again against the new evidence digest. This holds
+for the final review too, so a requested check always runs before `done`. A check whose
 status is `unknown` (a sandbox failure) pauses the run instead of blaming the candidate.
+
+Every check evidence record carries the digests of its stdout and stderr; packets, repair
+summaries and the final gate read the streams by those digests.
 
 ## Packets
 
@@ -168,8 +180,10 @@ reviewer for the same candidate.
 
 - **Invocations** are the `attempt.started` events. A call is refused when none remain.
 - **Active time** accrues between the events of a session. Waiting in `needs_input` or
-  `paused` between sessions costs nothing. Time after the last event before a crash is
-  not counted.
+  `paused` between sessions costs nothing. A session start is a boundary: when the
+  journal ends inside a session (a crash), `resume` records a new session before
+  recovery writes anything, so neither the downtime nor the time after the last event
+  before the crash is counted.
 - **Each attempt's deadline** is the invocation deadline or the remaining active time,
   whichever is shorter.
 - **A new step** starts only when at least the final reserve plus two invocations, and
@@ -223,9 +237,21 @@ content digest, before its entries apply.
 - every artifact the journal references matches its digest.
 
 Then a receipt is written as an immutable version (`receipts/<n>-<status>.json` and
-`.md`), `receipt.saved` is recorded, `execution.json` and `execution.md` are replaced
-atomically, and only then the run state becomes `done` or `implemented`. A failing gate
-pauses the run with `final_gate` and exit 1.
+`.md`), `receipt.saved` is recorded with both digests, `execution.json` and
+`execution.md` are replaced atomically, and only then the run state becomes `done` or
+`implemented`. A failing gate pauses the run with `final_gate` and exit 1.
+
+The receipt is built from the journal folded up to the decisive event: the final
+acceptance, or a later attestation. Its creation time is that event's time, and its
+usage, criteria and artifact list are those of that state. Later events, such as a new
+session after a crash, do not change it. A crash after the receipt files were written but
+before `receipt.saved` therefore rebuilds the same bytes, and the existing files are
+reused.
+
+The artifacts the gate verifies are every one the journal references by digest:
+candidate records, messages, check evidence and the streams it binds, attempt prompts,
+streams, outcomes and results, collected reviewer evidence, answers files,
+attestations, earlier receipts, the stored inputs and the contract.
 
 The receipt holds the plan identity and digests, the base and final commits, per-step
 acceptance, per-criterion status with evidence, the final checks and review, the ledger,
@@ -277,7 +303,13 @@ go-two-step fixture, a two-step plan on a small Go module published by Shogun's 
   - a saved result applied after a crash, a crash between moving the branch and the
     journal, an unexplained branch move, an unknown outcome, a rate limit and an
     interrupt;
-  - a reviewer's check request joining the final checks.
+  - a reviewer's check request leading to a review of the new evidence, and a final
+    review's check request running before `done`;
+  - a reviewer check the executor cannot weaken, and a refused redefinition of an
+    accepted check;
+  - a missing check stream failing the final gate, a receipt rebuilt byte for byte
+    after a crash, leftover roots of an unrecorded turn (free and held), and crash
+    downtime kept out of the active time.
 
 The prompt-injection scenarios check mechanical boundaries: roles, profiles, packets and
 provenance. They do not claim that any model is robust against injection.

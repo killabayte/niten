@@ -222,12 +222,13 @@ func readJSON(t *testing.T, e *Engine, rel string, v any) {
 func TestTwoStepPlanReachesDoneAfterTheReceipt(t *testing.T) {
 	t.Parallel()
 	script := happyScript(t)
-	// The reviewer of S-002 asks for go vet; it joins the final checks.
+	// The reviewer of S-002 approves but asks for go vet: the check runs on
+	// the same candidate and S-002 is reviewed again against the new evidence.
 	vet := goTest("go-vet", "R-002.C1", "S-002/V-001")
 	vet.Method, vet.Argv = contract.MethodCommand, []string{"go", "vet", "./..."}
 	r2 := review(contract.VerdictApprove, []string{"R-002.C1"}, both)
 	r2.CheckRequests = []contract.CheckRequest{{Proposal: vet, Reason: "the change adds exported API", CriterionIDs: []string{"R-002.C1"}}}
-	script.Reviewer[2] = revAction(t, r2)
+	script.Reviewer = append(script.Reviewer[:2], revAction(t, r2), script.Reviewer[2], script.Reviewer[3])
 	w := newWorld(t, script, setup{})
 	out, e := w.run()
 	defer e.Close()
@@ -236,7 +237,7 @@ func TestTwoStepPlanReachesDoneAfterTheReceipt(t *testing.T) {
 	}
 	st := e.State()
 	s1, s2 := st.Unit("S-001"), st.Unit("S-002")
-	if s1.Repairs != 1 || s1.Reviews != 2 || s2.Repairs != 0 || s2.Reviews != 1 || st.Invocations != 7 {
+	if s1.Repairs != 1 || s1.Reviews != 2 || s2.Repairs != 0 || s2.Reviews != 2 || st.Invocations != 8 {
 		t.Fatalf("S-001 repairs %d reviews %d, S-002 repairs %d reviews %d, invocations %d", s1.Repairs, s1.Reviews, s2.Repairs, s2.Reviews, st.Invocations)
 	}
 	if f := st.Finding("F-001"); f == nil || f.State != contract.FindingFixed || len(f.Responses) != 1 {
@@ -251,6 +252,15 @@ func TestTwoStepPlanReachesDoneAfterTheReceipt(t *testing.T) {
 	}
 	if len(reviews) != 2 || reviews[0].Candidate == reviews[1].Candidate || reviews[1].Candidate != s1.AcceptedAt {
 		t.Fatalf("S-001 reviews: %+v, accepted at %s", reviews, s1.AcceptedAt)
+	}
+	var s2reviews []*TurnView
+	for _, tv := range st.Turns {
+		if tv.Unit == "S-002" && tv.Kind == KindReview {
+			s2reviews = append(s2reviews, tv)
+		}
+	}
+	if len(s2reviews) != 2 || s2reviews[0].Candidate != s2reviews[1].Candidate || s2reviews[0].Evidence == s2reviews[1].Evidence {
+		t.Fatalf("the requested check did not lead to a review of the new evidence: %+v", s2reviews)
 	}
 	checked := map[string]bool{}
 	for _, ev := range e.events {
@@ -287,7 +297,7 @@ func TestTwoStepPlanReachesDoneAfterTheReceipt(t *testing.T) {
 		if c.Status != contract.CheckPassed {
 			t.Fatalf("final check %+v", c)
 		}
-		vetRan = vetRan || c.ID == "S-002/go-vet"
+		vetRan = vetRan || c.ID == "S-002/review/go-vet"
 	}
 	if !vetRan {
 		t.Fatalf("the reviewer's check request did not join the final checks: %+v", r.Checks)

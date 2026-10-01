@@ -38,6 +38,7 @@ type reviewView struct {
 	required  []string // mandatory coordinator-owned criteria the approval must cover
 	refs      refs
 	evidence  map[string]string // evidence/<name> -> store ref
+	collected []artifactRef
 	firstPass bool
 }
 
@@ -99,6 +100,22 @@ func (e *Engine) reviewerTurn(ctx context.Context, u *StepView) (*Outcome, error
 		kind = KindFinalReview
 	}
 	id := e.turnID(u.ID, kind)
+	if err := e.clearUnrecorded(id); err != nil {
+		return nil, err
+	}
+	rv, err := e.reviewContext(ctx, u)
+	if err != nil {
+		return nil, err
+	}
+	prompt, err := e.reviewerPrompt(u, kind, rv)
+	if err != nil {
+		return nil, err
+	}
+	// Recorded before any root exists; see executorTurn.
+	if err := e.emit(evTurn, TurnView{ID: id, Role: string(contract.RoleReviewer), Kind: kind, Unit: u.ID, Candidate: u.Candidate.Commit,
+		Evidence: u.Checks.Digest, PacketRef: "attempts/" + id + "/prompt", PacketSHA: digest(prompt)}); err != nil {
+		return nil, err
+	}
 	base := e.reviewBase(id)
 	launcher := filepath.Join(base, "launcher")
 	for _, d := range []string{base, filepath.Join(base, "control"), launcher, filepath.Join(launcher, "packet", "checks"), filepath.Join(launcher, "evidence")} {
@@ -107,10 +124,6 @@ func (e *Engine) reviewerTurn(ctx context.Context, u *StepView) (*Outcome, error
 		}
 	}
 	if err := e.clone.Materialize(ctx, u.Candidate.Commit, filepath.Join(launcher, "source")); err != nil {
-		return nil, err
-	}
-	rv, err := e.reviewContext(ctx, u)
-	if err != nil {
 		return nil, err
 	}
 	if err := e.writePacket(launcher, u, rv); err != nil {
@@ -127,16 +140,8 @@ func (e *Engine) reviewerTurn(ctx context.Context, u *StepView) (*Outcome, error
 	if err := provider.CheckFreshOutput(req.LastPath); err != nil {
 		return nil, err
 	}
-	prompt, err := e.reviewerPrompt(u, kind, rv)
-	if err != nil {
-		return nil, err
-	}
 	env, stripped, err := e.childEnv(filepath.Join(launcher, "scratch"), provider.CodexRustLog)
 	if err != nil {
-		return nil, err
-	}
-	if err := e.emit(evTurn, TurnView{ID: id, Role: string(contract.RoleReviewer), Kind: kind, Unit: u.ID, Candidate: u.Candidate.Commit,
-		Evidence: u.Checks.Digest, PacketRef: "attempts/" + id + "/prompt", PacketSHA: digest(prompt)}); err != nil {
 		return nil, err
 	}
 	e.logf("%s: %s of %s (%s)", u.ID, kind, short(u.Candidate.Commit), id)
@@ -159,25 +164,37 @@ func (e *Engine) writePacket(launcher string, u *StepView, rv *reviewView) error
 	}
 	for _, r := range u.Checks.Results {
 		name := strings.ReplaceAll(r.ID, "/", "__")
-		ev, err := e.run.ReadArtifact(r.EvidenceRef, r.EvidenceSHA)
+		raw, ev, err := e.evidence(r)
 		if err != nil {
 			return err
 		}
-		if err := os.WriteFile(filepath.Join(launcher, "packet", "checks", name+".json"), ev, 0o600); err != nil {
+		if err := os.WriteFile(filepath.Join(launcher, "packet", "checks", name+".json"), raw, 0o600); err != nil {
 			return err
 		}
-		dir := strings.TrimSuffix(r.EvidenceRef, "/evidence.json")
-		for _, s := range []string{"stdout", "stderr"} {
-			b, err := e.run.ReadArtifact(dir+"/"+s, "")
+		for _, s := range []struct{ ext, ref, sha string }{{"stdout", ev.StdoutRef, ev.StdoutSHA256}, {"stderr", ev.StderrRef, ev.StderrSHA256}} {
+			b, err := e.run.ReadArtifact(s.ref, s.sha)
 			if err != nil {
 				return err
 			}
-			if err := os.WriteFile(filepath.Join(launcher, "packet", "checks", name+"."+s), tail(b, maxPacketStream), 0o600); err != nil {
+			if err := os.WriteFile(filepath.Join(launcher, "packet", "checks", name+"."+s.ext), tail(b, maxPacketStream), 0o600); err != nil {
 				return err
 			}
 		}
 	}
 	return nil
+}
+
+// evidence reads a check's evidence record by its digest.
+func (e *Engine) evidence(r CheckOutcome) ([]byte, contract.CheckEvidence, error) {
+	var ev contract.CheckEvidence
+	raw, err := e.run.ReadArtifact(r.EvidenceRef, r.EvidenceSHA)
+	if err != nil {
+		return nil, ev, err
+	}
+	if err := json.Unmarshal(raw, &ev); err != nil {
+		return nil, ev, fmt.Errorf("%s: %w", r.EvidenceRef, err)
+	}
+	return raw, ev, nil
 }
 
 func tail(b []byte, n int) []byte {
@@ -215,9 +232,11 @@ func (e *Engine) collectEvidence(t *TurnView, rv *reviewView) ([]string, error) 
 			return nil, err
 		}
 		ref := "reviews/" + t.ID + "/evidence/" + de.Name()
-		if _, err := e.writeOrReuse(ref, b); err != nil {
+		sha, err := e.writeOrReuse(ref, b)
+		if err != nil {
 			return nil, err
 		}
+		rv.collected = append(rv.collected, artifactRef{Ref: ref, SHA: sha})
 		rv.evidence["evidence/"+de.Name()] = ref
 		rv.refs.exact["evidence/"+de.Name()] = true
 		n++
@@ -261,7 +280,7 @@ func (e *Engine) processReviewer(ctx context.Context, t *TurnView, res *provider
 	if err != nil {
 		return nil, err
 	}
-	pd.Reported = res.Reported.Model
+	pd.Reported, pd.Collected = res.Reported.Model, rv.collected
 	pd.Review.Reasons = append(pd.Review.Reasons, notes...)
 	if err := e.emit(evProcessed, pd); err != nil {
 		return nil, err
@@ -272,9 +291,12 @@ func (e *Engine) processReviewer(ctx context.Context, t *TurnView, res *provider
 	case len(pd.Questions) > 0:
 		return e.askQuestions(pd.Questions)
 	}
-	if accepts {
+	switch {
+	case accepts:
 		e.logf("%s: accepted at %s", u.ID, short(u.Candidate.Commit))
-	} else {
+	case pd.Step != nil && pd.Step.State == contract.StepCandidate:
+		e.logf("%s: %s", u.ID, strings.Join(pd.Review.Reasons, "; "))
+	default:
 		e.logf("%s: changes requested: %s", u.ID, strings.Join(pd.Review.Reasons, "; "))
 	}
 	return nil, nil
@@ -472,12 +494,25 @@ func (e *Engine) applyReview(u *StepView, t *TurnView, rt *contract.ReviewerTurn
 	}
 	sort.Strings(others)
 	why = append(why, others...)
+	// An approval that asks for new checks is not an approval of the evidence
+	// it saw: the checks run on this candidate first, and the unit is reviewed
+	// again against the new evidence digest.
+	recheck := len(why) == 0 && len(v.specs) > 0
+	if recheck {
+		var ids []string
+		for _, sp := range v.specs {
+			ids = append(ids, sp.ID)
+		}
+		why = append(why, fmt.Sprintf("the reviewer requested new checks (%s); they run on this candidate, then it is reviewed again", strings.Join(ids, ", ")))
+	}
 	accepts := len(why) == 0
 	pd.Review = &ReviewView{Turn: t.ID, Candidate: cid.Commit, Evidence: t.Evidence, Verdict: rt.Review.Verdict, Accepts: accepts, Reasons: append(why, v.problems...)}
 	switch {
 	case rt.Review.Verdict == contract.VerdictBlocked:
 	case accepts:
 		pd.Accepted = &acceptedData{Candidate: cid.Commit, Review: t.ID, Evidence: t.Evidence}
+	case recheck:
+		pd.Step = &stepStateData{State: contract.StepCandidate, Repairs: u.Repairs, Problems: nonNil(slices.Clone(v.problems))}
 	default:
 		pd.Step = &stepStateData{State: contract.StepChangesRequested, Repairs: u.Repairs, Problems: append(slices.Clone(why), v.problems...)}
 	}

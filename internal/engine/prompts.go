@@ -200,14 +200,12 @@ func (e *Engine) failedChecks(u *StepView) []map[string]any {
 		if r.Status == contract.CheckPassed {
 			continue
 		}
-		var ev contract.CheckEvidence
-		b, err := e.run.ReadArtifact(r.EvidenceRef, r.EvidenceSHA)
+		_, ev, err := e.evidence(r)
+		var so, se []byte
 		if err == nil {
-			_ = json.Unmarshal(b, &ev)
+			so, _ = e.run.ReadArtifact(ev.StdoutRef, ev.StdoutSHA256)
+			se, _ = e.run.ReadArtifact(ev.StderrRef, ev.StderrSHA256)
 		}
-		dir := strings.TrimSuffix(r.EvidenceRef, "/evidence.json")
-		so, _ := e.run.ReadArtifact(dir+"/stdout", "")
-		se, _ := e.run.ReadArtifact(dir+"/stderr", "")
 		out = append(out, map[string]any{"check": r.ID, "status": r.Status, "evidence_ref": r.EvidenceRef, "argv": ev.Argv, "exit_code": ev.ExitCode,
 			"assertions": ev.Assertions, "stdout_tail": string(tail(so, 8<<10)), "stderr_tail": string(tail(se, 8<<10))})
 	}

@@ -153,3 +153,35 @@ func TestEvidenceDigestAndGateBindTheCandidate(t *testing.T) {
 		t.Fatal("a gate does not depend on the accepted candidate")
 	}
 }
+
+// A crashed session's downtime is not active time: the next session start is
+// a boundary, whatever the reducer saw last.
+func TestCrashDowntimeIsNotActiveTime(t *testing.T) {
+	s := newState("r", "c", "p", "base", []string{"S-001"}, Limits{MaxActiveTime: "10m"})
+	for _, e := range []store.Event{
+		ev(1, "2026-10-01T00:00:00Z", evSession, sessionData{Command: "run"}),
+		ev(2, "2026-10-01T00:00:01Z", evRunState, runStateData{State: contract.RunRunning}),
+		// The coordinator crashed here, without a stop event.
+		ev(3, "2026-10-01T01:00:01Z", evSession, sessionData{Command: "recover"}),
+		ev(4, "2026-10-01T01:00:03Z", evRunState, runStateData{State: contract.RunRunning}),
+	} {
+		if err := s.apply(e); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if s.ActiveMS != 3000 {
+		t.Fatalf("active %d ms, want 3000: the crash downtime was counted", s.ActiveMS)
+	}
+}
+
+// An accepted check keeps its id and definition: a later one under the same
+// id is never added in its place.
+func TestAcceptedChecksAreNeverReplaced(t *testing.T) {
+	u := newUnit("S-001")
+	strict := CheckSpec{ID: "S-001/go-test", Expected: contract.CheckExpected{StdoutContains: []string{"ok"}}}
+	u.addSpecs([]CheckSpec{strict})
+	u.addSpecs([]CheckSpec{{ID: "S-001/go-test"}})
+	if len(u.Specs) != 1 || len(u.Specs[0].Expected.StdoutContains) != 1 {
+		t.Fatalf("specs %+v", u.Specs)
+	}
+}

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -890,5 +891,219 @@ func TestRateLimitPauses(t *testing.T) {
 	want(t, out, contract.RunPaused, "rate_limit", "rate limit")
 	if w.calls("executor") != 1 {
 		t.Fatal("a rate-limited call was retried")
+	}
+}
+
+// A check the final reviewer requests runs before done, and the final review
+// has to approve the new evidence: an impossible expectation keeps the run
+// from done.
+func TestFinalReviewCheckRunsBeforeDone(t *testing.T) {
+	t.Parallel()
+	script := happyScript(t)
+	rt := review(contract.VerdictApprove, []string{"R-001.C1", "R-002.C1"}, both)
+	p := goTest("marker", "R-002.C1", "S-002/V-001")
+	p.Expected.StdoutContains = []string{"THIS_MARKER_IS_NEVER_PRINTED"}
+	rt.CheckRequests = []contract.CheckRequest{{Proposal: p, Reason: "require this output before acceptance", CriterionIDs: []string{"R-002.C1"}}}
+	script.Reviewer[3] = revAction(t, rt)
+	w := newWorld(t, script, setup{})
+	out, e := w.run()
+	defer e.Close()
+	if out.State == contract.RunDone || len(e.State().Receipts) != 0 {
+		t.Fatalf("done despite the final review's check: %+v", out)
+	}
+	f := e.State().Final
+	ran := false
+	for _, r := range f.Checks.Results {
+		if r.ID == "final/review/marker" {
+			ran = r.Status == contract.CheckFailed
+		}
+	}
+	if !ran || f.State == contract.StepAccepted {
+		t.Fatalf("the requested check did not run and fail: %+v, final %s", f.Checks.Results, f.State)
+	}
+}
+
+// The executor cannot weaken a check the reviewer added: the reviewer's
+// checks have their own ids, and an accepted check is never replaced.
+func TestExecutorCannotWeakenAReviewerCheck(t *testing.T) {
+	t.Parallel()
+	script := happyScript(t)
+	var rt contract.ReviewerTurn
+	if err := json.Unmarshal(script.Reviewer[0].Payload, &rt); err != nil {
+		t.Fatal(err)
+	}
+	strict := goTest("go-test", "R-001.C1", "S-001/V-001")
+	strict.Expected.StdoutContains = []string{"THIS_MARKER_IS_NEVER_PRINTED"}
+	rt.CheckRequests = []contract.CheckRequest{{Proposal: strict, Reason: "require output on repair", CriterionIDs: []string{"R-001.C1"}}}
+	script.Reviewer[0] = revAction(t, rt)
+	var et contract.ExecutorTurn
+	if err := json.Unmarshal(script.Executor[1].Payload, &et); err != nil {
+		t.Fatal(err)
+	}
+	weak := goTest("go-test", "R-001.C1", "S-001/V-001")
+	weak.Expected.StdoutContains = nil
+	et.Candidate.ProposedChecks = []contract.CheckSpecProposal{weak}
+	script.Executor[1].Payload = payload(t, et)
+	w := newWorld(t, script, setup{})
+	out, e := w.run()
+	defer e.Close()
+	if out.State == contract.RunDone {
+		t.Fatal("the executor replaced the reviewer's condition and the run reached done")
+	}
+	spec := specByID(e.State(), "S-001/review/go-test")
+	if spec == nil || len(spec.Expected.StdoutContains) != 1 {
+		t.Fatalf("the reviewer's check: %+v", spec)
+	}
+}
+
+// A changed redefinition of an accepted check is refused and the original keeps running.
+func TestAcceptedCheckCannotBeRedefined(t *testing.T) {
+	t.Parallel()
+	script := happyScript(t)
+	var et contract.ExecutorTurn
+	if err := json.Unmarshal(script.Executor[1].Payload, &et); err != nil {
+		t.Fatal(err)
+	}
+	loose := goTest("go-test", "R-001.C1", "S-001/V-001")
+	loose.Timeout = "1s"
+	et.Candidate.ProposedChecks = []contract.CheckSpecProposal{loose}
+	script.Executor[1].Payload = payload(t, et)
+	w := newWorld(t, script, setup{})
+	out, e := w.run()
+	defer e.Close()
+	if out.State != contract.RunDone {
+		t.Fatalf("outcome %+v", out)
+	}
+	spec := specByID(e.State(), "S-001/go-test")
+	if spec == nil || spec.Timeout == "1s" {
+		t.Fatalf("the accepted check was redefined: %+v", spec)
+	}
+	found := false
+	for _, ev := range e.events {
+		if ev.Type == evChecks && strings.Contains(string(ev.Data), "already accepted with another definition") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("the refusal of the redefinition was not recorded")
+	}
+}
+
+// Every stream an evidence record binds is part of the final gate: a missing
+// one keeps the run from done.
+func TestMissingCheckStreamFailsTheFinalGate(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t, happyScript(t), setup{})
+	e := w.open()
+	defer e.Close()
+	removed := ""
+	e.crashAfter = func(id string) error {
+		if e.st.Turn(id).Kind != KindFinalReview {
+			return nil
+		}
+		_, ev, err := e.evidence(e.st.Final.Checks.Results[0])
+		if err != nil {
+			return err
+		}
+		removed = ev.StdoutRef
+		p, err := e.run.Path(removed)
+		if err != nil {
+			return err
+		}
+		return os.Remove(p)
+	}
+	out, err := e.Run(context.Background())
+	if err != nil || removed == "" {
+		t.Fatalf("run: %v (%+v), removed %q", err, out, removed)
+	}
+	want(t, out, contract.RunPaused, "final_gate", "an artifact does not match its digest")
+	if out.Exit != contract.ExitRejected || len(e.State().Receipts) != 0 {
+		t.Fatalf("exit %d, receipts %d", out.Exit, len(e.State().Receipts))
+	}
+}
+
+// A crash after the receipt files were written but before receipt.saved:
+// the receipt is rebuilt from the journal, byte for byte, whatever the clock says.
+func TestReceiptRebuiltAfterACrashIsIdentical(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t, happyScript(t), setup{})
+	out, e := w.run()
+	if out.State != contract.RunDone {
+		e.Close()
+		t.Fatalf("fixture: %+v", out)
+	}
+	before, invocations := e.State().Receipts[0], e.State().Invocations
+	e.Close()
+	dropTrailing(t, w, evRunState)
+	dropTrailing(t, w, evReceipt)
+	e = w.open()
+	defer e.Close()
+	future := time.Now().Add(time.Hour)
+	e.o.Now = func() time.Time { return future }
+	out, err := e.Resume(context.Background(), ResumeOptions{})
+	if err != nil || out.State != contract.RunDone || e.State().Invocations != invocations {
+		t.Fatalf("resume: %+v %v, invocations %d want %d", out, err, e.State().Invocations, invocations)
+	}
+	after := e.State().Receipts[0]
+	if after.SHA != before.SHA || after.MDSHA != before.MDSHA || after.Ref != before.Ref {
+		t.Fatalf("the rebuilt receipt differs: %+v vs %+v", after, before)
+	}
+}
+
+// Roots left under the id of a turn the journal never recorded are removed
+// before the turn starts; roots a process still holds are refused.
+func TestLeftoverRootsOfAnUnrecordedTurn(t *testing.T) {
+	t.Parallel()
+	for _, held := range []bool{false, true} {
+		t.Run(map[bool]string{false: "free", true: "held"}[held], func(t *testing.T) {
+			t.Parallel()
+			w := newWorld(t, happyScript(t), setup{})
+			e := w.open()
+			ctx := context.Background()
+			if err := e.setup(ctx); err != nil {
+				e.Close()
+				t.Fatal(err)
+			}
+			for _, step := range []func() error{
+				func() error { return e.emit(evSession, sessionData{Command: "run", ContractSHA256: e.contractSHA}) },
+				func() error { return e.createClone(ctx) },
+				func() error { return e.emit(evRunState, runStateData{State: contract.RunRunning}) },
+			} {
+				if err := step(); err != nil {
+					e.Close()
+					t.Fatal(err)
+				}
+			}
+			if out, err := e.advance(ctx, e.st.Unit("S-001")); err != nil || out != nil {
+				e.Close()
+				t.Fatalf("start step: %v %v", out, err)
+			}
+			leftover := filepath.Join(e.work, "executor", e.turnID("S-001", KindImplement))
+			if err := newDir(leftover); err != nil {
+				e.Close()
+				t.Fatal(err)
+			}
+			e.Close()
+			if held {
+				cmd := exec.Command("/bin/sleep", "60")
+				cmd.Dir = leftover
+				if err := cmd.Start(); err != nil {
+					t.Fatal(err)
+				}
+				defer func() { cmd.Process.Kill(); cmd.Wait() }()
+			}
+			e = w.open()
+			defer e.Close()
+			out, err := e.Resume(ctx, ResumeOptions{})
+			if held {
+				if err == nil || !strings.Contains(err.Error(), "held by processes") {
+					t.Fatalf("a held leftover: %+v %v", out, err)
+				}
+				return
+			}
+			if err != nil || out.State != contract.RunDone {
+				t.Fatalf("a free leftover: %+v %v", out, err)
+			}
+		})
 	}
 }

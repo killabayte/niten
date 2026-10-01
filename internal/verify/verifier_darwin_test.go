@@ -147,8 +147,11 @@ func TestPassingCheckIsRecordedAfterSeal(t *testing.T) {
 	if err != nil || contract.ValidateRecord(contract.RecordCheck, b) != nil {
 		t.Fatalf("stored evidence: %v", err)
 	}
-	if out, err := w.run.ReadArtifact(ev.StdoutRef, ""); err != nil || !strings.Contains(string(out), "ok") {
+	if out, err := w.run.ReadArtifact(ev.StdoutRef, ev.StdoutSHA256); err != nil || !strings.Contains(string(out), "ok") {
 		t.Fatalf("stored stdout %q %v", out, err)
+	}
+	if _, err := w.run.ReadArtifact(ev.StderrRef, ev.StderrSHA256); err != nil {
+		t.Fatalf("stored stderr does not match its recorded digest: %v", err)
 	}
 	w.run.Close()
 	s, _ := store.Open(filepath.Dir(filepath.Dir(w.run.Dir)))

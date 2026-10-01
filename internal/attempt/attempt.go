@@ -92,6 +92,26 @@ type finished struct {
 	OutcomeSHA string `json:"outcome_sha256"`
 	ResultRef  string `json:"result_ref"`
 	ResultSHA  string `json:"result_sha256"`
+	// The streams the result was parsed from, as they are after the process.
+	StdoutRef string `json:"stdout_ref,omitempty"`
+	StdoutSHA string `json:"stdout_sha256,omitempty"`
+	StderrRef string `json:"stderr_ref,omitempty"`
+	StderrSHA string `json:"stderr_sha256,omitempty"`
+}
+
+// streamDigests records the digests of an attempt's stream files.
+func streamDigests(run *store.Run, f *finished, stdoutRef, stderrRef string) error {
+	for _, s := range []struct {
+		ref      string
+		dst, sum *string
+	}{{stdoutRef, &f.StdoutRef, &f.StdoutSHA}, {stderrRef, &f.StderrRef, &f.StderrSHA}} {
+		b, err := run.ReadArtifact(s.ref, "")
+		if err != nil {
+			return fmt.Errorf("digest the stream %s: %w", s.ref, err)
+		}
+		*s.dst, *s.sum = s.ref, digest(b)
+	}
+	return nil
 }
 
 type resolved struct {
@@ -180,6 +200,9 @@ func (r *Runner) finish(id string, out provider.Outcome, res *provider.Result, p
 	f := finished{ID: id, OK: res != nil, OutcomeRef: dir + "/outcome.json", OutcomeSHA: osha, ResultRef: dir + "/result.json", ResultSHA: rsha}
 	if perr != nil {
 		f.Class = string(perr.Class)
+	}
+	if err := streamDigests(r.Store, &f, dir+"/stdout.jsonl", dir+"/stderr.log"); err != nil {
+		return err
 	}
 	_, err = r.Store.Append(EvFinished, f)
 	return err
@@ -413,6 +436,9 @@ func completeFromArtifacts(run *store.Run, in *intent, outcomeBytes []byte, pars
 		ResultRef: dir + "/result.json", ResultSHA: digest(resultBytes)}
 	if st.Error != nil {
 		f.Class = string(st.Error.Class)
+	}
+	if err := streamDigests(run, &f, in.StdoutRef, in.StderrRef); err != nil {
+		return rec, err
 	}
 	if _, err := run.Append(EvFinished, f); err != nil {
 		return rec, err

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/killabayte/niten/internal/attempt"
 	"github.com/killabayte/niten/internal/contract"
+	"github.com/killabayte/niten/internal/holders"
 	"github.com/killabayte/niten/internal/provider"
 	"github.com/killabayte/niten/internal/store"
 	"github.com/killabayte/niten/internal/workspace"
@@ -61,6 +63,19 @@ func (e *Engine) executorTurn(ctx context.Context, u *StepView) (*Outcome, error
 	}
 	kind := executorKind(u)
 	id := e.turnID(u.ID, kind)
+	if err := e.clearUnrecorded(id); err != nil {
+		return nil, err
+	}
+	prompt, err := e.executorPrompt(ctx, u, kind)
+	if err != nil {
+		return nil, err
+	}
+	// The turn is in the journal before any of its roots exist, so a crash
+	// while they are prepared never makes the next turn reuse its id.
+	if err := e.emit(evTurn, TurnView{ID: id, Role: string(contract.RoleExecutor), Kind: kind, Unit: u.ID, Base: e.st.Head,
+		PacketRef: "attempts/" + id + "/prompt", PacketSHA: digest(prompt)}); err != nil {
+		return nil, err
+	}
 	scratch, control := filepath.Join(e.work, "executor", id), filepath.Join(e.work, "control", id)
 	for _, d := range []string{scratch, control} {
 		if err := newDir(d); err != nil {
@@ -75,16 +90,8 @@ func (e *Engine) executorTurn(ctx context.Context, u *StepView) (*Outcome, error
 	if err != nil {
 		return nil, err
 	}
-	prompt, err := e.executorPrompt(ctx, u, kind)
-	if err != nil {
-		return nil, err
-	}
 	env, stripped, err := e.childEnv(scratch)
 	if err != nil {
-		return nil, err
-	}
-	if err := e.emit(evTurn, TurnView{ID: id, Role: string(contract.RoleExecutor), Kind: kind, Unit: u.ID, Base: e.st.Head,
-		PacketRef: "attempts/" + id + "/prompt", PacketSHA: digest(prompt)}); err != nil {
 		return nil, err
 	}
 	e.logf("%s: %s by the executor (%s)", u.ID, kind, id)
@@ -97,6 +104,35 @@ func (e *Engine) executorTurn(ctx context.Context, u *StepView) (*Outcome, error
 		return nil, err
 	}
 	return e.processExecutor(context.WithoutCancel(ctx), e.st.Turn(id), res, perr)
+}
+
+// clearUnrecorded removes roots left under the id of a turn the journal does
+// not have: a crash before the turn was recorded. No attempt can have run
+// there (attempts start only after their turn is recorded), and a root that
+// any process still holds is refused, never removed.
+func (e *Engine) clearUnrecorded(id string) error {
+	if e.st.Turn(id) != nil {
+		return fmt.Errorf("turn %s is already in the journal", id)
+	}
+	for _, root := range []string{filepath.Join(e.work, "executor", id), filepath.Join(e.work, "control", id), e.reviewBase(id)} {
+		if _, err := os.Lstat(root); errors.Is(err, os.ErrNotExist) {
+			continue
+		} else if err != nil {
+			return err
+		}
+		pids, err := holders.List([]string{root})
+		if err != nil {
+			return fmt.Errorf("the leftover %s cannot be checked: %w", root, err)
+		}
+		if len(pids) > 0 {
+			return fmt.Errorf("the leftover %s of an unrecorded turn is held by processes %v", root, pids)
+		}
+		if err := os.RemoveAll(root); err != nil {
+			return err
+		}
+		e.logf("removed the leftover %s of an unrecorded turn", root)
+	}
+	return nil
 }
 
 // attempt runs one model attempt with a heartbeat while it runs.
@@ -768,6 +804,26 @@ func (e *Engine) checkProposal(u *StepView, p contract.CheckSpecProposal, source
 			return
 		}
 	}
-	v.specs = append(v.specs, CheckSpec{ID: u.ID + "/" + p.ID, Source: source, CommandID: cmd.id, Argv: slices.Clone(p.Argv), Cwd: cwd,
-		Timeout: timeout.String(), Expected: p.Expected, CriterionIDs: p.CriterionIDs, VerificationIDs: p.VerificationIDs})
+	spec := CheckSpec{ID: specID(u, source, p.ID), Source: source, CommandID: cmd.id, Argv: slices.Clone(p.Argv), Cwd: cwd,
+		Timeout: timeout.String(), Expected: p.Expected, CriterionIDs: p.CriterionIDs, VerificationIDs: p.VerificationIDs}
+	if i := slices.IndexFunc(u.Specs, func(o CheckSpec) bool { return o.ID == spec.ID }); i >= 0 {
+		if digestJSON(u.Specs[i]) != digestJSON(spec) {
+			refuse("%s is already accepted with another definition; an accepted check is never changed or withdrawn", spec.ID)
+		}
+		return // the same check again: nothing new
+	}
+	if slices.ContainsFunc(v.specs, func(o CheckSpec) bool { return o.ID == spec.ID }) {
+		v.bad("check %s is proposed twice", spec.ID)
+		return
+	}
+	v.specs = append(v.specs, spec)
+}
+
+// specID scopes a check to its unit and to the role that proposed it, so one
+// role's proposal never names, and never replaces, the other's check.
+func specID(u *StepView, source, id string) string {
+	if source == string(contract.RoleReviewer) {
+		return u.ID + "/review/" + id
+	}
+	return u.ID + "/" + id
 }

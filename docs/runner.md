@@ -156,7 +156,7 @@ configured `strip_env` names, and returns only the removed names for the record.
 One attempt writes, in order: the prompt artifact; `attempt.intent` (role, argv and its
 digest, prompt digest, environment names, removed names, stream paths); the stream files
 and the process; `attempt.started` with the identity, before waiting; the outcome and
-result artifacts; `attempt.finished` with both digests. A store failure before the start
+result artifacts; `attempt.finished` with both digests and the digests of the two stream files. A store failure before the start
 means the model is never started.
 
 `Recover` resolves every attempt of the replayed journal and records its answer, so it

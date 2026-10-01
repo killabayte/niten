@@ -128,6 +128,7 @@ type StepView struct {
 	Checks         *ChecksView           `json:"checks,omitempty"`
 	Review         *ReviewView           `json:"review,omitempty"`
 	AcceptedAt     string                `json:"accepted_at,omitempty"`
+	AcceptedSeq    int64                 `json:"accepted_seq,omitempty"`
 	Pending        string                `json:"pending,omitempty"`
 	Specs          []CheckSpec           `json:"check_specs"`
 	Justifications map[string]string     `json:"justifications"`
@@ -193,6 +194,7 @@ type AttestationView struct {
 	Candidate string `json:"candidate_sha"`
 	Ref       string `json:"ref"`
 	SHA       string `json:"sha256"`
+	Seq       int64  `json:"seq"`
 }
 
 // ReceiptView is one saved receipt version.
@@ -201,6 +203,7 @@ type ReceiptView struct {
 	Ref       string `json:"ref"`
 	SHA       string `json:"sha256"`
 	MDRef     string `json:"md_ref"`
+	MDSHA     string `json:"md_sha256"`
 	Candidate string `json:"candidate"`
 }
 
@@ -253,6 +256,16 @@ func newState(runID, contractSHA, planDigest, base string, order []string, lim L
 
 func newUnit(id string) *StepView {
 	return &StepView{ID: id, State: contract.StepPending, Specs: []CheckSpec{}, Justifications: map[string]string{}, Problems: []string{}, Rejected: []string{}}
+}
+
+// addSpecs adds newly accepted checks. An accepted check is never replaced or
+// removed: a later proposal under the same id is refused before it gets here.
+func (u *StepView) addSpecs(specs []CheckSpec) {
+	for _, sp := range specs {
+		if !slices.ContainsFunc(u.Specs, func(o CheckSpec) bool { return o.ID == sp.ID }) {
+			u.Specs = append(u.Specs, sp)
+		}
+	}
 }
 
 // Unit returns the step with id, or the final stage.
@@ -362,16 +375,19 @@ type (
 		Justifications map[string]string `json:"justifications,omitempty"`
 		Questions      []QuestionView    `json:"questions,omitempty"`
 		Review         *ReviewView       `json:"review,omitempty"`
+		Collected      []artifactRef     `json:"collected_evidence,omitempty"`
 		transition
 	}
 	gateReleasedData struct {
 		Gate      string `json:"gate_id"`
 		AnswerRef string `json:"answer_ref"`
+		AnswerSHA string `json:"answer_sha256"`
 	}
 	answerData struct {
 		Question string `json:"question_id"`
 		Text     string `json:"text"`
 		Ref      string `json:"ref"`
+		SHA      string `json:"sha256"`
 	}
 	limitsData struct {
 		Changes []LimitChange `json:"changes"`
@@ -392,7 +408,9 @@ func (s *State) apply(ev store.Event) error {
 		return nil
 	}
 	if t, err := time.Parse(time.RFC3339Nano, ev.Time); err == nil {
-		if s.sessionOpen && t.After(s.lastTime) {
+		// A session start is a boundary: the time since the previous event,
+		// a crashed session's downtime included, is never active time.
+		if s.sessionOpen && ev.Type != evSession && t.After(s.lastTime) {
 			s.ActiveMS += t.Sub(s.lastTime).Milliseconds()
 		}
 		s.lastTime = t
@@ -438,7 +456,7 @@ func (s *State) apply(ev store.Event) error {
 		if err := decode(&d); err != nil {
 			return err
 		}
-		if err := s.applyTransition(d); err != nil {
+		if err := s.applyTransition(d, ev.Seq); err != nil {
 			return bad(err)
 		}
 	case evTurn:
@@ -485,10 +503,7 @@ func (s *State) apply(ev store.Event) error {
 			}
 			if t.Role == string(contract.RoleExecutor) {
 				u.LastExecutor = t.ID
-				for _, sp := range d.Specs {
-					u.Specs = slices.DeleteFunc(u.Specs, func(o CheckSpec) bool { return o.ID == sp.ID })
-					u.Specs = append(u.Specs, sp)
-				}
+				u.addSpecs(d.Specs)
 				for p, r := range d.Justifications {
 					u.Justifications[p] = r
 				}
@@ -496,14 +511,11 @@ func (s *State) apply(ev store.Event) error {
 				u.Reviews++
 				r := *d.Review
 				u.Review = &r
-				for _, sp := range d.Specs {
-					u.Specs = slices.DeleteFunc(u.Specs, func(o CheckSpec) bool { return o.ID == sp.ID })
-					u.Specs = append(u.Specs, sp)
-				}
+				u.addSpecs(d.Specs)
 			}
 		}
 		d.transition.Unit = t.Unit
-		if err := s.applyTransition(d.transition); err != nil {
+		if err := s.applyTransition(d.transition, ev.Seq); err != nil {
 			return bad(err)
 		}
 	case evGateOpened:
@@ -537,6 +549,7 @@ func (s *State) apply(ev store.Event) error {
 		if err := decode(&d); err != nil {
 			return err
 		}
+		d.Seq = ev.Seq
 		s.Attestations = append(s.Attestations, d)
 	case evReceipt:
 		var d ReceiptView
@@ -549,7 +562,7 @@ func (s *State) apply(ev store.Event) error {
 }
 
 // applyTransition applies one atomic unit change.
-func (s *State) applyTransition(d transition) error {
+func (s *State) applyTransition(d transition, seq int64) error {
 	u := s.Unit(d.Unit)
 	if u == nil {
 		return fmt.Errorf("unknown unit %q", d.Unit)
@@ -581,7 +594,7 @@ func (s *State) applyTransition(d transition) error {
 		u.Checks = &c
 	}
 	if a := d.Accepted; a != nil {
-		u.State, u.AcceptedAt = contract.StepAccepted, a.Candidate
+		u.State, u.AcceptedAt, u.AcceptedSeq = contract.StepAccepted, a.Candidate, seq
 	}
 	if st := d.Step; st != nil {
 		u.State, u.Repairs = st.State, st.Repairs

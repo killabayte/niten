@@ -80,6 +80,8 @@ type Engine struct {
 	verifier    *verify.Verifier
 	exec, rev   model
 	runner      *attempt.Runner
+	// inSession is set once this process recorded its session boundary.
+	inSession bool
 	// crashAfter is a test hook: a non-nil error stops the engine right after
 	// an attempt, before its result is processed, as a crash would.
 	crashAfter func(turn string) error
@@ -195,14 +197,12 @@ func (e *Engine) load() error {
 	if e.rev, err = parseModel(c.Models.Reviewer, "codex", c.Models.CodexCommand); err != nil {
 		return err
 	}
-	lim := Limits{MaxInvocations: c.Limits.MaxInvocations, MaxActiveTime: c.Limits.MaxActiveTime, InvocationDeadline: c.Limits.InvocationDeadline,
-		MaxRepairsPerStep: c.Limits.MaxRepairsPerStep, FinalReserveInvocations: c.Limits.FinalReserveInvocations, FinalReserveTime: c.Limits.FinalReserveTime}
-	for _, d := range []string{lim.MaxActiveTime, lim.InvocationDeadline, lim.FinalReserveTime} {
+	for _, d := range []string{c.Limits.MaxActiveTime, c.Limits.InvocationDeadline, c.Limits.FinalReserveTime} {
 		if _, err := time.ParseDuration(d); err != nil {
 			return fmt.Errorf("%w: limit %q: %v", ErrIntegrity, d, err)
 		}
 	}
-	e.st = newState(c.RunID, e.contractSHA, c.PlanDigest, c.Repos[0].BaseCommit, c.Order, lim)
+	e.st = e.initialState()
 	for _, ev := range e.events {
 		if err := e.st.apply(ev); err != nil {
 			return err
@@ -210,6 +210,33 @@ func (e *Engine) load() error {
 	}
 	e.work = filepath.Join(e.o.Store.Root, "work", c.RunID)
 	return nil
+}
+
+// initialState is the projection right after prepare.
+func (e *Engine) initialState() *State {
+	c := e.c
+	lim := Limits{MaxInvocations: c.Limits.MaxInvocations, MaxActiveTime: c.Limits.MaxActiveTime, InvocationDeadline: c.Limits.InvocationDeadline,
+		MaxRepairsPerStep: c.Limits.MaxRepairsPerStep, FinalReserveInvocations: c.Limits.FinalReserveInvocations, FinalReserveTime: c.Limits.FinalReserveTime}
+	return newState(c.RunID, e.contractSHA, c.PlanDigest, c.Repos[0].BaseCommit, c.Order, lim)
+}
+
+// snapshot folds the journal up to and including seq into a fresh projection.
+func (e *Engine) snapshot(seq int64) (*State, []store.Event, error) {
+	s := e.initialState()
+	var events []store.Event
+	for _, ev := range e.events {
+		if ev.Seq > seq {
+			break
+		}
+		if err := s.apply(ev); err != nil {
+			return nil, nil, err
+		}
+		events = append(events, ev)
+	}
+	if len(events) == 0 {
+		return nil, nil, fmt.Errorf("no events up to %d", seq)
+	}
+	return s, events, nil
 }
 
 // verifyInputs re-reads every stored input against the digests in the contract
@@ -299,6 +326,15 @@ func (e *Engine) Resume(ctx context.Context, r ResumeOptions) (Outcome, error) {
 	if err := e.setup(ctx); err != nil {
 		return e.outcome(contract.ExitFormat), err
 	}
+	if e.st.sessionOpen {
+		// The journal ends inside a session: the coordinator crashed. Mark the
+		// boundary before recovery records anything, so the downtime is not
+		// counted as active time.
+		if err := e.emit(evSession, sessionData{Command: "recover", ContractSHA256: e.contractSHA}); err != nil {
+			return e.failure(err)
+		}
+		e.inSession = true
+	}
 	if out, err := e.recoverAttempts(ctx); err != nil || out != nil {
 		if err != nil {
 			return e.failure(err)
@@ -355,8 +391,11 @@ func (e *Engine) session(ctx context.Context, command string) (Outcome, error) {
 			return e.outcome(contract.ExitFormat), err
 		}
 	}
-	if err := e.emit(evSession, sessionData{Command: command, ContractSHA256: e.contractSHA}); err != nil {
-		return e.failure(err)
+	if !e.inSession {
+		if err := e.emit(evSession, sessionData{Command: command, ContractSHA256: e.contractSHA}); err != nil {
+			return e.failure(err)
+		}
+		e.inSession = true
 	}
 	if e.st.CloneWork == "" {
 		if err := e.createClone(ctx); err != nil {
@@ -636,6 +675,9 @@ func (e *Engine) setup(ctx context.Context) error {
 	}
 	toolchains, version, err := e.toolchains(ctx)
 	if err != nil {
+		return err
+	}
+	if _, err := e.settingsTemplate(); err != nil {
 		return err
 	}
 	for _, m := range []*model{&e.exec, &e.rev} {

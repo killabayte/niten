@@ -182,7 +182,8 @@ func (v *Verifier) Run(ctx context.Context, req Request) (*Result, error) {
 	ev := contract.CheckEvidence{
 		SchemaVersion: contract.SchemaVersion, Key: key, Argv: argv, Cwd: req.Check.Cwd,
 		ToolVersion: v.ToolVersion, EnvNames: envNames(env), StartedAt: started.UTC().Format(time.RFC3339Nano),
-		StdoutRef: "checks/" + id + "/stdout", StderrRef: "checks/" + id + "/stderr", Assertions: asserts,
+		StdoutRef: "checks/" + id + "/stdout", StdoutSHA256: digestBytes(stdout.Bytes()),
+		StderrRef: "checks/" + id + "/stderr", StderrSHA256: digestBytes(stderr.Bytes()), Assertions: asserts,
 		SourcesUnchanged: runErr == nil && sealErr == nil && len(changed) == 0, Status: status,
 	}
 	if runErr == nil && !res.Finished.IsZero() {
@@ -294,6 +295,11 @@ func envNames(env []string) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+func digestBytes(b []byte) string {
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
 }
 
 func digestJSON(v any) string {

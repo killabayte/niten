@@ -22,12 +22,13 @@ func (e *Engine) applyAnswers(raw []byte) (*Outcome, error) {
 	// Named by content: a refused file records no event, so the journal
 	// position cannot name the next one.
 	ref := "answers/" + digest(raw)[:16] + ".json"
-	if _, err := e.writeOrReuse(ref, raw); err != nil {
+	sha, err := e.writeOrReuse(ref, raw)
+	if err != nil {
 		return nil, err
 	}
 	var refused []string
 	for _, sc := range a.StepContinue {
-		if why := e.releaseGate(sc, ref); why != "" {
+		if why := e.releaseGate(sc, ref, sha); why != "" {
 			refused = append(refused, why)
 		}
 	}
@@ -39,7 +40,7 @@ func (e *Engine) applyAnswers(raw []byte) (*Outcome, error) {
 		}
 	}
 	for _, qa := range a.Answers {
-		if why := e.answer(qa, ref); why != "" {
+		if why := e.answer(qa, ref, sha); why != "" {
 			refused = append(refused, why)
 		}
 	}
@@ -56,7 +57,7 @@ func (e *Engine) applyAnswers(raw []byte) (*Outcome, error) {
 // releaseGate releases the open gate only with an answer bound to it exactly:
 // gate, run, plan and contract digests, step and accepted candidate. Repeating
 // the answer for a released gate is idempotent.
-func (e *Engine) releaseGate(sc contract.StepContinue, ref string) string {
+func (e *Engine) releaseGate(sc contract.StepContinue, ref, sha string) string {
 	if e.released(sc.GateID) {
 		for _, ev := range e.events {
 			if ev.Type != evGateOpened {
@@ -78,7 +79,7 @@ func (e *Engine) releaseGate(sc contract.StepContinue, ref string) string {
 	case sc.RunID != e.st.RunID || sc.PlanDigest != e.c.PlanDigest || sc.ContractDigest != e.contractSHA:
 		return fmt.Sprintf("step_continue %s is bound to another run, plan or contract", sc.GateID)
 	}
-	if err := e.emit(evGateReleased, gateReleasedData{Gate: g.ID, AnswerRef: ref}); err != nil {
+	if err := e.emit(evGateReleased, gateReleasedData{Gate: g.ID, AnswerRef: ref, AnswerSHA: sha}); err != nil {
 		return err.Error()
 	}
 	return ""
@@ -90,7 +91,7 @@ func (e *Engine) attest(in contract.AttestationInput) (string, error) {
 	if e.st.State != contract.RunImplemented {
 		return fmt.Sprintf("attestation %s: the run is %s; attestations bind the implemented candidate", in.CriterionID, e.st.State), nil
 	}
-	_, pending := e.criteriaStatus(map[string]bool{})
+	_, pending := e.criteriaStatus(e.st, map[string]bool{})
 	want := false
 	for _, c := range e.c.Criteria {
 		if c.ID == in.CriterionID {
@@ -133,7 +134,7 @@ func (e *Engine) attest(in contract.AttestationInput) (string, error) {
 }
 
 // answer records the user's answer to an open blocking question.
-func (e *Engine) answer(qa contract.QuestionAnswer, ref string) string {
+func (e *Engine) answer(qa contract.QuestionAnswer, ref, sha string) string {
 	for _, q := range e.st.Questions {
 		if q.ID != qa.QuestionID {
 			continue
@@ -144,7 +145,7 @@ func (e *Engine) answer(qa contract.QuestionAnswer, ref string) string {
 			}
 			return fmt.Sprintf("question %s is already answered differently", qa.QuestionID)
 		}
-		if err := e.emit(evAnswer, answerData{Question: q.ID, Text: qa.Text, Ref: ref}); err != nil {
+		if err := e.emit(evAnswer, answerData{Question: q.ID, Text: qa.Text, Ref: ref, SHA: sha}); err != nil {
 			return err.Error()
 		}
 		return ""

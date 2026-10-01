@@ -192,7 +192,9 @@ type CheckEvidence struct {
 	FinishedAt       *string     `json:"finished_at"`
 	ExitCode         *int        `json:"exit_code"`
 	StdoutRef        string      `json:"stdout_ref"`
+	StdoutSHA256     string      `json:"stdout_sha256"`
 	StderrRef        string      `json:"stderr_ref"`
+	StderrSHA256     string      `json:"stderr_sha256"`
 	Assertions       []Assertion `json:"assertions"`
 	SourcesUnchanged bool        `json:"sources_unchanged"`
 	Status           CheckStatus `json:"status"`
