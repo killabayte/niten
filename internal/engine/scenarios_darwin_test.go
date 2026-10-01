@@ -60,7 +60,6 @@ func TestFalseDoneIsCaughtByTheRealCheck(t *testing.T) {
 	}
 	w := newWorld(t, testutil.FakeScript{Executor: []testutil.FakeAction{bad(0), bad(1), bad(2)}}, setup{})
 	out, e := w.run()
-	defer e.Close()
 	want(t, out, contract.RunNeedsInput, "repair_limit", "check required/go-tests failed")
 	if n := w.calls("reviewer"); n != 0 {
 		t.Fatalf("a failing candidate was sent to review %d times", n)
@@ -71,6 +70,14 @@ func TestFalseDoneIsCaughtByTheRealCheck(t *testing.T) {
 	}
 	if e.State().State == contract.RunDone || len(e.State().Receipts) != 0 {
 		t.Fatal("a receipt exists for a failed step")
+	}
+	e.Close()
+	// Only an explicit raise buys another repair; it is recorded like any limit.
+	out, e = w.resume(ResumeOptions{MaxRepairs: 3})
+	defer e.Close()
+	want(t, out, contract.RunPaused, "transport", "no scripted action")
+	if w.calls("executor") != 4 || e.State().LimitHistory[0].Field != "max_repairs_per_step" {
+		t.Fatalf("executor calls %d, history %+v", w.calls("executor"), e.State().LimitHistory)
 	}
 }
 

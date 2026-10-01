@@ -4,7 +4,7 @@ Status: implemented offline, 2026-10-01. This records what the P2 packages do, s
 [architecture](architecture.md) and the code stay aligned. Nothing here calls a model:
 the adapters are exercised with fake CLIs, and `niten doctor --live` stays refused until
 the live probes are separately authorized. The engine that drives these pieces (`run`,
-`status`, `resume`) is P3.
+`status`, `resume`) is P3, see [engine](engine.md).
 
 ## Packages
 

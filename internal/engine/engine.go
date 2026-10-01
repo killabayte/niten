@@ -279,6 +279,7 @@ type ResumeOptions struct {
 	Answers        []byte // the --answers file, nil without one
 	MaxInvocations int    // a raised invocation limit, 0 to keep it
 	MaxActiveTime  time.Duration
+	MaxRepairs     int // a raised repair budget per step, 0 to keep it
 }
 
 // Resume recovers the run's attempts, applies the user's answers and limit
@@ -290,7 +291,7 @@ func (e *Engine) Resume(ctx context.Context, r ResumeOptions) (Outcome, error) {
 	case contract.RunFailed:
 		return e.outcome(contract.ExitFormat), fmt.Errorf("run %s failed (%s) and cannot be resumed", e.st.RunID, e.st.Reason)
 	case contract.RunDone:
-		if r.Answers != nil || r.MaxInvocations != 0 || r.MaxActiveTime != 0 {
+		if r.Answers != nil || r.MaxInvocations != 0 || r.MaxActiveTime != 0 || r.MaxRepairs != 0 {
 			return e.outcome(contract.ExitFormat), fmt.Errorf("run %s is done; it takes no answers or limits", e.st.RunID)
 		}
 		return e.outcome(contract.ExitOK), nil
@@ -317,7 +318,7 @@ func (e *Engine) Resume(ctx context.Context, r ResumeOptions) (Outcome, error) {
 		}
 	}
 	if e.st.State == contract.RunImplemented {
-		return e.completeExternal()
+		return e.completeExternal(ctx)
 	}
 	if out := e.waiting(); out != nil {
 		return *out, nil
@@ -373,16 +374,18 @@ func (e *Engine) session(ctx context.Context, command string) (Outcome, error) {
 	return out, nil
 }
 
-// failure records an unrecoverable engine error when the journal still accepts it.
+// failure records an engine error when the journal still accepts it. Corrupt
+// or tampered run files fail the run for good; any other error (a git or file
+// system failure, say) pauses it, so the user can resume after fixing the cause.
 func (e *Engine) failure(err error) (Outcome, error) {
-	if e.run.Broken() == nil && e.st.State != contract.RunFailed {
-		reason := "engine_error"
-		if errors.Is(err, store.ErrCorrupt) || errors.Is(err, ErrIntegrity) {
-			reason = "integrity"
-		}
-		_ = e.emit(evRunState, runStateData{State: contract.RunFailed, Reason: reason, Detail: []string{err.Error()}})
+	st, reason := contract.RunPaused, "engine_error"
+	if errors.Is(err, store.ErrCorrupt) || errors.Is(err, ErrIntegrity) {
+		st, reason = contract.RunFailed, "integrity"
 	}
-	return Outcome{State: contract.RunFailed, Reason: e.st.Reason, Detail: e.st.Detail, Exit: contract.ExitFormat}, err
+	if e.run.Broken() == nil && e.st.State != contract.RunFailed {
+		_ = e.emit(evRunState, runStateData{State: st, Reason: reason, Detail: []string{err.Error()}})
+	}
+	return Outcome{State: e.st.State, Reason: e.st.Reason, Detail: e.st.Detail, Exit: contract.ExitFormat}, err
 }
 
 // stop records a state the run waits in and ends the session.
@@ -600,6 +603,13 @@ func (e *Engine) raiseLimits(r ResumeOptions) error {
 		}
 		changes = append(changes, LimitChange{Field: "max_active_time", Previous: lim.MaxActiveTime, New: r.MaxActiveTime.String()})
 		lim.MaxActiveTime = r.MaxActiveTime.String()
+	}
+	if r.MaxRepairs != 0 {
+		if r.MaxRepairs <= lim.MaxRepairsPerStep {
+			return fmt.Errorf("--max-repairs %d does not raise the limit %d", r.MaxRepairs, lim.MaxRepairsPerStep)
+		}
+		changes = append(changes, LimitChange{Field: "max_repairs_per_step", Previous: fmt.Sprint(lim.MaxRepairsPerStep), New: fmt.Sprint(r.MaxRepairs)})
+		lim.MaxRepairsPerStep = r.MaxRepairs
 	}
 	if len(changes) == 0 {
 		return nil

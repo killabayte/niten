@@ -498,35 +498,19 @@ func renderReport(r *Receipt) string {
 	return b.String()
 }
 
-// completeExternal re-runs the final gate of an implemented run after new
-// attestations, without any model call.
-func (e *Engine) completeExternal() (Outcome, error) {
+// completeExternal finishes an implemented run after new attestations,
+// without any model call: once nothing is pending, the whole final gate runs
+// again on the unchanged candidate and a new receipt version records done.
+func (e *Engine) completeExternal(ctx context.Context) (Outcome, error) {
 	for _, a := range e.st.Attestations {
 		if a.Candidate == e.st.Head && a.Result == string(contract.AttestationFailed) {
 			return Outcome{State: e.st.State, Reason: "attestation_failed", Detail: []string{fmt.Sprintf("%s was attested as failed; a new code change needs a new revision", a.Criterion)}, Exit: contract.ExitRejected}, nil
 		}
 	}
-	covered := map[string]bool{}
-	var rr contract.ReviewResult
-	if f := e.st.Final.Review; f != nil {
-		if err := e.message(fmt.Sprintf("m-%s-01", f.Turn), &rr); err == nil {
-			for _, c := range rr.Coverage.CriterionIDsChecked {
-				covered[c] = true
-			}
-		}
-	}
-	crit, pending := e.criteriaStatus(covered)
-	if len(pending) > 0 {
+	if _, pending := e.criteriaStatus(map[string]bool{}); len(pending) > 0 {
 		return Outcome{State: e.st.State, Reason: "pending_external", Detail: pending, Exit: contract.ExitImplemented}, nil
 	}
-	arts, err := e.verifyArtifacts()
-	if err != nil {
-		return e.failure(err)
-	}
-	if err := e.saveReceipt(contract.RunDone, crit, nil, arts); err != nil {
-		return e.failure(err)
-	}
-	out, err := e.stop(contract.RunDone, "", nil, contract.ExitOK)
+	out, err := e.finish(ctx)
 	if err != nil {
 		return e.failure(err)
 	}

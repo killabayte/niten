@@ -221,6 +221,12 @@ are labeled untrusted and cannot replace coordinator evidence.
 Dependencies: P1 + offline P2. The sequential P3 slice is the basis for the first
 live pilot and v0.1; parallelism is not a condition for running that pilot.
 
+P3 status: implemented offline on 2026-10-01, see [engine](engine.md). The six-step
+acceptance flow, every mandatory negative scenario and the separate boundary scenarios
+above run as tests on scripted executor and reviewer CLIs, a small Go fixture plan
+published by Shogun's own code, and the real verifier sandbox. No live model was called;
+the first live run is the separately authorized pilot.
+
 ## P3 pilot Learn from the sequential pair
 
 After P3 offline checks and current P0/P2 certificates, separately authorize one

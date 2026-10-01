@@ -21,24 +21,30 @@ result into a new local ref of the source repo.
 
 ## Status
 
-Offline P0a and P1, 30 September 2026. `niten prepare` imports an approved Shogun
+Offline P0a, P1, P2 and P3, 1 October 2026. `niten prepare` imports an approved Shogun
 plan into a prepared run: it verifies the plan triplet, checks the source repository
 against the approved base and freezes the execution contract, without calling a model.
-`niten version`, `niten help` and an offline `niten doctor` also work; `run`, `status`,
-`resume`, `verify` and `export` are present but refuse to run with exit code 2. The
-verifier sandbox backend and the message/record contracts are implemented and tested
-offline. No model has been called. `prepare` needs a Shogun build with the S0 manifest
-sidecar (`shogun verify --require-manifest`). The P2 building blocks (run store with lock
-and journal, owned clone, sandboxed verifier, process supervisor, Claude and Codex
-adapters, crash recovery) are implemented and tested offline with fake CLIs; the engine
-that drives them is P3. The settings and
-structures below describe the proposed interface. These documents have not gone
-through a separate Shogun run and are not a plan with its approval receipt.
+`niten run`, `niten resume` and `niten status` drive a prepared run through the
+sequential loop. For every step that is executor turn, coordinator checks in the
+verifier sandbox, independent review and bounded repairs. Then come a final check and
+review of the whole change, and an execution receipt. Optional step gates, questions and
+attestations go through `resume --answers`.
+
+The engine is tested offline on scripted model CLIs and the real verifier sandbox. No
+live model has been called; the first live run is the separately authorized pilot.
+`niten version`, `niten help` and an offline `niten doctor` also work. `verify` and
+`export` are present but refuse to run with exit code 2. `prepare` needs a Shogun build
+with the S0 manifest sidecar (`shogun verify --require-manifest`).
+
+These documents have not gone through a separate Shogun run and are not a plan with its
+approval receipt.
 
 ```text
 go build ./... && go test ./...      # offline; the sandbox tests need macOS
 go run ./cmd/niten doctor            # checks the verifier sandbox, never calls a model
 go run ./cmd/niten prepare PLAN.md --repo repo-1=/path/to/checkout
+go run ./cmd/niten run RUN_ID        # calls the configured claude and codex CLIs
+go run ./cmd/niten status RUN_ID
 ```
 
 ## Documents
@@ -64,6 +70,8 @@ go run ./cmd/niten prepare PLAN.md --repo repo-1=/path/to/checkout
     codes and the prepared run layout.
 12. [Runner](docs/runner.md): the P2 store, clone, verifier, supervisor, adapters and
     crash recovery.
+13. [Engine](docs/engine.md): the P3 loop, journal, trust rules, checks, packets,
+    limits, gates, the final gate and the receipt.
 
 ## First version
 

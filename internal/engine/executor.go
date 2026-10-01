@@ -140,14 +140,14 @@ func (e *Engine) rules(u *StepView) workspace.Rules {
 }
 
 // denyPatterns are the policy patterns the executor's file tools are denied:
-// every protected path and every instruction path the unit does not target.
+// every protected path, and the instruction paths unless the unit targets an
+// instruction file. A deny rule cannot be lifted for one file, so a targeted
+// instruction file leaves the instruction patterns to the coordinator's
+// inspection, which still rejects any untargeted instruction change.
 func (e *Engine) denyPatterns(u *StepView) []string {
-	r := e.rules(u)
 	out := slices.Clone(e.c.Policy.ProtectedPaths)
-	for _, p := range e.c.Policy.InstructionPaths {
-		if !slices.Contains(r.InstructionTargets, p) {
-			out = append(out, p)
-		}
+	if len(e.rules(u).InstructionTargets) == 0 {
+		out = append(out, e.c.Policy.InstructionPaths...)
 	}
 	return out
 }
@@ -159,8 +159,20 @@ func (e *Engine) cleanResidue(ctx context.Context, u *StepView) (*Outcome, error
 	if err != nil {
 		return nil, err
 	}
-	if len(ins.Changes) == 0 && len(ins.Violations) == 0 && len(ins.Ignored) == 0 {
-		return nil, nil
+	if len(ins.Changes) == 0 && len(ins.Violations) == 0 {
+		if len(ins.Ignored) == 0 {
+			return nil, nil
+		}
+		// Ignored files (build outputs of the last session) are not part of any
+		// candidate; they are removed so the next session starts clean.
+		if err := e.clone.Restore(ctx); err != nil {
+			return nil, err
+		}
+		fp, err := e.clone.MetadataFingerprint()
+		if err != nil {
+			return nil, err
+		}
+		return nil, e.emit(evResidue, transition{Unit: u.ID, Rejected: &rejectedData{Violations: []string{}, Metadata: fp}})
 	}
 	rej, out, err := e.discard(ctx, ins, fmt.Sprintf("residue-%03d", len(e.st.Turns)+1), e.o.Now())
 	if out != nil || err != nil {
@@ -207,6 +219,8 @@ func (e *Engine) stopForClass(perr *provider.Error) (*Outcome, error) {
 		return e.stop(contract.RunPaused, "timeout", detail, contract.ExitPaused)
 	case provider.ClassProtocol, provider.ClassConfig:
 		return e.stop(contract.RunFailed, string(perr.Class), detail, contract.ExitFormat)
+	case provider.ClassTransport, provider.ClassRefusal:
+		return e.stop(contract.RunPaused, string(perr.Class), detail, contract.ExitPaused)
 	}
 	return e.stop(contract.RunPaused, "invalid_result", detail, contract.ExitPaused)
 }
