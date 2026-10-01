@@ -180,7 +180,8 @@ func TestRejectedSnapshotIsKeptNotCommitted(t *testing.T) {
 	if _, err := c.Commit(ctx, ins, "candidate", time.Now()); err == nil {
 		t.Fatal("committed")
 	}
-	ref, err := c.SaveRejected(ctx, ins, "attempt-1", time.Now())
+	at := time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
+	ref, err := c.SaveRejected(ctx, ins, "attempt-1", at)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -190,7 +191,12 @@ func TestRejectedSnapshotIsKeptNotCommitted(t *testing.T) {
 	if head, _ := c.Head(ctx); head != testutil.FixtureHead {
 		t.Fatalf("HEAD moved to %s", head)
 	}
-	if _, err := c.SaveRejected(ctx, ins, "attempt-1", time.Now()); err == nil {
+	// Saving the same snapshot again (a recovery after a crash) is a no-op;
+	// a different snapshot under the same name never replaces it.
+	if again, err := c.SaveRejected(ctx, ins, "attempt-1", at); err != nil || again != ref {
+		t.Fatalf("saving the same snapshot again: %s %v", again, err)
+	}
+	if _, err := c.SaveRejected(ctx, ins, "attempt-1", at.Add(time.Hour)); err == nil {
 		t.Fatal("a rejected snapshot was overwritten")
 	}
 	if err := c.Restore(ctx); err != nil {
@@ -578,5 +584,101 @@ func TestSymlinkResolutionUsesTheFileSystemNames(t *testing.T) {
 				t.Fatal("committed")
 			}
 		})
+	}
+}
+
+// Prepare writes the same commit for the same snapshot and time without moving
+// the branch; Advance is a compare-and-swap on the parent and a no-op when the
+// branch is already there, which is what a recovery after a crash relies on.
+func TestPrepareIsDeterministicAndAdvanceIdempotent(t *testing.T) {
+	_, c := newClone(t)
+	ctx := context.Background()
+	at := time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
+	write(t, c.Work, "a.go", "package a\n\nfunc A() {}\n")
+	ins, err := c.Inspect(ctx, rules(t, c, "a.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	one, err := c.Prepare(ctx, ins, "niten: t001", at)
+	if err != nil {
+		t.Fatal(err)
+	}
+	two, err := c.Prepare(ctx, ins, "niten: t001", at)
+	if err != nil || two != one {
+		t.Fatalf("prepared twice: %+v %+v %v", one, two, err)
+	}
+	if head, _ := c.Head(ctx); head != testutil.FixtureHead {
+		t.Fatalf("Prepare moved the branch to %s", head)
+	}
+	for i := 0; i < 2; i++ {
+		if err := c.Advance(ctx, one); err != nil {
+			t.Fatalf("advance %d: %v", i, err)
+		}
+	}
+	if head, _ := c.Head(ctx); head != one.Commit {
+		t.Fatalf("HEAD %s, want %s", head, one.Commit)
+	}
+	if s, err := c.Subject(ctx, one.Commit); err != nil || s != "niten: t001" {
+		t.Fatalf("subject %q %v", s, err)
+	}
+	if p, err := c.Parent(ctx, one.Commit); err != nil || p != testutil.FixtureHead {
+		t.Fatalf("parent %q %v", p, err)
+	}
+	// A candidate prepared on a parent the branch has left cannot move it.
+	stale := Candidate{Commit: one.Commit, Tree: one.Tree, Parent: strings.Repeat("1", 40)}
+	write(t, c.Work, "a.go", "package a\n\nfunc B() {}\n")
+	ins2, _ := c.Inspect(ctx, rules(t, c, "a.go"))
+	next, err := c.Prepare(ctx, ins2, "niten: t002", at)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale.Commit = next.Commit
+	if err := c.Advance(ctx, stale); err == nil {
+		t.Fatal("advanced from a parent the branch is not at")
+	}
+}
+
+// Compare classifies a commit range like Inspect classifies a snapshot, and Diff
+// shows a file's content even when the candidate marks it -diff.
+func TestCompareAndDiffOfARange(t *testing.T) {
+	_, c := newClone(t)
+	ctx := context.Background()
+	write(t, c.Work, "a.go", "package a\n\nvar Secret = 1\n")
+	write(t, c.Work, "helper.go", "package a\n")
+	write(t, c.Work, ".gitattributes", "a.go -diff\n")
+	ins, err := c.Inspect(ctx, rules(t, c, "a.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cand, err := c.Commit(ctx, ins, "niten: t001", time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmp, err := c.Compare(ctx, testutil.FixtureHead, cand.Commit, rules(t, c, "a.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(cmp.Paths(), ","); got != ".gitattributes,a.go,helper.go" {
+		t.Fatalf("paths %s", got)
+	}
+	if got := strings.Join(cmp.OffTarget, ","); got != ".gitattributes,helper.go" {
+		t.Fatalf("off-target %s", got)
+	}
+	diff, err := c.Diff(ctx, testutil.FixtureHead, cand.Commit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(diff), "+var Secret = 1") || strings.Contains(string(diff), "Binary files") {
+		t.Fatalf("the diff hides content:\n%s", diff)
+	}
+	paths, err := c.Paths(ctx, cand.Commit)
+	if err != nil || strings.Join(paths, ",") != ".gitattributes,a.go,helper.go" {
+		t.Fatalf("paths of the candidate: %v %v", paths, err)
+	}
+	if b, ok, err := c.FileAt(ctx, cand.Commit, "a.go"); err != nil || !ok || !strings.Contains(string(b), "Secret") {
+		t.Fatalf("FileAt: %q %v %v", b, ok, err)
+	}
+	if _, ok, err := c.FileAt(ctx, cand.Commit, "missing.go"); err != nil || ok {
+		t.Fatalf("FileAt of a missing path: %v %v", ok, err)
 	}
 }

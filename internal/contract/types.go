@@ -236,3 +236,60 @@ type HandoffRecord struct {
 	Verified      bool    `json:"verified"`
 	Handoff       Handoff `json:"handoff"`
 }
+
+// ExecutorTurn is the structured output of one executor invocation: the candidate
+// announcement, one response per answered finding and blocking questions.
+type ExecutorTurn struct {
+	Candidate CandidateReady `json:"candidate"`
+	Responses []Response     `json:"responses"`
+	Questions []Question     `json:"questions"`
+}
+
+// TestAssessment is the reviewer's explicit judgement of one test change the
+// coordinator flagged (a deleted, renamed or skipped test).
+type TestAssessment struct {
+	Path       string `json:"path"`
+	Assessment string `json:"assessment"` // preserves or weakens
+	Reason     string `json:"reason"`
+}
+
+// ReviewerTurn is the structured output of one reviewer invocation. ReviewedCommit
+// is the reviewer's claim of what it reviewed; the coordinator checks it against
+// the candidate the attempt was bound to and never trusts it.
+type ReviewerTurn struct {
+	ReviewedCommit  string           `json:"reviewed_commit"`
+	Review          ReviewResult     `json:"review"`
+	Findings        []Finding        `json:"findings"`
+	CheckRequests   []CheckRequest   `json:"check_requests"`
+	TestAssessments []TestAssessment `json:"test_assessments"`
+	Questions       []Question       `json:"questions"`
+}
+
+// AttestationInput is one attestation as the user submits it; the coordinator adds
+// submitted_at and the source when it stores the record.
+type AttestationInput struct {
+	CriterionID    string            `json:"criterion_id"`
+	PlanDigest     string            `json:"plan_digest"`
+	ContractDigest string            `json:"contract_digest"`
+	CandidateSHA   string            `json:"candidate_sha"`
+	Result         AttestationResult `json:"result"`
+	Observation    string            `json:"observation"`
+	Environment    string            `json:"environment"`
+	ObservedAt     string            `json:"observed_at"`
+	Actor          string            `json:"actor"`
+	EvidenceRefs   []string          `json:"evidence_refs"`
+}
+
+// QuestionAnswer is the user's answer to a blocking question, by message id.
+type QuestionAnswer struct {
+	QuestionID string `json:"question_id"`
+	Text       string `json:"text"`
+}
+
+// Answers is the file passed to `resume --answers`: user decisions only.
+type Answers struct {
+	SchemaVersion int                `json:"schema_version"`
+	StepContinue  []StepContinue     `json:"step_continue,omitempty"`
+	Attestations  []AttestationInput `json:"attestations,omitempty"`
+	Answers       []QuestionAnswer   `json:"answers,omitempty"`
+}

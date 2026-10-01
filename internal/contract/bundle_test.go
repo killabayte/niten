@@ -9,8 +9,12 @@ import (
 
 // A bundled schema accepts and rejects exactly what the embedded one does.
 func TestBundleIsSelfContainedAndEquivalent(t *testing.T) {
+	names := []string{DocExecutorTurn, DocReviewerTurn}
 	for _, kind := range MessageKinds {
-		b, err := Bundle(string(kind))
+		names = append(names, string(kind))
+	}
+	for _, kind := range names {
+		b, err := Bundle(kind)
 		if err != nil {
 			t.Fatalf("%s: %v", kind, err)
 		}
@@ -33,11 +37,14 @@ func TestBundleIsSelfContainedAndEquivalent(t *testing.T) {
 			t.Fatalf("%s: the bundle rejects the valid fixture: %v", kind, err)
 		}
 	}
-	b, _ := Bundle(string(KindCandidateReady))
-	s := compileBundle(t, b)
-	inst, _ := jsonschema.UnmarshalJSON(bytes.NewReader(readFixture(t, "invalid/candidate_ready__no_steps.json")))
-	if s.Validate(inst) == nil {
-		t.Fatal("the bundle accepts an invalid payload")
+	for kind, bad := range map[string]string{string(KindCandidateReady): "candidate_ready__no_steps.json",
+		DocExecutorTurn: "executor_turn__smuggled_accepted.json", DocReviewerTurn: "reviewer_turn__executor_kind.json"} {
+		b, _ := Bundle(kind)
+		s := compileBundle(t, b)
+		inst, _ := jsonschema.UnmarshalJSON(bytes.NewReader(readFixture(t, "invalid/"+bad)))
+		if s.Validate(inst) == nil {
+			t.Fatalf("the %s bundle accepts an invalid payload", kind)
+		}
 	}
 }
 

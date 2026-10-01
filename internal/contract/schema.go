@@ -31,6 +31,17 @@ const (
 // recordNames lists every record schema; message kinds map to their own files.
 var recordNames = []string{RecordCandidate, RecordCheck, RecordAttestation, RecordStepGate, RecordHandoff}
 
+// Document schema names: the structured output of one CLI invocation per role, and
+// the user's answers file for `resume --answers`. A turn is a transport container:
+// the coordinator splits it into envelopes of the message kinds it references.
+const (
+	DocExecutorTurn = "executor_turn"
+	DocReviewerTurn = "reviewer_turn"
+	DocAnswers      = "answers"
+)
+
+var documentNames = []string{DocExecutorTurn, DocReviewerTurn, DocAnswers}
+
 const envelopeSchema = "envelope"
 
 var (
@@ -83,6 +94,7 @@ func Schemas() []string {
 		names = append(names, string(k))
 	}
 	names = append(names, recordNames...)
+	names = append(names, documentNames...)
 	sort.Strings(names)
 	return names
 }
@@ -247,6 +259,16 @@ func slicesContains[T comparable](xs []T, x T) bool {
 	return false
 }
 
+// ValidateDocument checks a turn or an answers file against the named document schema.
+func ValidateDocument(name string, data []byte) error {
+	for _, d := range documentNames {
+		if d == name {
+			return validate(name, data)
+		}
+	}
+	return fmt.Errorf("unknown document %q", name)
+}
+
 // ValidateValue marshals a Go value and validates it against the named schema.
 // It is the round-trip check for the typed structs above.
 func ValidateValue(name string, v any) error {
@@ -260,6 +282,9 @@ func ValidateValue(name string, v any) error {
 	}
 	if MessageKind(name).Valid() {
 		return ValidatePayload(MessageKind(name), data)
+	}
+	if slicesContains(documentNames, name) {
+		return ValidateDocument(name, data)
 	}
 	return ValidateRecord(name, data)
 }

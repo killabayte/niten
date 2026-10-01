@@ -51,6 +51,14 @@ func fixtureRepo(t *testing.T, name string, files map[string]string, git bool) s
 
 var demoFiles = map[string]string{"a.go": "package a\n"}
 
+// calcFiles is the small Go module of the two-step engine fixture: one function with a
+// passing test, so a real local check (go test ./...) can run against every candidate.
+var calcFiles = map[string]string{
+	"go.mod":       "module example.com/calc\n\ngo 1.26\n",
+	"calc.go":      "package calc\n\n// Add returns the sum of a and b.\nfunc Add(a, b int) int { return a + b }\n",
+	"calc_test.go": "package calc\n\nimport \"testing\"\n\nfunc TestAdd(t *testing.T) {\n\tif Add(2, 3) != 5 {\n\t\tt.Fatal(\"Add(2, 3) != 5\")\n\t}\n}\n",
+}
+
 // scripted is a planner/reviewer pair for the fast path built from one plan document: the
 // planner returns it (with source coverage for every source named in the prompt), the
 // reviewer approves it with the coverage the integration gate expects.
@@ -330,6 +338,27 @@ func TestZZNitenFixtures(t *testing.T) {
 	t.Run("fast-multirepo", func(t *testing.T) {
 		pl, rv := fake()
 		publish(t, "fast-multirepo", []string{fixtureRepo(t, "demo", demoFiles, true), fixtureRepo(t, "other", map[string]string{"b.go": "package b\n"}, true)}, pl, rv, minTask)
+	})
+	// The P3 engine fixture: two dependent steps on a Go module, each with a test
+	// verification that Niten runs for real, and both criteria in the final verification.
+	t.Run("go-two-step", func(t *testing.T) {
+		reqs := []any{
+			req("R-001", "functional", true, "calc.Sub returns a minus b.", "Sub(5, 3) returns 2 and a test covers it"),
+			req("R-002", "functional", true, "calc.Mul returns a times b.", "Mul(4, 3) returns 12 and a test covers it"),
+		}
+		steps := []any{
+			step("S-001", "Add Sub", []string{}, []string{"R-001"}, []string{"R-001.C1"},
+				[]any{target("repo-1", "calc.go", "modify"), target("repo-1", "calc_test.go", "modify")},
+				[]any{"Add func Sub(a, b int) int to calc.go.", "Add TestSub to calc_test.go."},
+				[]any{verif("V-001", "test", "repo-1", "go test ./... passes, including TestSub")}, "git revert"),
+			step("S-002", "Add Mul", []string{"S-001"}, []string{"R-002"}, []string{"R-002.C1"},
+				[]any{target("repo-1", "calc.go", "modify"), target("repo-1", "calc_test.go", "modify")},
+				[]any{"Add func Mul(a, b int) int to calc.go.", "Add TestMul to calc_test.go."},
+				[]any{verif("V-001", "test", "repo-1", "go test ./... passes, including TestMul")}, "git revert"),
+		}
+		facts := []any{fact("FACT-001", "task", "task", "Add Sub and Mul", "The task asks for two functions.")}
+		pl, rv := scriptedPair(planDoc(facts, reqs, steps, []string{"R-001.C1", "R-002.C1"}))
+		publish(t, "go-two-step", []string{fixtureRepo(t, "calc", calcFiles, true)}, pl, rv, "Add Sub and Mul to the calc package")
 	})
 	t.Run("fast-nongit", func(t *testing.T) {
 		pl, rv := fake()

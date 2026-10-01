@@ -77,6 +77,16 @@ type Run struct {
 	seq     int64
 	broken  error
 	now     func() time.Time
+	observe func(Event) error
+}
+
+// Observe registers f to see every event this process appends to the run,
+// whoever appends it, right after the event is durable. An error of f is
+// returned by that Append; the event itself stays in the journal.
+func (r *Run) Observe(f func(Event) error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.observe = f
 }
 
 // LockedError carries the holder recorded in the lock file.
@@ -208,33 +218,41 @@ func (r *Run) replay() ([]Event, error) {
 // returned and every later Append refuses, so nothing can be claimed on top of
 // a record whose durability is unknown.
 func (r *Run) Append(typ string, data any) (Event, error) {
+	ev, observe, err := r.append(typ, data)
+	if err != nil || observe == nil {
+		return ev, err
+	}
+	return ev, observe(ev)
+}
+
+func (r *Run) append(typ string, data any) (Event, func(Event) error, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.broken != nil {
-		return Event{}, fmt.Errorf("%w: %v", ErrBroken, r.broken)
+		return Event{}, nil, fmt.Errorf("%w: %v", ErrBroken, r.broken)
 	}
 	if r.journal == nil {
-		return Event{}, errors.New("run is closed")
+		return Event{}, nil, errors.New("run is closed")
 	}
 	raw, err := json.Marshal(data)
 	if err != nil {
-		return Event{}, err
+		return Event{}, nil, err
 	}
 	ev := Event{Seq: r.seq + 1, Time: r.now().UTC().Format(time.RFC3339Nano), Type: typ, Data: raw}
 	line, err := json.Marshal(ev)
 	if err != nil {
-		return Event{}, err
+		return Event{}, nil, err
 	}
 	if _, err := writeAll(r.journal, append(line, '\n')); err != nil {
 		r.broken = err
-		return Event{}, fmt.Errorf("%w: %v", ErrBroken, err)
+		return Event{}, nil, fmt.Errorf("%w: %v", ErrBroken, err)
 	}
 	if err := syncFile(r.journal); err != nil {
 		r.broken = err
-		return Event{}, fmt.Errorf("%w: %v", ErrBroken, err)
+		return Event{}, nil, fmt.Errorf("%w: %v", ErrBroken, err)
 	}
 	r.seq = ev.Seq
-	return ev, nil
+	return ev, r.observe, nil
 }
 
 // Broken reports the write error that stopped the journal, if any.
@@ -277,30 +295,46 @@ func (r *Run) SaveState(v any) error {
 	if err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(r.Dir, "."+stateFile+".tmp-*")
+	_, err = r.Replace(stateFile, append(b, '\n'))
+	return err
+}
+
+// Projections are the run files that are replaced rather than written once:
+// the state projection and the current execution report. Every other run file
+// is a write-once artifact.
+var projections = map[string]bool{stateFile: true, "execution.json": true, "execution.md": true}
+
+// Replace atomically replaces one projection file (temp file, sync, rename,
+// directory sync) and returns the digest of the new content. A failure leaves
+// the previous content intact.
+func (r *Run) Replace(rel string, data []byte) (string, error) {
+	if !projections[rel] {
+		return "", fmt.Errorf("run file %s is not a projection; artifacts are written once", rel)
+	}
+	tmp, err := os.CreateTemp(r.Dir, "."+rel+".tmp-*")
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer os.Remove(tmp.Name())
-	if _, err := writeAll(tmp, append(b, '\n')); err != nil {
+	if _, err := writeAll(tmp, data); err != nil {
 		tmp.Close()
-		return err
+		return "", err
 	}
 	if err := tmp.Chmod(0o600); err != nil {
 		tmp.Close()
-		return err
+		return "", err
 	}
 	if err := syncFile(tmp); err != nil {
 		tmp.Close()
-		return err
+		return "", err
 	}
 	if err := tmp.Close(); err != nil {
-		return err
+		return "", err
 	}
-	if err := os.Rename(tmp.Name(), filepath.Join(r.Dir, stateFile)); err != nil {
-		return err
+	if err := os.Rename(tmp.Name(), filepath.Join(r.Dir, rel)); err != nil {
+		return "", err
 	}
-	return syncDir(r.Dir)
+	return sha(data), syncDir(r.Dir)
 }
 
 // LoadState decodes state.json into v.

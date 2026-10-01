@@ -67,6 +67,39 @@ func FixtureRepo(t *testing.T, parent string) string {
 	return dir
 }
 
+// CalcHead is the base commit of the go-two-step fixture: a small Go module with a
+// passing test, used by the engine's end-to-end tests.
+const CalcHead = "bdffc24a02d55307d6907485cf14fe665d5b3c82"
+
+// CalcFiles are the files of the go-two-step fixture repository.
+var CalcFiles = map[string]string{
+	"go.mod":       "module example.com/calc\n\ngo 1.26\n",
+	"calc.go":      "package calc\n\n// Add returns the sum of a and b.\nfunc Add(a, b int) int { return a + b }\n",
+	"calc_test.go": "package calc\n\nimport \"testing\"\n\nfunc TestAdd(t *testing.T) {\n\tif Add(2, 3) != 5 {\n\t\tt.Fatal(\"Add(2, 3) != 5\")\n\t}\n}\n",
+}
+
+// CalcRepo rebuilds the go-two-step fixture repository at <parent>/calc and checks that
+// its HEAD is CalcHead.
+func CalcRepo(t *testing.T, parent string) string {
+	t.Helper()
+	dir := filepath.Join(parent, "calc")
+	for p, c := range CalcFiles {
+		if err := os.MkdirAll(filepath.Dir(filepath.Join(dir, p)), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, p), []byte(c), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	Git(t, dir, "init", "-q")
+	Git(t, dir, "add", "-A")
+	Git(t, dir, "commit", "-qm", "fixture base")
+	if head := Git(t, dir, "rev-parse", "HEAD"); head != CalcHead {
+		t.Fatalf("calc fixture HEAD %s, want %s: the fixture commit is not reproducible here", head, CalcHead)
+	}
+	return dir
+}
+
 // CopyFixture copies the named triplet into dir as plan.md, plan.approval.json and
 // plan.manifest.json and returns the plan path.
 func CopyFixture(t *testing.T, name, dir string) string {

@@ -113,5 +113,25 @@
   "schema": "check_evidence",
   "file": "check_evidence__passed_with_failed_assertion.json",
   "expect": "passed"
+ },
+ {
+  "schema": "executor_turn",
+  "file": "executor_turn__smuggled_accepted.json",
+  "expect": "accepted"
+ },
+ {
+  "schema": "reviewer_turn",
+  "file": "reviewer_turn__executor_kind.json",
+  "expect": "candidate"
+ },
+ {
+  "schema": "reviewer_turn",
+  "file": "reviewer_turn__bad_assessment.json",
+  "expect": "assessment"
+ },
+ {
+  "schema": "answers",
+  "file": "answers__model_source.json",
+  "expect": "source"
  }
 ]
