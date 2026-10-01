@@ -329,7 +329,11 @@ func (c *Clone) Inspect(ctx context.Context, r Rules) (*Inspection, error) {
 		ins.Changes = append(ins.Changes, ch)
 		c.classify(ch, r, ins)
 	}
-	if err := c.physical(ctx, r, ins); err != nil {
+	ignoredLinks := linkView{}
+	if err := c.physical(ctx, r, ins, ignoredLinks); err != nil {
+		return nil, err
+	}
+	if err := c.checkLinks(ctx, head, ins, ignoredLinks); err != nil {
 		return nil, err
 	}
 	sort.Strings(ins.OffTarget)
@@ -342,7 +346,7 @@ func (c *Clone) Inspect(ctx context.Context, r Rules) (*Inspection, error) {
 // is not part of the candidate, but a protected or instruction path may not
 // exist in the worktree that way either, and a nested .git directory is never
 // allowed. Other ignored files are listed, not committed.
-func (c *Clone) physical(ctx context.Context, r Rules, ins *Inspection) error {
+func (c *Clone) physical(ctx context.Context, r Rules, ins *Inspection, ignoredLinks linkView) error {
 	out, err := c.git(ctx, nil, "ls-tree", "-r", "-z", "--name-only", "--full-tree", ins.Tree)
 	if err != nil {
 		return err
@@ -377,10 +381,7 @@ func (c *Clone) physical(ctx context.Context, r Rules, ins *Inspection) error {
 			if err != nil {
 				return err
 			}
-			if escapes(rel, target) {
-				ins.Violations = append(ins.Violations, fmt.Sprintf("%s: symlink to %q leaves the repository (ignored by git)", rel, target))
-				return nil
-			}
+			ignoredLinks[rel] = target
 		}
 		switch {
 		case pathglob.MatchAny(r.Protected, rel) != "":
@@ -408,22 +409,143 @@ func (c *Clone) classify(ch Change, r Rules, ins *Inspection) {
 			ins.Violations = append(ins.Violations, p+": instruction path changed without an explicit plan target")
 		}
 	}
-	if ch.NewMode == "120000" && escapes(p, ch.SymlinkTarget) {
-		ins.Violations = append(ins.Violations, fmt.Sprintf("%s: symlink to %q leaves the repository", p, ch.SymlinkTarget))
-	}
 	if !matchesTarget(r.Targets, p) {
 		ins.OffTarget = append(ins.OffTarget, p)
 	}
 }
 
-// escapes reports whether a symlink at the repository-relative path p with
-// the given target points outside the repository.
-func escapes(p, target string) bool {
-	if strings.HasPrefix(target, "/") {
-		return true
+// linkView maps the repository-relative paths of symlinks to their targets.
+type linkView map[string]string
+
+// maxHops bounds symlink resolution; a longer chain is treated as a loop.
+const maxHops = 40
+
+// escapes resolves the symlink at p the way the file system does: component
+// by component from the symlink's directory, following every symlink of the
+// view before a later ".." is applied. It reports whether the resolution
+// leaves the repository, through an absolute target, a ".." above the root or
+// a loop. Components that are not symlinks of the view are taken as
+// directories.
+func (v linkView) escapes(p string) (bool, string) {
+	target, ok := v[p]
+	if !ok {
+		return false, ""
 	}
-	resolved := path.Clean(path.Join(path.Dir(p), target))
-	return resolved == ".." || strings.HasPrefix(resolved, "../")
+	var stack []string
+	if dir := path.Dir(p); dir != "." {
+		stack = strings.Split(dir, "/")
+	}
+	if strings.HasPrefix(target, "/") {
+		return true, "absolute target"
+	}
+	queue := strings.Split(target, "/")
+	hops := 0
+	for len(queue) > 0 {
+		c := queue[0]
+		queue = queue[1:]
+		switch c {
+		case "", ".":
+			continue
+		case "..":
+			if len(stack) == 0 {
+				return true, "resolves above the repository root"
+			}
+			stack = stack[:len(stack)-1]
+			continue
+		}
+		cur := strings.Join(append(append([]string{}, stack...), c), "/")
+		if t, isLink := v[cur]; isLink {
+			hops++
+			if hops > maxHops {
+				return true, "symlink loop"
+			}
+			if strings.HasPrefix(t, "/") {
+				return true, "resolves through " + cur + " to an absolute target"
+			}
+			queue = append(strings.Split(t, "/"), queue...)
+			continue
+		}
+		stack = append(stack, c)
+	}
+	return false, ""
+}
+
+// treeLinks reads the symlinks of a tree.
+func (c *Clone) treeLinks(ctx context.Context, treeish string) (linkView, error) {
+	entries, err := c.treeEntries(ctx, treeish)
+	if err != nil {
+		return nil, err
+	}
+	var shas []string
+	for _, e := range entries {
+		if e.mode == "120000" {
+			shas = append(shas, e.sha)
+		}
+	}
+	blobs, err := c.readBlobs(ctx, shas)
+	if err != nil {
+		return nil, err
+	}
+	v := linkView{}
+	for _, e := range entries {
+		if e.mode == "120000" {
+			v[e.path] = string(blobs[e.sha])
+		}
+	}
+	return v, nil
+}
+
+// checkLinks resolves every symlink of the snapshot and every ignored symlink
+// of the worktree together, as the file system would, and reports each one
+// that leaves the repository. A symlink that is unchanged from HEAD and
+// already left the repository there is the base's own and is not a
+// violation; any other escape is, including an unchanged symlink that now
+// escapes because another symlink changed.
+func (c *Clone) checkLinks(ctx context.Context, head string, ins *Inspection, ignoredLinks linkView) error {
+	base, err := c.treeLinks(ctx, head)
+	if err != nil {
+		return err
+	}
+	cur, err := c.treeLinks(ctx, ins.Tree)
+	if err != nil {
+		return err
+	}
+	for p, t := range ignoredLinks {
+		cur[p] = t
+	}
+	paths := make([]string, 0, len(cur))
+	for p := range cur {
+		paths = append(paths, p)
+	}
+	sort.Strings(paths)
+	bad := map[string]bool{}
+	for _, p := range paths {
+		esc, why := cur.escapes(p)
+		if !esc {
+			continue
+		}
+		if bt, ok := base[p]; ok && bt == cur[p] {
+			if besc, _ := base.escapes(p); besc {
+				continue
+			}
+		}
+		where := ""
+		if _, ignored := ignoredLinks[p]; ignored {
+			where = " (ignored by git)"
+		}
+		ins.Violations = append(ins.Violations, fmt.Sprintf("%s: symlink to %q leaves the repository%s: %s", p, cur[p], where, why))
+		bad[p] = true
+	}
+	if len(bad) > 0 {
+		kept := ins.Ignored[:0]
+		for _, p := range ins.Ignored {
+			if !bad[p] {
+				kept = append(kept, p)
+			}
+		}
+		ins.Ignored = kept
+	}
+	return nil
 }
 
 // matchesTarget reports whether p is a target, matches a target pattern or

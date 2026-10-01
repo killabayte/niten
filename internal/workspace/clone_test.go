@@ -402,3 +402,93 @@ func TestAttributeConversionsCannotHideChanges(t *testing.T) {
 		t.Fatalf("changes hidden by attribute conversions: %v %v", changes, err)
 	}
 }
+
+// Review regression (P2, round 3): a symlink chain is resolved the way the
+// file system does it, not lexically: alias -> . then escape -> alias/../x
+// leaves the repository, whether the links are committed or ignored.
+func TestCompoundSymlinkChainIsResolvedPhysically(t *testing.T) {
+	for _, ignored := range []bool{false, true} {
+		t.Run(map[bool]string{false: "tracked", true: "ignored"}[ignored], func(t *testing.T) {
+			_, c := newClone(t)
+			ctx := context.Background()
+			outside := filepath.Join(filepath.Dir(c.Work), "outside")
+			os.WriteFile(outside, []byte("outside the clone"), 0o600)
+			os.Symlink(".", filepath.Join(c.Work, "alias"))
+			os.Symlink("alias/../outside", filepath.Join(c.Work, "escape"))
+			if real, _ := filepath.EvalSymlinks(filepath.Join(c.Work, "escape")); real != outside {
+				t.Fatalf("fixture resolves to %s", real)
+			}
+			write(t, c.Work, "a.go", "package changed\n")
+			if ignored {
+				write(t, c.Work, ".gitignore", "alias\nescape\n")
+			}
+			ins, err := c.Inspect(ctx, rules(t, c, "a.go", "alias", "escape", ".gitignore"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(strings.Join(ins.Violations, " "), "escape: symlink to \"alias/../outside\" leaves the repository") {
+				t.Fatalf("violations %v", ins.Violations)
+			}
+			if _, err := c.Commit(ctx, ins, "candidate", time.Now()); err == nil {
+				t.Fatal("committed")
+			}
+		})
+	}
+}
+
+// An unchanged symlink that starts to escape because another symlink changed
+// is a violation; a loop is refused.
+func TestSymlinkResolutionCoversIndirectChanges(t *testing.T) {
+	_, c := newClone(t)
+	ctx := context.Background()
+	write(t, c.Work, "dir/keep.go", "package dir\n")
+	os.Symlink("dir/../a.go", filepath.Join(c.Work, "x"))
+	ins, err := c.Inspect(ctx, rules(t, c, "dir/", "x"))
+	if err != nil || len(ins.Violations) != 0 {
+		t.Fatalf("setup: %v %v", ins.Violations, err)
+	}
+	if _, err := c.Commit(ctx, ins, "base links", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	os.RemoveAll(filepath.Join(c.Work, "dir"))
+	os.Symlink(".", filepath.Join(c.Work, "dir"))
+	ins, err = c.Inspect(ctx, rules(t, c, "dir", "x"))
+	if err != nil || !strings.Contains(strings.Join(ins.Violations, " "), "x: symlink to \"dir/../a.go\" leaves the repository") {
+		t.Fatalf("indirect escape: %v %v", ins.Violations, err)
+	}
+	_, c2 := newClone(t)
+	os.Symlink("loop-b", filepath.Join(c2.Work, "loop-a"))
+	os.Symlink("loop-a", filepath.Join(c2.Work, "loop-b"))
+	if ins, _ := c2.Inspect(ctx, rules(t, c2, "loop-a", "loop-b")); !strings.Contains(strings.Join(ins.Violations, " "), "symlink loop") {
+		t.Fatalf("loop: %v", ins.Violations)
+	}
+}
+
+// A symlink the base commit already had, pointing outside, is the base's own:
+// it is not a violation while it stays unchanged.
+func TestBaseSymlinkOutsideIsNotAViolation(t *testing.T) {
+	testutil.IsolateGit(t)
+	root := t.TempDir()
+	src := filepath.Join(root, "src")
+	os.MkdirAll(src, 0o755)
+	os.WriteFile(filepath.Join(src, "a.go"), []byte("package a\n"), 0o644)
+	os.Symlink("../shared", filepath.Join(src, "shared"))
+	testutil.Git(t, src, "init", "-q")
+	testutil.Git(t, src, "add", "-A")
+	testutil.Git(t, src, "commit", "-qm", "base with an outside link")
+	head := testutil.Git(t, src, "rev-parse", "HEAD")
+	c, err := CreateClone(context.Background(), src, head, filepath.Join(root, "work"), filepath.Join(root, "gitdir"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	write(t, c.Work, "a.go", "package b\n")
+	ins, err := c.Inspect(context.Background(), rules(t, c, "a.go"))
+	if err != nil || len(ins.Violations) != 0 {
+		t.Fatalf("the base's own link was flagged: %v %v", ins.Violations, err)
+	}
+	os.Remove(filepath.Join(c.Work, "shared"))
+	os.Symlink("../elsewhere", filepath.Join(c.Work, "shared"))
+	if ins, _ := c.Inspect(context.Background(), rules(t, c, "a.go", "shared")); len(ins.Violations) == 0 {
+		t.Fatal("a changed outside link was accepted")
+	}
+}
