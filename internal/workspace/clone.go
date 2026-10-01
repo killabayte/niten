@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"os/exec"
@@ -371,6 +372,16 @@ func (c *Clone) physical(ctx context.Context, r Rules, ins *Inspection) error {
 		if inTree[rel] {
 			return nil
 		}
+		if d.Type()&fs.ModeSymlink != 0 {
+			target, err := os.Readlink(p)
+			if err != nil {
+				return err
+			}
+			if escapes(rel, target) {
+				ins.Violations = append(ins.Violations, fmt.Sprintf("%s: symlink to %q leaves the repository (ignored by git)", rel, target))
+				return nil
+			}
+		}
 		switch {
 		case pathglob.MatchAny(r.Protected, rel) != "":
 			ins.Violations = append(ins.Violations, rel+": protected path present outside the snapshot (ignored by git) ("+pathglob.MatchAny(r.Protected, rel)+")")
@@ -397,15 +408,22 @@ func (c *Clone) classify(ch Change, r Rules, ins *Inspection) {
 			ins.Violations = append(ins.Violations, p+": instruction path changed without an explicit plan target")
 		}
 	}
-	if ch.NewMode == "120000" {
-		t := ch.SymlinkTarget
-		if strings.HasPrefix(t, "/") || strings.HasPrefix(path.Clean(path.Join(path.Dir(p), t)), "../") || path.Clean(path.Join(path.Dir(p), t)) == ".." {
-			ins.Violations = append(ins.Violations, fmt.Sprintf("%s: symlink to %q leaves the repository", p, t))
-		}
+	if ch.NewMode == "120000" && escapes(p, ch.SymlinkTarget) {
+		ins.Violations = append(ins.Violations, fmt.Sprintf("%s: symlink to %q leaves the repository", p, ch.SymlinkTarget))
 	}
 	if !matchesTarget(r.Targets, p) {
 		ins.OffTarget = append(ins.OffTarget, p)
 	}
+}
+
+// escapes reports whether a symlink at the repository-relative path p with
+// the given target points outside the repository.
+func escapes(p, target string) bool {
+	if strings.HasPrefix(target, "/") {
+		return true
+	}
+	resolved := path.Clean(path.Join(path.Dir(p), target))
+	return resolved == ".." || strings.HasPrefix(resolved, "../")
 }
 
 // matchesTarget reports whether p is a target, matches a target pattern or
@@ -508,8 +526,10 @@ func (c *Clone) Restore(ctx context.Context) error {
 	return err
 }
 
-// Materialize writes the tree of commit into dest, a new directory, through a
-// private index. Nothing in dest refers back to the clone.
+// Materialize writes the tree of commit into dest, a new directory, byte for
+// byte from the blobs: no smudge-side conversion (ident, end-of-line,
+// working-tree encoding) and no filter is applied, so the copy holds exactly
+// the candidate's bytes. Nothing in dest refers back to the clone.
 func (c *Clone) Materialize(ctx context.Context, commit, dest string) error {
 	if !filepath.IsAbs(dest) {
 		return fmt.Errorf("copy path %q is not absolute", dest)
@@ -520,18 +540,40 @@ func (c *Clone) Materialize(ctx context.Context, commit, dest string) error {
 	if err := os.MkdirAll(dest, 0o700); err != nil {
 		return err
 	}
-	idx, cleanup, err := c.tempIndex()
+	entries, err := c.treeEntries(ctx, commit)
 	if err != nil {
 		return err
 	}
-	defer cleanup()
-	env := []string{"GIT_INDEX_FILE=" + idx}
-	if _, err := c.git(ctx, env, "read-tree", commit); err != nil {
+	var shas []string
+	for _, e := range entries {
+		switch e.mode {
+		case "100644", "100755", "120000":
+			shas = append(shas, e.sha)
+		default:
+			return fmt.Errorf("%s: entry mode %s cannot be materialized", e.path, e.mode)
+		}
+	}
+	blobs, err := c.readBlobs(ctx, shas)
+	if err != nil {
 		return err
 	}
-	cp := &Clone{Work: dest, GitDir: c.GitDir}
-	if _, err := cp.git(ctx, env, "checkout-index", "--all", "--force"); err != nil {
-		return err
+	for _, e := range entries {
+		p := filepath.Join(dest, filepath.FromSlash(e.path))
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			return err
+		}
+		data := blobs[e.sha]
+		switch e.mode {
+		case "120000":
+			err = os.Symlink(string(data), p)
+		case "100755":
+			err = os.WriteFile(p, data, 0o755)
+		default:
+			err = os.WriteFile(p, data, 0o644)
+		}
+		if err != nil {
+			return err
+		}
 	}
 	changed, err := c.SourcesChanged(ctx, commit, dest, nil)
 	if err != nil {
@@ -541,6 +583,71 @@ func (c *Clone) Materialize(ctx context.Context, commit, dest string) error {
 		return fmt.Errorf("the materialized copy differs from %s: %v", commit, changed)
 	}
 	return nil
+}
+
+type treeEntry struct{ mode, sha, path string }
+
+func (c *Clone) treeEntries(ctx context.Context, commit string) ([]treeEntry, error) {
+	out, err := c.git(ctx, nil, "ls-tree", "-r", "-z", "--full-tree", commit)
+	if err != nil {
+		return nil, err
+	}
+	var entries []treeEntry
+	for _, rec := range strings.Split(string(out), "\x00") {
+		if rec == "" {
+			continue
+		}
+		meta, p, ok := strings.Cut(rec, "\t")
+		f := strings.Fields(meta)
+		if !ok || len(f) != 3 {
+			return nil, fmt.Errorf("unexpected ls-tree record %q", rec)
+		}
+		entries = append(entries, treeEntry{mode: f[0], sha: f[2], path: p})
+	}
+	return entries, nil
+}
+
+// readBlobs reads raw blob contents through one `git cat-file --batch`.
+func (c *Clone) readBlobs(ctx context.Context, shas []string) (map[string][]byte, error) {
+	out := map[string][]byte{}
+	if len(shas) == 0 {
+		return out, nil
+	}
+	var in bytes.Buffer
+	for _, s := range shas {
+		in.WriteString(s + "\n")
+	}
+	cmd := exec.CommandContext(ctx, "git", append(append([]string{"--git-dir", c.GitDir}, isolatedFlags...), "cat-file", "--batch")...)
+	cmd.Env = isolatedEnv()
+	cmd.Stdin = &in
+	raw, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("git cat-file --batch: %w", err)
+	}
+	r := bufio.NewReader(bytes.NewReader(raw))
+	for range shas {
+		header, err := r.ReadString('\n')
+		if err != nil {
+			return nil, fmt.Errorf("git cat-file --batch: %w", err)
+		}
+		f := strings.Fields(header)
+		if len(f) != 3 || f[1] != "blob" {
+			return nil, fmt.Errorf("git cat-file --batch: unexpected header %q", strings.TrimSpace(header))
+		}
+		var size int
+		if _, err := fmt.Sscan(f[2], &size); err != nil {
+			return nil, err
+		}
+		data := make([]byte, size)
+		if _, err := io.ReadFull(r, data); err != nil {
+			return nil, err
+		}
+		if _, err := r.ReadByte(); err != nil { // the newline after the content
+			return nil, err
+		}
+		out[f[0]] = data
+	}
+	return out, nil
 }
 
 // SourcesChanged compares dir with the tree of commit and lists every tracked
@@ -602,7 +709,7 @@ func (c *Clone) SourcesChanged(ctx context.Context, commit, dir string, outputs 
 			in.WriteString(e.path + "\n")
 		}
 		cp := &Clone{Work: dir, GitDir: c.GitDir}
-		cmd := exec.CommandContext(ctx, "git", append(append([]string{"--git-dir", c.GitDir, "--work-tree", dir}, isolatedFlags...), "hash-object", "--stdin-paths")...)
+		cmd := exec.CommandContext(ctx, "git", append(append([]string{"--git-dir", c.GitDir, "--work-tree", dir}, isolatedFlags...), "hash-object", "--no-filters", "--stdin-paths")...)
 		cmd.Env = isolatedEnv()
 		cmd.Dir = cp.Work
 		cmd.Stdin = &in

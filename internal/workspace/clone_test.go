@@ -347,3 +347,58 @@ func TestTamperedMetadataStopsBeforeGitRuns(t *testing.T) {
 		t.Fatalf("inspection of tampered metadata: %+v %v", ins, err)
 	}
 }
+
+// Review regression (P2, round 2): an ignored symlink that leaves the
+// repository is a hard violation like a committed one.
+func TestIgnoredEscapingSymlinkRejectsTheSnapshot(t *testing.T) {
+	_, c := newClone(t)
+	ctx := context.Background()
+	write(t, c.Work, ".gitignore", "escape\n")
+	write(t, c.Work, "a.go", "package changed\n")
+	os.Symlink(t.TempDir(), filepath.Join(c.Work, "escape"))
+	ins, err := c.Inspect(ctx, rules(t, c, "a.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(strings.Join(ins.Violations, " "), "escape: symlink to") || slices.Contains(ins.Ignored, "escape") {
+		t.Fatalf("violations %v ignored %v", ins.Violations, ins.Ignored)
+	}
+	if _, err := c.Commit(ctx, ins, "candidate", time.Now()); err == nil {
+		t.Fatal("the permitted part was committed")
+	}
+}
+
+// Review regression (P2, round 2): built-in attribute conversions (ident,
+// end-of-line) neither change the copy nor hide a change to it: the copy holds
+// the blob bytes and the comparison uses raw bytes.
+func TestAttributeConversionsCannotHideChanges(t *testing.T) {
+	_, c := newClone(t)
+	ctx := context.Background()
+	write(t, c.Work, ".gitattributes", "a.go ident\n*.txt text eol=crlf\n")
+	write(t, c.Work, "a.go", "package a\nconst Value = \"$Id$\"\n")
+	write(t, c.Work, "notes.txt", "one\ntwo\n")
+	ins, err := c.Inspect(ctx, rules(t, c, "a.go", ".gitattributes", "notes.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cand, err := c.Commit(ctx, ins, "candidate", time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	dest := filepath.Join(t.TempDir(), "copy")
+	if err := c.Materialize(ctx, cand.Commit, dest); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(dest, "a.go")); string(b) != "package a\nconst Value = \"$Id$\"\n" {
+		t.Fatalf("ident was expanded in the copy: %q", b)
+	}
+	if b, _ := os.ReadFile(filepath.Join(dest, "notes.txt")); string(b) != "one\ntwo\n" {
+		t.Fatalf("end-of-line conversion in the copy: %q", b)
+	}
+	write(t, dest, "a.go", "package a\nconst Value = \"$Id: altered implementation $\"\n")
+	write(t, dest, "notes.txt", "one\r\ntwo\r\n")
+	changes, err := c.SourcesChanged(ctx, cand.Commit, dest, nil)
+	if err != nil || len(changes) != 2 {
+		t.Fatalf("changes hidden by attribute conversions: %v %v", changes, err)
+	}
+}

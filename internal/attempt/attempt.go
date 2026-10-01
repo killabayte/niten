@@ -331,10 +331,16 @@ func resolve(run *store.Run, in *intent, st *started, parsers map[string]ParseFu
 	rec := Recovered{ID: in.ID, Role: in.Role}
 	dir := "attempts/" + in.ID
 	if st != nil {
-		if ob, err := run.ReadArtifact(dir+"/outcome.json", ""); err == nil {
+		ob, err := run.ReadArtifact(dir+"/outcome.json", "")
+		switch {
+		case err == nil:
 			return completeFromArtifacts(run, in, ob, parsers)
+		case !errors.Is(err, fs.ErrNotExist):
+			// The outcome may exist but cannot be read: what happened is
+			// recorded and unknown to us, so nothing is guessed.
+			return rec, fmt.Errorf("%w: attempt %s: the saved outcome cannot be read: %v", store.ErrCorrupt, in.ID, err)
 		}
-		err := provider.TerminateRecorded(st.Identity, grace)
+		err = provider.TerminateRecorded(st.Identity, grace)
 		var remains *provider.GroupRemainsError
 		if errors.As(err, &remains) {
 			rec.Status, rec.Remains = StatusUnknown, remains.PIDs
@@ -355,6 +361,11 @@ func resolve(run *store.Run, in *intent, st *started, parsers map[string]ParseFu
 		se, _ := run.Path(in.StderrRef)
 		_, e1 := os.Lstat(so)
 		_, e2 := os.Lstat(se)
+		for _, e := range []error{e1, e2} {
+			if e != nil && !errors.Is(e, fs.ErrNotExist) {
+				return rec, fmt.Errorf("attempt %s: the stream files cannot be checked: %w", in.ID, e)
+			}
+		}
 		if errors.Is(e1, fs.ErrNotExist) && errors.Is(e2, fs.ErrNotExist) {
 			rec.Status, rec.Reason = StatusNotStarted, "the stream files were never created, so the process never started"
 		} else {
@@ -377,11 +388,14 @@ func completeFromArtifacts(run *store.Run, in *intent, outcomeBytes []byte, pars
 	}
 	var st stored
 	resultBytes, err := run.ReadArtifact(dir+"/result.json", "")
-	if err == nil {
+	switch {
+	case err == nil:
 		if err := json.Unmarshal(resultBytes, &st); err != nil {
 			return rec, fmt.Errorf("%w: %s/result.json: %v", store.ErrCorrupt, dir, err)
 		}
-	} else {
+	case !errors.Is(err, fs.ErrNotExist):
+		return rec, fmt.Errorf("%w: %s/result.json cannot be read: %v", store.ErrCorrupt, dir, err)
+	default:
 		parse := parsers[in.Role]
 		if parse == nil {
 			return rec, fmt.Errorf("no parser for role %s", in.Role)

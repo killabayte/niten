@@ -56,14 +56,19 @@ the live probes are separately authorized. The engine that drives these pieces (
   fingerprinted after the coordinator's last commit). Changed metadata or a rewritten
   pointer stops the inspection before any git command reads the worktree. Inspect also
   walks the physical worktree, independent of ignore rules: a protected or instruction
-  path that git ignores, or a nested `.git` directory, is a hard violation; other ignored
-  files are listed and are not part of the candidate. Paths outside the plan targets are
+  path that git ignores, an ignored symlink leaving the repository, or a nested `.git`
+  directory, is a hard violation; other ignored files are listed and are not part of the
+  candidate. Paths outside the plan targets are
   off-target; they are allowed for review, not rejected here.
 - `Commit` refuses any violation (there is no partial commit of the permitted part), an
   empty snapshot and a HEAD that moved since the inspection; candidates are committed by
   `Niten <niten@localhost>`. `SaveRejected` keeps a rejected snapshot under
   `refs/niten/rejected/<name>` without moving HEAD; `Restore` returns the worktree to
-  HEAD exactly.
+  HEAD exactly. `Materialize` writes a candidate into new roots byte for byte from its
+  blobs (`git cat-file --batch`), with no smudge-side conversion (`ident`, end-of-line,
+  working-tree encoding) and no filter, and `SourcesChanged` compares raw bytes
+  (`hash-object --no-filters`), so an attribute cannot hide a change to the code under
+  test.
 - Repository instructions for the next invocation come from the base commit copies that
   `prepare` stored, never from the clone, and the CLIs are told not to load them
   (`--safe-mode` for Claude, `project_doc_max_bytes=0` for Codex), so a candidate's edit
@@ -152,6 +157,7 @@ is not repeated; an interrupted recovery reuses its own identical artifact:
 |---|---|
 | `attempt.finished` present | `finished`; both artifacts must match their digests |
 | started, outcome artifact saved | `finished`, completed from the saved outcome (and result, or a parse against the saved outcome); a known failure stays a failure |
+| started, outcome or result artifact present but unreadable | recovery stops with `ErrCorrupt`; an unreadable record is never treated as absent |
 | started, no outcome, recorded process alive with its recorded start time | the group is stopped, then as below |
 | started, members of a dead leader's group remain | `outcome_unknown`, processes reported, never signalled; the run is blocked |
 | started or intent, the attempt's directory is held by any process, or the holders cannot be listed | `outcome_unknown`, blocked until nothing holds it |

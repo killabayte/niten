@@ -301,3 +301,24 @@ func TestCheckThatAddsSourcesIsInvalidated(t *testing.T) {
 		t.Fatalf("declared output: %v %+v %v", err, res2.Evidence, res2.Reasons)
 	}
 }
+
+// Review regression (P2, round 2): a check that edits code inside an ident
+// keyword is invalidated, end to end.
+func TestIdentMutationInvalidatesTheEvidence(t *testing.T) {
+	w := newWorld(t)
+	for name, body := range map[string]string{
+		".gitattributes": "a.go ident\n",
+		"a.go":           "package demo\nconst Value = \"$Id$\"\nfunc A() int { return 1 }\n",
+		"check.sh":       "#!/bin/sh\nset -eu\nprintf 'package demo\\nconst Value = \"$Id: altered implementation $\"\\nfunc A() int { return 1 }\\n' > a.go\n" + w.v.Toolchains[0] + "/bin/go test -count=1 ./...\n",
+	} {
+		os.WriteFile(filepath.Join(w.clone.Work, name), []byte(body), 0o644)
+	}
+	c := w.candidate(t, test(`	if Value != "$Id: altered implementation $" { t.Fatal(Value) }`))
+	res, err := w.v.Run(context.Background(), req(c, Check{ID: "ident", Argv: []string{"/bin/sh", "./check.sh"}, Cwd: ".", Timeout: 3 * time.Minute}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Evidence.Status != contract.CheckInvalidated || res.Evidence.SourcesUnchanged {
+		t.Fatalf("status=%s sources_unchanged=%v reasons=%v", res.Evidence.Status, res.Evidence.SourcesUnchanged, res.Reasons)
+	}
+}

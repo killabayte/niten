@@ -416,3 +416,23 @@ func TestStoreFailureStartsNothing(t *testing.T) {
 		t.Fatal("the model was started")
 	}
 }
+
+// Review regression (P2, round 2): a saved outcome that cannot be read stops
+// recovery; it is never treated as absent.
+func TestUnreadableOutcomeStopsRecovery(t *testing.T) {
+	w := newWorld(t)
+	full, _ := os.ReadFile(w.stream)
+	w.writeIntent("a0001-executor", string(full), true)
+	id := deadIdentity(t)
+	w.run.Append(EvStarted, started{ID: "a0001-executor", Identity: id})
+	ob, _ := json.Marshal(provider.Outcome{Exit: 17, Identity: id})
+	w.run.WriteArtifact("attempts/a0001-executor/outcome.json", ob, 0o600)
+	p, _ := w.run.Path("attempts/a0001-executor/outcome.json")
+	os.Chmod(p, 0o000)
+	defer os.Chmod(p, 0o600)
+	events := w.reopen()
+	recs, err := Recover(w.run, events, map[string]ParseFunc{"executor": claudeParse()}, time.Second)
+	if !errors.Is(err, store.ErrCorrupt) || len(recs) != 0 {
+		t.Fatalf("unreadable outcome: %+v %v", recs, err)
+	}
+}
