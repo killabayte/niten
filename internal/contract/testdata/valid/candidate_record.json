@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "candidate_id": {"commit": "0123456789abcdef0123456789abcdef01234567", "tree": "0123456789abcdef0123456789abcdef01234567", "plan_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "generation": 1},
+  "parent_candidate_id": null,
+  "step_ids": ["S-001"],
+  "actual_changed_paths": ["main.go", "main_test.go", "go.sum"],
+  "off_target_changes": [{"path": "go.sum", "reason_claimed": "checksum for the test dependency", "disposition": "pending"}],
+  "hard_policy_violations": [],
+  "created_at": "2026-09-30T12:00:00Z"
+}

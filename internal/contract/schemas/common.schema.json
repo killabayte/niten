@@ -1,0 +1,77 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "common.schema.json",
+  "$defs": {
+    "nonempty": {"type": "string", "minLength": 1},
+    "sha": {"type": "string", "pattern": "^([0-9a-f]{40}|[0-9a-f]{64})$"},
+    "digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "timestamp": {"type": "string", "format": "date-time"},
+    "duration": {"type": "string", "pattern": "^[0-9]+(ns|us|ms|s|m|h)$"},
+    "id_S": {"type": "string", "pattern": "^S-[0-9]{3,}$"},
+    "id_C": {"type": "string", "pattern": "^R-[0-9]{3,}\\.C[0-9]+$"},
+    "id_V": {"type": "string", "pattern": "^S-[0-9]{3,}/V-[0-9]{3,}$"},
+    "id_F": {"type": "string", "pattern": "^F-[0-9]{3,}$"},
+    "step_ids": {"type": "array", "items": {"$ref": "#/$defs/id_S"}, "uniqueItems": true},
+    "criterion_ids": {"type": "array", "items": {"$ref": "#/$defs/id_C"}, "uniqueItems": true},
+    "string_list": {"type": "array", "items": {"$ref": "#/$defs/nonempty"}},
+    "evidence_refs": {"type": "array", "items": {"$ref": "#/$defs/nonempty"}, "uniqueItems": true},
+    "role": {"type": "string", "enum": ["executor", "reviewer", "coordinator", "user"]},
+    "message_kind": {"type": "string", "enum": ["candidate_ready", "finding", "response", "check_request", "question", "review_result"]},
+    "verification_method": {"type": "string", "enum": ["test", "command", "inspect", "measure"]},
+    "candidate_id": {
+      "type": "object", "additionalProperties": false,
+      "required": ["commit", "tree", "plan_digest", "generation"],
+      "properties": {
+        "commit": {"$ref": "#/$defs/sha"},
+        "tree": {"$ref": "#/$defs/sha"},
+        "plan_digest": {"$ref": "#/$defs/digest"},
+        "generation": {"type": "integer", "minimum": 1}
+      }
+    },
+    "check_expected": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "exit_code": {"type": "integer"},
+        "stdout_contains": {"$ref": "#/$defs/string_list"},
+        "stdout_regex": {"$ref": "#/$defs/nonempty"}
+      }
+    },
+    "check_spec_proposal": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "method", "expected", "criterion_ids", "verification_ids"],
+      "properties": {
+        "id": {"$ref": "#/$defs/nonempty"},
+        "method": {"$ref": "#/$defs/verification_method"},
+        "argv": {"type": "array", "items": {"$ref": "#/$defs/nonempty"}, "minItems": 1},
+        "cwd": {"$ref": "#/$defs/nonempty"},
+        "timeout": {"$ref": "#/$defs/duration"},
+        "expected": {"$ref": "#/$defs/check_expected"},
+        "criterion_ids": {"$ref": "#/$defs/criterion_ids"},
+        "verification_ids": {"type": "array", "items": {"$ref": "#/$defs/id_V"}, "uniqueItems": true}
+      },
+      "allOf": [
+        {"if": {"properties": {"method": {"enum": ["test", "command"]}}}, "then": {"required": ["argv"]}}
+      ]
+    },
+    "handoff": {
+      "type": "object", "additionalProperties": false,
+      "required": ["implementation_notes", "remaining_work", "risks", "decision_refs", "evidence_refs"],
+      "properties": {
+        "implementation_notes": {"$ref": "#/$defs/string_list"},
+        "remaining_work": {"$ref": "#/$defs/string_list"},
+        "risks": {"$ref": "#/$defs/string_list"},
+        "decision_refs": {"$ref": "#/$defs/evidence_refs"},
+        "evidence_refs": {"$ref": "#/$defs/evidence_refs"}
+      }
+    },
+    "location": {
+      "type": "object", "additionalProperties": false,
+      "required": ["path"],
+      "properties": {
+        "path": {"$ref": "#/$defs/nonempty"},
+        "line_start": {"type": "integer", "minimum": 1},
+        "line_end": {"type": "integer", "minimum": 1}
+      }
+    }
+  }
+}

@@ -1,0 +1,62 @@
+{
+ "schema_version": 1,
+ "plan_id": "20260930-204527-add-a-version-flag-that-prints-t-686b",
+ "revision": 1,
+ "body_sha256": "0289ffaf79e96b0f8b05cabc0f3acb60a269cca34d31cb61002f64f8a68b8838",
+ "immutable_metadata": {
+  "created": {
+   "t": "str",
+   "v": "2026-09-30"
+  },
+  "plan_id": {
+   "t": "str",
+   "v": "20260930-204527-add-a-version-flag-that-prints-t-686b"
+  },
+  "planner": {
+   "t": "str",
+   "v": "claude/opus:high"
+  },
+  "project": {
+   "t": "str",
+   "v": "demo"
+  },
+  "repos": {
+   "t": "list",
+   "v": [
+    {
+     "t": "str",
+     "v": "demo"
+    }
+   ]
+  },
+  "reviewer": {
+   "t": "str",
+   "v": "codex/gpt-6-astra:high"
+  },
+  "revision": {
+   "t": "int",
+   "v": "1"
+  },
+  "run_id": {
+   "t": "str",
+   "v": "20260930-204527-add-a-version-flag-that-prints-t-686b"
+  },
+  "title": {
+   "t": "str",
+   "v": "Add a --version flag that prints the version and exits"
+  }
+ },
+ "manifest_digest": "95bd32d9bbae124f194428b4c40d0a14f9872b0f70a5e7e2d08b13b04f07874f",
+ "requirements_revision": "1",
+ "review_id": "reviews/plan-1.json",
+ "cli_versions": null,
+ "requested": {
+  "planner": "claude/opus:high",
+  "reviewer": "codex/gpt-6-astra:high"
+ },
+ "reported": {
+  "planner": ":",
+  "reviewer": ":"
+ },
+ "approved_at": "2026-09-30T18:45:28Z"
+}

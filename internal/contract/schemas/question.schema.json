@@ -1,0 +1,11 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "question.schema.json",
+  "type": "object", "additionalProperties": false,
+  "required": ["text", "needed_decision"],
+  "properties": {
+    "text": {"$ref": "common.schema.json#/$defs/nonempty"},
+    "needed_decision": {"type": "boolean"},
+    "options": {"$ref": "common.schema.json#/$defs/string_list"}
+  }
+}

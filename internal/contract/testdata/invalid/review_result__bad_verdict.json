@@ -1,0 +1,28 @@
+{
+ "verdict": "done",
+ "coverage": {
+  "criterion_ids_checked": [
+   "R-001.C1",
+   "R-001.C2"
+  ],
+  "paths_reviewed": [
+   "main.go",
+   "main_test.go",
+   "go.sum"
+  ],
+  "off_target_dispositions": [
+   {
+    "path": "go.sum",
+    "disposition": "accept",
+    "reason": "required by the added dependency"
+   }
+  ]
+ },
+ "finding_dispositions": [
+  {
+   "finding_id": "F-001",
+   "state": "open"
+  }
+ ],
+ "summary": "One major defect in argument handling; otherwise the step matches the plan."
+}

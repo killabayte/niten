@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "finding.schema.json",
+  "type": "object", "additionalProperties": false,
+  "required": ["finding_id", "severity", "criterion_ids", "location", "defect_scenario", "expected_fix", "evidence_refs"],
+  "properties": {
+    "finding_id": {"$ref": "common.schema.json#/$defs/id_F"},
+    "severity": {"type": "string", "enum": ["blocker", "major", "minor"]},
+    "criterion_ids": {"$ref": "common.schema.json#/$defs/criterion_ids"},
+    "location": {"$ref": "common.schema.json#/$defs/location"},
+    "defect_scenario": {"$ref": "common.schema.json#/$defs/nonempty"},
+    "expected_fix": {"$ref": "common.schema.json#/$defs/nonempty"},
+    "evidence_refs": {"$ref": "common.schema.json#/$defs/evidence_refs"}
+  }
+}

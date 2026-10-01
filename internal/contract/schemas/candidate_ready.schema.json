@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "candidate_ready.schema.json",
+  "type": "object", "additionalProperties": false,
+  "required": ["steps", "description", "changed_paths_claimed", "off_target_justifications", "proposed_checks", "questions", "handoff"],
+  "properties": {
+    "steps": {"allOf": [{"$ref": "common.schema.json#/$defs/step_ids"}], "minItems": 1},
+    "description": {"$ref": "common.schema.json#/$defs/nonempty"},
+    "changed_paths_claimed": {"type": "array", "items": {"$ref": "common.schema.json#/$defs/nonempty"}, "uniqueItems": true},
+    "off_target_justifications": {
+      "type": "array",
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["path", "reason"],
+        "properties": {
+          "path": {"$ref": "common.schema.json#/$defs/nonempty"},
+          "reason": {"$ref": "common.schema.json#/$defs/nonempty"}
+        }
+      }
+    },
+    "proposed_checks": {"type": "array", "items": {"$ref": "common.schema.json#/$defs/check_spec_proposal"}},
+    "questions": {"$ref": "common.schema.json#/$defs/string_list"},
+    "handoff": {"$ref": "common.schema.json#/$defs/handoff"}
+  }
+}

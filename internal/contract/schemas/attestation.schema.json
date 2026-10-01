@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "attestation.schema.json",
+  "type": "object", "additionalProperties": false,
+  "required": ["schema_version", "criterion_id", "plan_digest", "contract_digest", "candidate_sha", "result", "observation", "environment", "observed_at", "actor", "evidence_refs", "submitted_at", "source"],
+  "properties": {
+    "schema_version": {"type": "integer", "const": 1},
+    "criterion_id": {"$ref": "common.schema.json#/$defs/id_C"},
+    "plan_digest": {"$ref": "common.schema.json#/$defs/digest"},
+    "contract_digest": {"$ref": "common.schema.json#/$defs/digest"},
+    "candidate_sha": {"$ref": "common.schema.json#/$defs/sha"},
+    "result": {"type": "string", "enum": ["passed", "failed"]},
+    "observation": {"$ref": "common.schema.json#/$defs/nonempty"},
+    "environment": {"$ref": "common.schema.json#/$defs/nonempty"},
+    "observed_at": {"$ref": "common.schema.json#/$defs/timestamp"},
+    "actor": {"$ref": "common.schema.json#/$defs/nonempty"},
+    "evidence_refs": {"$ref": "common.schema.json#/$defs/evidence_refs"},
+    "submitted_at": {"$ref": "common.schema.json#/$defs/timestamp"},
+    "source": {"type": "string", "const": "resume_answers"}
+  }
+}

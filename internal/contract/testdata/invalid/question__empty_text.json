@@ -1,0 +1,8 @@
+{
+ "text": "",
+ "needed_decision": true,
+ "options": [
+  "stdout",
+  "stderr"
+ ]
+}

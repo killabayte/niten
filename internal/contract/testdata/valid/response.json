@@ -1,0 +1,1 @@
+{"finding_id": "F-001", "disposition": "fixed", "explanation": "Added an early return and a regression test.", "evidence_refs": ["checks/go-test"]}
