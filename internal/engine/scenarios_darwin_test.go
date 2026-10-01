@@ -776,3 +776,119 @@ func TestInterruptPausesAndResumes(t *testing.T) {
 		t.Fatalf("after resume: %+v", out)
 	}
 }
+
+// A crash after the clone's branch moved to the new candidate but before the
+// journal recorded it: the next start recognizes the turn's own commit and the
+// saved result is processed into the same candidate.
+func TestCrashBetweenAdvanceAndTheJournal(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t, happyScript(t), setup{})
+	e := w.open()
+	e.crashAfter = func(id string) error {
+		if id == "t001-s-001-implement" {
+			return errors.New("simulated crash")
+		}
+		return nil
+	}
+	if _, err := e.Run(context.Background()); err == nil {
+		t.Fatal("no crash")
+	}
+	// Do what the processing would have done up to the crash point: move the branch.
+	ctx := context.Background()
+	tv := e.State().Turn("t001-s-001-implement")
+	ins, err := e.clone.Inspect(ctx, e.rules(e.State().Unit("S-001")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cand, err := e.clone.Prepare(ctx, ins, "niten: "+tv.ID, turnTime(tv))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.clone.Advance(ctx, cand); err != nil {
+		t.Fatal(err)
+	}
+	e.Close()
+	dropTrailing(t, w, evRunState)
+	out, e := w.resume(ResumeOptions{})
+	defer e.Close()
+	if out.State != contract.RunDone || e.State().Invocations != 7 {
+		t.Fatalf("outcome %+v, invocations %d", out, e.State().Invocations)
+	}
+	if first := e.State().Turn("t002-s-001-review"); first == nil || first.Candidate != cand.Commit {
+		t.Fatalf("the recovered candidate is not the prepared one: %+v vs %s", first, cand.Commit)
+	}
+}
+
+// A moved branch that no pending turn explains is tampering: the run does not start.
+func TestUnexplainedBranchMoveIsRefused(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t, testutil.FakeScript{Executor: []testutil.FakeAction{{Payload: json.RawMessage(`{}`)}}}, setup{})
+	out, e := w.run()
+	want(t, out, contract.RunPaused, "invalid_result", "payload")
+	ctx := context.Background()
+	os.WriteFile(filepath.Join(e.clone.Work, calcGo), []byte(calcSub), 0o644)
+	ins, _ := e.clone.Inspect(ctx, e.rules(e.State().Unit("S-001")))
+	if _, err := e.clone.Commit(ctx, ins, "someone else", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	e.Close()
+	e = w.open()
+	defer e.Close()
+	if _, err := e.Resume(ctx, ResumeOptions{}); !errors.Is(err, ErrIntegrity) {
+		t.Fatalf("resume after an unexplained branch move: %v", err)
+	}
+}
+
+// An attempt whose outcome cannot be established keeps its worktree as a
+// snapshot and asks the user; the next resume runs the turn anew.
+func TestUnknownOutcomeAsksTheUser(t *testing.T) {
+	t.Parallel()
+	script := happyScript(t)
+	script.Executor = append([]testutil.FakeAction{script.Executor[0]}, script.Executor...)
+	w := newWorld(t, script, setup{})
+	e := w.open()
+	e.crashAfter = func(id string) error {
+		if id == "t001-s-001-implement" {
+			return errors.New("simulated crash")
+		}
+		return nil
+	}
+	if _, err := e.Run(context.Background()); err == nil {
+		t.Fatal("no crash")
+	}
+	e.Close()
+	// Make it the crash before the outcome was saved, with a cut stream.
+	dropTrailing(t, w, evRunState)
+	dropTrailing(t, w, "attempt.finished")
+	dir := filepath.Join(w.store.RunDir(w.runID), "attempts", "t001-s-001-implement")
+	os.Remove(filepath.Join(dir, "outcome.json"))
+	os.Remove(filepath.Join(dir, "result.json"))
+	b, _ := os.ReadFile(filepath.Join(dir, "stdout.jsonl"))
+	first, _, _ := strings.Cut(string(b), "\n")
+	os.WriteFile(filepath.Join(dir, "stdout.jsonl"), []byte(first+"\n"), 0o600)
+	out, e := w.resume(ResumeOptions{})
+	want(t, out, contract.RunNeedsInput, "outcome_unknown", "refs/niten/rejected/t001-s-001-implement@")
+	if w.head(e) != testutil.CalcHead {
+		t.Fatal("an unknown outcome produced a candidate")
+	}
+	e.Close()
+	out, e = w.resume(ResumeOptions{})
+	defer e.Close()
+	if out.State != contract.RunDone || w.calls("executor") != 4 {
+		t.Fatalf("after the decision: %+v, executor calls %d", out, w.calls("executor"))
+	}
+}
+
+// A subscription limit pauses the run without a retry.
+func TestRateLimitPauses(t *testing.T) {
+	t.Parallel()
+	raw := `{"type":"system","subtype":"init","model":"claude-opus-5-5","permissionMode":"acceptEdits","tools":["Read"]}` + "\n" +
+		`{"type":"rate_limit_event","rate_limit_info":{"status":"rejected"}}` + "\n"
+	w := newWorld(t, testutil.FakeScript{Executor: []testutil.FakeAction{{Raw: raw, Exit: 1}}}, setup{})
+	out, e := w.run()
+	defer e.Close()
+	want(t, out, contract.RunPaused, "rate_limit", "rate limit")
+	if w.calls("executor") != 1 {
+		t.Fatal("a rate-limited call was retried")
+	}
+}

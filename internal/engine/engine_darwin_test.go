@@ -221,7 +221,14 @@ func readJSON(t *testing.T, e *Engine, rel string, v any) {
 
 func TestTwoStepPlanReachesDoneAfterTheReceipt(t *testing.T) {
 	t.Parallel()
-	w := newWorld(t, happyScript(t), setup{})
+	script := happyScript(t)
+	// The reviewer of S-002 asks for go vet; it joins the final checks.
+	vet := goTest("go-vet", "R-002.C1", "S-002/V-001")
+	vet.Method, vet.Argv = contract.MethodCommand, []string{"go", "vet", "./..."}
+	r2 := review(contract.VerdictApprove, []string{"R-002.C1"}, both)
+	r2.CheckRequests = []contract.CheckRequest{{Proposal: vet, Reason: "the change adds exported API", CriterionIDs: []string{"R-002.C1"}}}
+	script.Reviewer[2] = revAction(t, r2)
+	w := newWorld(t, script, setup{})
 	out, e := w.run()
 	defer e.Close()
 	if out.State != contract.RunDone || out.Exit != contract.ExitOK {
@@ -275,10 +282,15 @@ func TestTwoStepPlanReachesDoneAfterTheReceipt(t *testing.T) {
 	if r.Status != contract.RunDone || r.Final.Commit != head || len(r.Criteria) != 2 || r.Criteria[0].Status != "covered" || r.Criteria[1].Status != "covered" {
 		t.Fatalf("receipt: status %s final %s (head %s) criteria %+v", r.Status, r.Final.Commit, head, r.Criteria)
 	}
+	vetRan := false
 	for _, c := range r.Checks {
 		if c.Status != contract.CheckPassed {
 			t.Fatalf("final check %+v", c)
 		}
+		vetRan = vetRan || c.ID == "S-002/go-vet"
+	}
+	if !vetRan {
+		t.Fatalf("the reviewer's check request did not join the final checks: %+v", r.Checks)
 	}
 	// The final tree holds both functions and all tests.
 	for p, want := range map[string]string{calcGo: calcSubMul, calcTestGo: testSubMul} {

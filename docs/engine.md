@@ -58,9 +58,11 @@ Processing is idempotent. Artifacts are written write-once or reused when identi
 Candidate commits are deterministic: the snapshot, the parent, the turn id and the
 turn's start time give the same commit. A crash between moving the clone's branch and
 recording the candidate is recognized at the next start: an unprocessed executor turn,
-the journal's head as parent and the turn's commit subject. On `resume`, attempts are
-recovered first (see [runner](runner.md)) and every started turn without an outcome is
-resolved without calling the model again:
+the journal's head as parent and the turn's commit subject. The branch is moved back by
+compare-and-swap, the metadata must then match the journal again, and the turn's
+processing prepares the same commit. Any other branch move is an integrity error. On
+`resume`, attempts are recovered first (see [runner](runner.md)) and every started turn
+without an outcome is resolved without calling the model again:
 
 - **A saved result** is processed now.
 - **An attempt that provably never started** lets the turn run anew.
@@ -272,7 +274,10 @@ go-two-step fixture, a two-step plan on a small Go module published by Shogun's 
   - the human step gate;
   - a human criterion with an attestation;
   - a blocking question;
-  - a saved result applied after a crash, and an interrupt.
+  - a saved result applied after a crash, a crash between moving the branch and the
+    journal, an unexplained branch move, an unknown outcome, a rate limit and an
+    interrupt;
+  - a reviewer's check request joining the final checks.
 
 The prompt-injection scenarios check mechanical boundaries: roles, profiles, packets and
 provenance. They do not claim that any model is robust against injection.

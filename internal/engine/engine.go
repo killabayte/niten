@@ -654,8 +654,19 @@ func (e *Engine) setup(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		if head != e.st.Head && !e.advancedByPendingTurn(ctx, c, head) {
-			return fmt.Errorf("%w: the clone's branch points at %s, the journal at %s", ErrIntegrity, head, e.st.Head)
+		if head != e.st.Head {
+			if !e.advancedByPendingTurn(ctx, c, head) {
+				return fmt.Errorf("%w: the clone's branch points at %s, the journal at %s", ErrIntegrity, head, e.st.Head)
+			}
+			// The turn's own commit, not yet in the journal: move the branch
+			// back (compare-and-swap) so the metadata matches the journal; the
+			// turn's processing prepares the same commit again.
+			if err := c.Advance(ctx, workspace.Candidate{Commit: e.st.Head, Parent: head}); err != nil {
+				return err
+			}
+			if fp, err := c.MetadataFingerprint(); err != nil || fp != e.st.Metadata {
+				return fmt.Errorf("%w: the clone's git metadata differs from the journal after rewinding %s", ErrIntegrity, short(head))
+			}
 		}
 		e.clone = c
 	}
