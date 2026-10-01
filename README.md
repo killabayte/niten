@@ -28,7 +28,10 @@ against the approved base and freezes the execution contract, without calling a 
 `resume`, `verify` and `export` are present but refuse to run with exit code 2. The
 verifier sandbox backend and the message/record contracts are implemented and tested
 offline. No model has been called. `prepare` needs a Shogun build with the S0 manifest
-sidecar (`shogun verify --require-manifest`). The settings and
+sidecar (`shogun verify --require-manifest`). The P2 building blocks (run store with lock
+and journal, owned clone, sandboxed verifier, process supervisor, Claude and Codex
+adapters, crash recovery) are implemented and tested offline with fake CLIs; the engine
+that drives them is P3. The settings and
 structures below describe the proposed interface. These documents have not gone
 through a separate Shogun run and are not a plan with its approval receipt.
 
@@ -59,6 +62,8 @@ go run ./cmd/niten prepare PLAN.md --repo repo-1=/path/to/checkout
     the shape decisions they fix.
 11. [Import](docs/import.md): what `niten prepare` checks, the renderer grammar, reason
     codes and the prepared run layout.
+12. [Runner](docs/runner.md): the P2 store, clone, verifier, supervisor, adapters and
+    crash recovery.
 
 ## First version
 

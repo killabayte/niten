@@ -493,6 +493,8 @@ compare-and-swap of the original bytes.
 | `internal/config` | TOML, limits, effective config and policy fingerprint |
 | `internal/prepare` | The `prepare` intake sequence and its reason codes (P1) |
 | `internal/pathglob` | `**` path patterns for protected and instruction paths |
+| `internal/attempt` | The durable attempt protocol and crash recovery (P2) |
+| `internal/procinfo` | Kernel process identity: start time, parent, process group |
 
 Message schemas and embedded prompts live next to the package that uses them and
 are embedded via `go:embed`. The engine starts at most one worker per role.

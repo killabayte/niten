@@ -41,11 +41,11 @@ func cliWorld(t *testing.T, fixture string) (plan, repo, cfg, store string) {
 func TestPrepareCLI(t *testing.T) {
 	planPath, repo, cfg, store := cliWorld(t, "fast-stats")
 	// Flags may follow the plan path.
-	code, out, errb := exec("prepare", planPath, "--repo", "repo-1="+repo, "--config", cfg)
+	code, out, errb := runCLI("prepare", planPath, "--repo", "repo-1="+repo, "--config", cfg)
 	if code != contract.ExitOK || !strings.HasPrefix(out, "prepared run ") || !strings.Contains(out, "S-001 → S-002") || errb != "" {
 		t.Fatalf("prepare: code %d\n%s\n%s", code, out, errb)
 	}
-	code, out, _ = exec("prepare", "--json", "--config", cfg, "--repo", "repo-1="+repo, "--gate-per-step", planPath)
+	code, out, _ = runCLI("prepare", "--json", "--config", cfg, "--repo", "repo-1="+repo, "--gate-per-step", planPath)
 	var res map[string]any
 	if err := json.Unmarshal([]byte(out), &res); err != nil || code != contract.ExitOK || res["status"] != "prepared" {
 		t.Fatalf("json: code %d %v\n%s", code, err, out)
@@ -65,17 +65,17 @@ func TestPrepareCLI(t *testing.T) {
 
 func TestPrepareCLIRefusals(t *testing.T) {
 	planPath, repo, cfg, _ := cliWorld(t, "fast-measure")
-	code, out, errb := exec("prepare", planPath, "--repo", "repo-1="+repo, "--config", cfg)
+	code, out, errb := runCLI("prepare", planPath, "--repo", "repo-1="+repo, "--config", cfg)
 	if code != contract.ExitNeedsInput || out != "" || !strings.Contains(errb, "needs input (needs_input)") || !strings.Contains(errb, "--human S-001/V-001") || !strings.Contains(errb, "no run was created") {
 		t.Fatalf("measure: code %d\n%s\n%s", code, out, errb)
 	}
-	code, out, _ = exec("prepare", "--json", planPath, "--repo", "repo-1="+repo, "--config", cfg)
+	code, out, _ = runCLI("prepare", "--json", planPath, "--repo", "repo-1="+repo, "--config", cfg)
 	var res map[string]any
 	json.Unmarshal([]byte(out), &res)
 	if code != contract.ExitNeedsInput || res["status"] != "needs_input" || res["reason"] != "needs_input" {
 		t.Fatalf("json refusal: %d %s", code, out)
 	}
-	if code, _, _ := exec("prepare", planPath, "--repo", "repo-1="+repo, "--config", cfg, "--human", "S-001/V-001"); code != contract.ExitOK {
+	if code, _, _ := runCLI("prepare", planPath, "--repo", "repo-1="+repo, "--config", cfg, "--human", "S-001/V-001"); code != contract.ExitOK {
 		t.Fatalf("with a human owner: %d", code)
 	}
 	for name, args := range map[string][]string{
@@ -87,7 +87,7 @@ func TestPrepareCLIRefusals(t *testing.T) {
 		"unknown flag":    {"prepare", planPath, "--force"},
 		"not a plan file": {"prepare", cfg, "--config", cfg},
 	} {
-		if code, _, _ := exec(args...); code != contract.ExitFormat {
+		if code, _, _ := runCLI(args...); code != contract.ExitFormat {
 			t.Errorf("%s: code %d, want 2", name, code)
 		}
 	}
