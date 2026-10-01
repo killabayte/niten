@@ -13,7 +13,6 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"strings"
 	"syscall"
 	"time"
 )
@@ -151,54 +150,13 @@ func (s *Store) Stage(id string) (*Staging, error) {
 }
 
 // Path resolves a slash-separated path relative to the staging directory, refusing to leave it.
-func (st *Staging) Path(rel string) (string, error) {
-	if rel == "" || filepath.IsAbs(rel) || strings.Contains(rel, "\\") {
-		return "", fmt.Errorf("invalid run path %q", rel)
-	}
-	clean := filepath.Clean(filepath.FromSlash(rel))
-	if clean == "." || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
-		return "", fmt.Errorf("run path %q leaves the run directory", rel)
-	}
-	return filepath.Join(st.Dir, clean), nil
-}
+func (st *Staging) Path(rel string) (string, error) { return safeJoin(st.Dir, rel) }
 
 // Write stores data at rel with the given mode: written to a temporary file, synced, then
-// renamed into place. An existing entry at rel is an error; run files are written once.
+// linked into place. An existing entry at rel is an error; run files are written once.
 func (st *Staging) Write(rel string, data []byte, mode fs.FileMode) error {
-	p, err := st.Path(rel)
-	if err != nil {
-		return err
-	}
-	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
-		return err
-	}
-	if _, err := os.Lstat(p); err == nil {
-		return fmt.Errorf("run file %s already exists", rel)
-	}
-	tmp, err := os.CreateTemp(filepath.Dir(p), "."+filepath.Base(p)+".tmp-*")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(tmp.Name())
-	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Chmod(mode); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Sync(); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	if err := os.Link(tmp.Name(), p); err != nil {
-		return err
-	}
-	return syncDir(filepath.Dir(p))
+	_, err := writeOnce(st.Dir, rel, data, mode)
+	return err
 }
 
 // Commit publishes the staging directory under the run id. It fails if the id is taken.
