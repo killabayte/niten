@@ -276,3 +276,28 @@ func TestRootsAreNeverReused(t *testing.T) {
 		t.Fatal("a cwd outside the repository was accepted")
 	}
 }
+
+// Review regression (P2): a check that writes a new source file (here the
+// implementation the test needs) must not pass; the new file invalidates the
+// evidence unless it is a declared output.
+func TestCheckThatAddsSourcesIsInvalidated(t *testing.T) {
+	w := newWorld(t)
+	script := "#!/bin/sh\nset -eu\nprintf 'package demo\\nfunc B() int { return 1 }\\n' > generated.go\n" + w.v.Toolchains[0] + "/bin/go test -count=1 ./...\n"
+	os.WriteFile(filepath.Join(w.clone.Work, "check.sh"), []byte(script), 0o644)
+	c := w.candidate(t, test(`	if B() != 1 { t.Fatal("B") }`))
+	chk := Check{ID: "generated-implementation", Argv: []string{"/bin/sh", "./check.sh"}, Cwd: ".", Timeout: 3 * time.Minute}
+	res, err := w.v.Run(context.Background(), req(c, chk))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Evidence.Status != contract.CheckInvalidated || res.Evidence.SourcesUnchanged || !strings.Contains(strings.Join(res.Reasons, " "), "generated.go: added by the check") {
+		t.Fatalf("status=%s sources_unchanged=%v reasons=%v", res.Evidence.Status, res.Evidence.SourcesUnchanged, res.Reasons)
+	}
+	// A declared output is allowed.
+	cov := Check{ID: "coverage", Argv: []string{"go", "test", "-count=1", "-coverprofile=cover.out", "./..."}, Cwd: ".", Timeout: 3 * time.Minute, Outputs: []string{"cover.out"}}
+	c2 := w.candidate(t, test(``))
+	res2, err := w.v.Run(context.Background(), req(c2, cov))
+	if err != nil || res2.Evidence.Status != contract.CheckPassed {
+		t.Fatalf("declared output: %v %+v %v", err, res2.Evidence, res2.Reasons)
+	}
+}

@@ -52,6 +52,10 @@ type Check struct {
 	Cwd      string // relative to the repository root
 	Timeout  time.Duration
 	Expected contract.CheckExpected
+	// Outputs are repository-relative patterns of files the check may create
+	// in the source tree (a coverage profile, say). Any other new file
+	// invalidates the evidence: it is code the check added.
+	Outputs []string
 }
 
 // Request binds a check to a candidate and the plan it serves.
@@ -116,7 +120,7 @@ func (v *Verifier) Run(ctx context.Context, req Request) (*Result, error) {
 	key := contract.CheckKey{
 		PlanDigest: req.PlanDigest, CandidateCommit: req.Candidate.Commit, CandidateTree: req.Candidate.Tree,
 		ContractDigest: req.ContractDigest, CheckID: req.Check.ID,
-		CheckSpecDigest:   digestJSON(map[string]any{"argv": req.Check.Argv, "cwd": req.Check.Cwd, "timeout": req.Check.Timeout.String(), "expected": req.Check.Expected}),
+		CheckSpecDigest:   digestJSON(map[string]any{"argv": req.Check.Argv, "cwd": req.Check.Cwd, "timeout": req.Check.Timeout.String(), "expected": req.Check.Expected, "outputs": req.Check.Outputs}),
 		EnvironmentDigest: environmentDigest(env, np, v.Toolchains, v.ReadOnly, v.ToolVersion, osVer, osBuild),
 	}
 
@@ -145,7 +149,7 @@ func (v *Verifier) Run(ctx context.Context, req Request) (*Result, error) {
 		status = contract.CheckUnknown
 	default:
 		var cerr error
-		changed, cerr = v.Clone.SourcesChanged(ctx, req.Candidate.Commit, sealed.SourceRoot)
+		changed, cerr = v.Clone.SourcesChanged(ctx, req.Candidate.Commit, sealed.SourceRoot, req.Check.Outputs)
 		if cerr != nil {
 			assert("sources compared after the check", false, cerr.Error())
 			status = contract.CheckUnknown

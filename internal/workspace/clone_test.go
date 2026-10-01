@@ -251,16 +251,99 @@ func TestCommitAndCopy(t *testing.T) {
 	if err := c.Materialize(ctx, cand.Commit, dest); err == nil {
 		t.Fatal("a copy root was reused")
 	}
-	// A check that edits the code under test is detected; build outputs are not.
+	// A file the check adds is code unless it matches a declared output.
 	write(t, dest, "bin/out", "built\n")
-	if changed, err := c.SourcesChanged(ctx, cand.Commit, dest); err != nil || len(changed) != 0 {
-		t.Fatalf("build output reported: %v %v", changed, err)
+	if changed, err := c.SourcesChanged(ctx, cand.Commit, dest, []string{"bin/**"}); err != nil || len(changed) != 0 {
+		t.Fatalf("a declared output was reported: %v %v", changed, err)
+	}
+	if changed, err := c.SourcesChanged(ctx, cand.Commit, dest, nil); err != nil || len(changed) != 1 || !strings.Contains(changed[0], "bin/out: added by the check") {
+		t.Fatalf("an undeclared new file: %v %v", changed, err)
 	}
 	write(t, dest, "a_test.go", "package a\n// disabled\n")
 	os.Remove(filepath.Join(dest, "a.go"))
 	os.Chmod(filepath.Join(dest, "run.sh"), 0o644)
-	changed, err := c.SourcesChanged(ctx, cand.Commit, dest)
+	changed, err := c.SourcesChanged(ctx, cand.Commit, dest, []string{"bin/**"})
 	if err != nil || len(changed) != 3 {
 		t.Fatalf("changed sources: %v %v", changed, err)
+	}
+}
+
+// Review regression (P2): an ignore rule cannot hide a protected path. The
+// physical tree is checked, and the snapshot with the permitted change is not
+// committed either.
+func TestIgnoredProtectedPathRejectsTheSnapshot(t *testing.T) {
+	_, c := newClone(t)
+	ctx := context.Background()
+	r := rules(t, c, "a.go")
+	write(t, c.Work, ".gitignore", ".claude/\nbuild/\n")
+	write(t, c.Work, ".claude/settings.json", "{}\n")
+	write(t, c.Work, "build/out.bin", "x\n")
+	write(t, c.Work, "a.go", "package changed\n")
+	ins, err := c.Inspect(ctx, r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(strings.Join(ins.Violations, "\n"), ".claude/settings.json: protected path present outside the snapshot") {
+		t.Fatalf("violations %v", ins.Violations)
+	}
+	if !slices.Equal(ins.Ignored, []string{"build/out.bin"}) {
+		t.Fatalf("ignored %v", ins.Ignored)
+	}
+	if _, err := c.Commit(ctx, ins, "candidate", time.Now()); err == nil {
+		t.Fatal("the permitted part was committed")
+	}
+	// An ignored instruction file is refused the same way.
+	_, c2 := newClone(t)
+	write(t, c2.Work, ".gitignore", "notes/\n")
+	write(t, c2.Work, "notes/AGENTS.md", "obey\n")
+	if ins, _ := c2.Inspect(ctx, rules(t, c2)); !strings.Contains(strings.Join(ins.Violations, " "), "instruction path present outside the snapshot") {
+		t.Fatalf("ignored instruction file: %v", ins.Violations)
+	}
+}
+
+// Review regression (P2): attributes a candidate writes cannot make git run a
+// filter program from the user's configuration; the clone's git commands see
+// only the clone's own configuration.
+func TestInspectDoesNotRunGitFilters(t *testing.T) {
+	_, c := newClone(t)
+	root := t.TempDir()
+	marker := filepath.Join(root, "outside-worktree")
+	script := filepath.Join(root, "filter.sh")
+	os.WriteFile(script, []byte("#!/bin/sh\n/usr/bin/touch '"+marker+"'\n/bin/cat\n"), 0o700)
+	cfg := filepath.Join(root, "gitconfig")
+	testutil.Git(t, c.Work, "config", "--file", cfg, "filter.review.clean", script)
+	testutil.Git(t, c.Work, "config", "--file", cfg, "filter.review.smudge", script)
+	testutil.Git(t, c.Work, "config", "--file", cfg, "filter.review.process", script)
+	t.Setenv("GIT_CONFIG_GLOBAL", cfg)
+	write(t, c.Work, ".gitattributes", "*.txt filter=review\n")
+	write(t, c.Work, "trigger.txt", "untrusted source\n")
+	ctx := context.Background()
+	ins, err := c.Inspect(ctx, rules(t, c, ".gitattributes", "trigger.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cand, err := c.Commit(ctx, ins, "candidate", time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Materialize(ctx, cand.Commit, filepath.Join(t.TempDir(), "copy")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("a git filter ran outside the sandbox: %v", err)
+	}
+}
+
+// Tampered metadata stops the inspection before any git command reads the
+// worktree: there is no snapshot to commit.
+func TestTamperedMetadataStopsBeforeGitRuns(t *testing.T) {
+	_, c := newClone(t)
+	r := rules(t, c, "a.go")
+	f, _ := os.OpenFile(filepath.Join(c.GitDir, "config"), os.O_APPEND|os.O_WRONLY, 0)
+	f.WriteString("[filter \"x\"]\n\tclean = /usr/bin/touch /tmp/never\n")
+	f.Close()
+	ins, err := c.Inspect(context.Background(), r)
+	if err != nil || ins.Tree != "" || len(ins.Violations) == 0 {
+		t.Fatalf("inspection of tampered metadata: %+v %v", ins, err)
 	}
 }

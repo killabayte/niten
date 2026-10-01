@@ -64,10 +64,9 @@ func CreateClone(ctx context.Context, source, base, work, gitdir string) (*Clone
 	if !gitSHA(base) {
 		return nil, fmt.Errorf("base %q is not a full commit id", base)
 	}
-	args := []string{"--no-replace-objects", "--no-lazy-fetch", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
-		"clone", "--quiet", "--no-local", "--no-checkout", "--template=", "--separate-git-dir", gitdir, "--", src, work}
+	args := append(append([]string{}, isolatedFlags...), "clone", "--quiet", "--no-local", "--no-checkout", "--template=", "--separate-git-dir", gitdir, "--", src, work)
 	cmd := exec.CommandContext(ctx, "git", args...)
-	cmd.Env = gitEnv()
+	cmd.Env = isolatedEnv()
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return nil, fmt.Errorf("git clone: %v: %s", err, bytes.TrimSpace(out))
 	}
@@ -137,12 +136,24 @@ func (c *Clone) checkPointer() error {
 	return nil
 }
 
-// git runs a git command on the clone with the hardened environment plus env.
+// isolatedEnv is the environment of every git command on the clone: the
+// user's global and system configuration and the system attributes are
+// ignored, so the only configuration is the clone's own (written by Niten,
+// outside every model write root). Without filter, diff or merge driver
+// definitions, attributes a candidate writes cannot make git run a program.
+func isolatedEnv(extra ...string) []string {
+	return append(append(gitEnv(), "GIT_CONFIG_GLOBAL="+os.DevNull, "GIT_CONFIG_NOSYSTEM=1", "GIT_ATTR_NOSYSTEM=1"), extra...)
+}
+
+// isolatedFlags precede every git command on the clone.
+var isolatedFlags = []string{"--no-replace-objects", "--no-lazy-fetch", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
+	"-c", "core.attributesFile=" + os.DevNull, "-c", "core.excludesFile=" + os.DevNull}
+
+// git runs a git command on the clone with the hardened, isolated environment plus env.
 func (c *Clone) git(ctx context.Context, env []string, args ...string) ([]byte, error) {
-	full := append([]string{"--git-dir", c.GitDir, "--work-tree", c.Work, "--no-replace-objects", "--no-lazy-fetch",
-		"-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false"}, args...)
+	full := append(append([]string{"--git-dir", c.GitDir, "--work-tree", c.Work}, isolatedFlags...), args...)
 	cmd := exec.CommandContext(ctx, "git", full...)
-	cmd.Env = append(gitEnv(), env...)
+	cmd.Env = isolatedEnv(env...)
 	cmd.Dir = c.Work
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
@@ -242,6 +253,9 @@ type Inspection struct {
 	Violations         []string `json:"violations"`
 	OffTarget          []string `json:"off_target"`
 	InstructionChanges []string `json:"instruction_changes"`
+	// Ignored lists files present in the worktree but ignored by git: they are
+	// not part of the candidate.
+	Ignored []string `json:"ignored"`
 }
 
 // Paths lists the changed paths.
@@ -257,7 +271,7 @@ func (ins *Inspection) Paths() []string {
 // not touched), writes its tree and classifies every change against HEAD. It
 // never commits. Ignored files are not part of the snapshot.
 func (c *Clone) Inspect(ctx context.Context, r Rules) (*Inspection, error) {
-	ins := &Inspection{Changes: []Change{}, Violations: []string{}, OffTarget: []string{}, InstructionChanges: []string{}}
+	ins := &Inspection{Changes: []Change{}, Violations: []string{}, OffTarget: []string{}, InstructionChanges: []string{}, Ignored: []string{}}
 	if err := c.checkPointer(); err != nil {
 		ins.Violations = append(ins.Violations, "the .git pointer file was changed: "+err.Error())
 	}
@@ -265,6 +279,11 @@ func (c *Clone) Inspect(ctx context.Context, r Rules) (*Inspection, error) {
 		if fp, err := c.MetadataFingerprint(); err != nil || fp != r.Metadata {
 			ins.Violations = append(ins.Violations, "the git metadata changed outside the coordinator")
 		}
+	}
+	if len(ins.Violations) > 0 {
+		// Tampered metadata could define programs git would run; no git
+		// command touches the worktree, and there is no snapshot.
+		return ins, nil
 	}
 	head, err := c.Head(ctx)
 	if err != nil {
@@ -309,8 +328,59 @@ func (c *Clone) Inspect(ctx context.Context, r Rules) (*Inspection, error) {
 		ins.Changes = append(ins.Changes, ch)
 		c.classify(ch, r, ins)
 	}
+	if err := c.physical(ctx, r, ins); err != nil {
+		return nil, err
+	}
 	sort.Strings(ins.OffTarget)
+	sort.Strings(ins.Ignored)
 	return ins, nil
+}
+
+// physical walks the worktree itself, independent of git's ignore rules, and
+// checks every file or symlink the snapshot does not contain. An ignored file
+// is not part of the candidate, but a protected or instruction path may not
+// exist in the worktree that way either, and a nested .git directory is never
+// allowed. Other ignored files are listed, not committed.
+func (c *Clone) physical(ctx context.Context, r Rules, ins *Inspection) error {
+	out, err := c.git(ctx, nil, "ls-tree", "-r", "-z", "--name-only", "--full-tree", ins.Tree)
+	if err != nil {
+		return err
+	}
+	inTree := map[string]bool{}
+	for _, p := range strings.Split(string(out), "\x00") {
+		if p != "" {
+			inTree[p] = true
+		}
+	}
+	return filepath.WalkDir(c.Work, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, _ := filepath.Rel(c.Work, p)
+		rel = filepath.ToSlash(rel)
+		if rel == "." || rel == ".git" && !d.IsDir() {
+			return nil
+		}
+		if d.IsDir() {
+			if d.Name() == ".git" {
+				ins.Violations = append(ins.Violations, rel+": nested git directory in the worktree")
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if inTree[rel] {
+			return nil
+		}
+		switch {
+		case pathglob.MatchAny(r.Protected, rel) != "":
+			ins.Violations = append(ins.Violations, rel+": protected path present outside the snapshot (ignored by git) ("+pathglob.MatchAny(r.Protected, rel)+")")
+		case pathglob.MatchAny(r.Instruction, rel) != "":
+			ins.Violations = append(ins.Violations, rel+": instruction path present outside the snapshot (ignored by git)")
+		default:
+			ins.Ignored = append(ins.Ignored, rel)
+		}
+		return nil
+	})
 }
 
 func (c *Clone) classify(ch Change, r Rules, ins *Inspection) {
@@ -463,7 +533,7 @@ func (c *Clone) Materialize(ctx context.Context, commit, dest string) error {
 	if _, err := cp.git(ctx, env, "checkout-index", "--all", "--force"); err != nil {
 		return err
 	}
-	changed, err := c.SourcesChanged(ctx, commit, dest)
+	changed, err := c.SourcesChanged(ctx, commit, dest, nil)
 	if err != nil {
 		return err
 	}
@@ -474,9 +544,11 @@ func (c *Clone) Materialize(ctx context.Context, commit, dest string) error {
 }
 
 // SourcesChanged compares dir with the tree of commit and lists every tracked
-// path that is missing, modified, has another type or another executable bit.
-// Files that are not in the tree (build outputs) are not reported.
-func (c *Clone) SourcesChanged(ctx context.Context, commit, dir string) ([]string, error) {
+// path that is missing, modified, has another type or another executable bit,
+// and every file or symlink that is not in the tree, unless it matches one of
+// the declared output patterns. Build caches and temporary files belong in the
+// scratch root, so a new file in the source tree is code the check added.
+func (c *Clone) SourcesChanged(ctx context.Context, commit, dir string, outputs []string) ([]string, error) {
 	out, err := c.git(ctx, nil, "ls-tree", "-r", "-z", commit)
 	if err != nil {
 		return nil, err
@@ -484,6 +556,7 @@ func (c *Clone) SourcesChanged(ctx context.Context, commit, dir string) ([]strin
 	type entry struct{ mode, sha, path string }
 	var files []entry
 	var changed []string
+	inTree := map[string]bool{}
 	for _, rec := range strings.Split(string(out), "\x00") {
 		if rec == "" {
 			continue
@@ -494,6 +567,7 @@ func (c *Clone) SourcesChanged(ctx context.Context, commit, dir string) ([]strin
 			return nil, fmt.Errorf("unexpected ls-tree record %q", rec)
 		}
 		e := entry{mode: f[0], sha: f[2], path: p}
+		inTree[p] = true
 		full := filepath.Join(dir, filepath.FromSlash(p))
 		fi, err := os.Lstat(full)
 		switch {
@@ -528,9 +602,8 @@ func (c *Clone) SourcesChanged(ctx context.Context, commit, dir string) ([]strin
 			in.WriteString(e.path + "\n")
 		}
 		cp := &Clone{Work: dir, GitDir: c.GitDir}
-		cmd := exec.CommandContext(ctx, "git", "--git-dir", c.GitDir, "--work-tree", dir, "--no-replace-objects", "--no-lazy-fetch",
-			"-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "hash-object", "--stdin-paths")
-		cmd.Env = gitEnv()
+		cmd := exec.CommandContext(ctx, "git", append(append([]string{"--git-dir", c.GitDir, "--work-tree", dir}, isolatedFlags...), "hash-object", "--stdin-paths")...)
+		cmd.Env = isolatedEnv()
 		cmd.Dir = cp.Work
 		cmd.Stdin = &in
 		hashes, err := cmd.Output()
@@ -546,6 +619,23 @@ func (c *Clone) SourcesChanged(ctx context.Context, commit, dir string) ([]strin
 				changed = append(changed, files[i].path+": content changed")
 			}
 		}
+	}
+	err = filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		rel, _ := filepath.Rel(dir, p)
+		rel = filepath.ToSlash(rel)
+		if !inTree[rel] && pathglob.MatchAny(outputs, rel) == "" {
+			changed = append(changed, rel+": added by the check")
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	sort.Strings(changed)
 	return changed, nil
