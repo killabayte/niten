@@ -18,6 +18,10 @@ func Render(p Policy) string {
 	w("(deny default)")
 	w("(allow process-fork)")
 	w("(allow process-exec)")
+	// A descendant that starts a session or a process group of its own would
+	// escape the group kill. Both calls are denied; see survivors_darwin.go for
+	// the posix_spawn attributes that the syscall filter does not cover.
+	w("(deny syscall-unix (syscall-number SYS_setsid SYS_setpgid))")
 	w("(allow process-info* (target same-sandbox))")
 	w("(allow signal (target same-sandbox))")
 	w("(allow sysctl-read)")

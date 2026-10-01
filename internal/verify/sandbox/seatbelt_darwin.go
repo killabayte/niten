@@ -130,25 +130,6 @@ func (s *Seatbelt) Run(ctx context.Context, p Policy, cmd Command) (Result, erro
 	res.Finished = time.Now()
 	res.Duration = res.Finished.Sub(res.Started)
 	res.TimedOut = errors.Is(runCtx.Err(), context.DeadlineExceeded)
-
-	// Whatever happened, nothing from the group may outlive the run.
-	_ = syscall.Kill(-pgid, syscall.SIGKILL)
-	if syscall.Kill(-pgid, 0) == nil {
-		res.Stragglers = true
-	}
-	// A descendant may have left the group with setsid while keeping the
-	// profile. Holders of the roots that this run started are killed and
-	// reported; holders it did not start are left alone and refuse the run.
-	killed, foreign, sweepErr := reapRoots([]string{np.SourceRoot, np.ScratchRoot}, res.Started)
-	if len(killed) > 0 {
-		res.Stragglers = true
-		res.SurvivorPIDs = killed
-	}
-	res.ForeignPIDs = foreign
-	if sweepErr != nil {
-		return res, sweepErr
-	}
-
 	if ps := c.ProcessState; ps != nil {
 		if ws, ok := ps.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
 			res.Signal = ws.Signal().String()
@@ -156,6 +137,32 @@ func (s *Seatbelt) Run(ctx context.Context, p Policy, cmd Command) (Result, erro
 			res.ExitCode = ps.ExitCode()
 		}
 	}
+
+	// Whatever happened, nothing from the group may outlive the run: kill the
+	// group and wait until it is gone.
+	_ = syscall.Kill(-pgid, syscall.SIGKILL)
+	if syscall.Kill(-pgid, 0) == nil {
+		res.Stragglers = true
+	}
+	for deadline := time.Now().Add(3 * time.Second); syscall.Kill(-pgid, 0) == nil; {
+		if time.Now().After(deadline) {
+			return res, fmt.Errorf("%w: the process group %d did not exit after SIGKILL", ErrUnavailable, pgid)
+		}
+		_ = syscall.Kill(-pgid, syscall.SIGKILL)
+		time.Sleep(20 * time.Millisecond)
+	}
+	// Holders of the roots that are still members of the group are killed
+	// with it; any other holder is never killed and refuses the run.
+	members, foreign, sweepErr := reapRoots([]string{np.SourceRoot, np.ScratchRoot}, pgid)
+	if len(members) > 0 {
+		res.Stragglers = true
+		res.SurvivorPIDs = members
+	}
+	res.ForeignPIDs = foreign
+	if sweepErr != nil {
+		return res, sweepErr
+	}
+
 	var exitErr *exec.ExitError
 	if waitErr != nil && !errors.As(waitErr, &exitErr) && !res.TimedOut {
 		return res, fmt.Errorf("%w: %v", ErrUnavailable, waitErr)

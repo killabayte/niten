@@ -79,16 +79,16 @@ type Result struct {
 	ExitCode int
 	Signal   string
 	TimedOut bool
-	// Stragglers is true when processes were still alive after the child
-	// finished: members of its process group, or descendants that left the
-	// group (setsid) but still held the roots. They were killed; a run with
-	// stragglers must not be accepted as evidence.
+	// Stragglers is true when members of the child's process group were still
+	// alive after the child finished. They were killed with the group; a run
+	// with stragglers must not be accepted as evidence.
 	Stragglers bool
-	// SurvivorPIDs lists the run's own processes found holding the roots after
-	// the run; they were killed.
+	// SurvivorPIDs lists group members found holding the roots during the
+	// sweep; they were killed with the group.
 	SurvivorPIDs []int
-	// ForeignPIDs lists holders of the roots that the run did not start. They
-	// are never killed; their presence refuses the run.
+	// ForeignPIDs lists holders of the roots outside the run's process group.
+	// Membership is not proven for them, so they are never killed; their
+	// presence refuses the run.
 	ForeignPIDs []int
 }
 

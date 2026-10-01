@@ -192,30 +192,42 @@ Go 1.26.3. No model was called. What the run established:
 - Review finding, fixed the same day: a descendant that calls `setsid` leaves the
   child's process group and survived the group kill while keeping the profile, so
   it could keep writing inside the roots after `Run` returned with exit 0. macOS has
-  no process namespaces, so the backend now sweeps after every run with
-  `/usr/sbin/lsof`: every process of the same user that holds an open file, cwd or
-  mapped binary under the roots and belongs to the run is killed and reported in
-  `SurvivorPIDs`, and `Stragglers` becomes true. A run with stragglers is not evidence.
-  The second half is `Seal(policy, since)`: when an attempt is over, both roots are
-  renamed to sibling paths that no profile permits, and the attempt's holders found
-  through the renamed paths are killed. A detached process that holds nothing at sweep
-  time therefore cannot reach the trees later, and outputs are read from the sealed
-  paths only. Two regressions cover a Go child with `setsid` and a detached `/bin/sh`
-  that opens a file three seconds after the run. Known limit: a detached process that
-  holds nothing and never reopens the roots is invisible; it also cannot affect them.
-- Second review, fixed 2026-09-30: the sweep killed every holder of the roots,
-  including processes the run never started, such as a shell the user had `cd`'d into
-  the copy. A holder now belongs to the attempt only if its kernel start time
-  (`kern.proc.pid`, microseconds) is not earlier than the attempt start and its parent
-  chain reaches the coordinator or launchd (an orphan left by `setsid`) without passing
-  a process that already existed. Any other holder is never killed: it is reported in
-  `ForeignPIDs` and the run or Seal is refused. A holder started during the attempt
-  and orphaned to launchd cannot be told apart from the attempt's own orphan; that
-  residual case is killed. The same review showed that an open descriptor keeps
-  writing into a renamed tree, so an incomplete `lsof` listing (any non-zero exit)
-  now fails the sweep instead of reporting the roots clean. Regressions cover a
-  foreign holder, an incomplete listing, a sealed path told to a detached process, and
-  the `kinfo_proc` layout the start time is read from.
+  no process namespaces. The final design after three review rounds:
+  - The child is the leader of a new process group, and the profile denies `setsid`
+    and `setpgid` (`(deny syscall-unix (syscall-number SYS_setsid SYS_setpgid))`), so
+    a descendant created with fork stays in the group. After the child exits the
+    whole group is killed and `Run` waits until the group is gone; a group that
+    survives `SIGKILL` refuses the run, and `Stragglers` marks a run whose group
+    still had members. A run with stragglers is not evidence.
+  - Membership in that group is the only proof that a process belongs to the
+    attempt. A start time, a parent chain or orphaning to launchd do not prove it:
+    the coordinator may start an unrelated process during the attempt (third
+    review). `posix_spawn` with `POSIX_SPAWN_SETSID` or `SETPGROUP` still leaves the
+    group, because the syscall filter does not see attributes applied inside
+    `posix_spawn`; such a descendant is likewise not provably the attempt's.
+  - After every run `/usr/sbin/lsof` lists the holders of the roots (open file,
+    cwd, mapped binary). Members of the group are killed with the group. Every
+    other holder is never killed: it is reported in `ForeignPIDs` and the run is
+    refused. An incomplete listing (any non-zero `lsof` exit) also refuses the run,
+    because an open descriptor keeps writing into a renamed tree (second review).
+  - `Seal` renames both roots to sibling paths that no profile permits, so nothing
+    can open anything in the trees afterwards, and lists holders again. It kills
+    nothing: the attempt's group is already gone, so every holder is foreign and
+    refuses the seal. Outputs are read from the sealed paths only, and a refused
+    seal means the trees are not evidence.
+  - Residual risk: a descendant that escaped through `posix_spawn` attributes
+    survives, still under the profile (no network, no protected reads, writes only
+    to the attempt's original root paths). If it holds the roots it refuses the run;
+    if it holds nothing it is invisible. P2 must therefore give every attempt new
+    root paths and seal them before reading outputs, so such a process never sees a
+    later attempt's trees.
+  - Regressions cover the denied `setsid`/`setpgid`, an orphan that stays in the
+    group and dies with it, a `posix_spawn` escape that is refused but not killed,
+    a holder that existed before the run, a sibling the coordinator starts during
+    the run, an incomplete listing, a sealed path written under the attempt's
+    profile, and the `kinfo_proc` layout the process group is read from. A test
+    command that creates sessions or process groups fails inside the verifier;
+    that is a v0.1 limitation.
 
 This closes the offline verifier gate of P0a. The executor and reviewer profiles
 remain unprobed, and the seatbelt result is bound to the OS build above.
