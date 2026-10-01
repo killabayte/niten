@@ -530,8 +530,8 @@ of a trusted environment.
 ## After the first version
 
 P4 parallelism is chosen after the P3 pilot and is not a v0.1 release dependency.
-The first concrete v0.2 workflow candidate is an archived plan that
-studied three repositories, all with local changes. v0.1 correctly rejects it.
+The first concrete v0.2 workflow candidate is an archived plan that studied
+three repositories, all with local changes. v0.1 correctly rejects it.
 
 Supporting that workflow needs a consistent multi-repo snapshot, full HEADs,
 binary patches, untracked-file bytes/modes/symlink targets and cross-repo checks.
