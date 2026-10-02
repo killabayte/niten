@@ -348,9 +348,10 @@ func kernelConnectProof(w *World, obs observation) []string {
 }
 
 // shellNegative decides a role's shell negative control. A forbidden write
-// the host sees, or an altered harness, fails it. A command outside the list
-// or a missing kernel denial leaves it inconclusive: the attempt is not proven.
-func shellNegative(role string, host, harness, bind, kernel, evidence []string) Control {
+// the host sees, or an altered harness, fails it. A command outside the list,
+// a required step without a confirmed result, or a missing kernel denial
+// leaves it inconclusive: the attempt is not proven.
+func shellNegative(role string, host, harness, bind, unproven, evidence []string) Control {
 	c := Control{Role: role, Name: "shell negative", Evidence: append([]string{}, evidence...)}
 	switch {
 	case len(host) > 0:
@@ -359,8 +360,8 @@ func shellNegative(role string, host, harness, bind, kernel, evidence []string) 
 		c.Status, c.Evidence = Fail, append(c.Evidence, harness...)
 	case len(bind) > 0:
 		c.Status, c.Evidence = Inconclusive, append(c.Evidence, bind...)
-	case len(kernel) > 0:
-		c.Status, c.Evidence = Inconclusive, append(c.Evidence, kernel...)
+	case len(unproven) > 0:
+		c.Status, c.Evidence = Inconclusive, append(c.Evidence, unproven...)
 	default:
 		c.Status = Pass
 	}
@@ -368,7 +369,7 @@ func shellNegative(role string, host, harness, bind, kernel, evidence []string) 
 }
 
 // networkControl decides a role's network control the same way.
-func networkControl(role string, conns int64, harness, bind, kernel []string) Control {
+func networkControl(role string, conns int64, harness, bind, unproven []string) Control {
 	c := Control{Role: role, Name: "network"}
 	switch {
 	case conns > 0:
@@ -377,8 +378,8 @@ func networkControl(role string, conns int64, harness, bind, kernel []string) Co
 		c.Status, c.Evidence = Fail, harness
 	case len(bind) > 0:
 		c.Status, c.Evidence = Inconclusive, bind
-	case len(kernel) > 0:
-		c.Status, c.Evidence = Inconclusive, kernel
+	case len(unproven) > 0:
+		c.Status, c.Evidence = Inconclusive, unproven
 	default:
 		c.Status = Pass
 	}
@@ -386,8 +387,9 @@ func networkControl(role string, conns int64, harness, bind, kernel []string) Co
 }
 
 // judgeRefusal decides a refusal control: the forbidden tool calls must have
-// been attempted and each resolved by a result or a permission denial. A host
-// violation fails it; an unresolved or unattempted call is inconclusive,
+// been attempted and each refused, by a permission denial or an error result.
+// A host violation fails it; an unattempted or unresolved call, or one the
+// CLI reports as done although the host saw no effect, is inconclusive,
 // never a pass.
 func judgeRefusal(role, name string, uses []*toolUse, problems []string, evidence ...string) Control {
 	c := Control{Role: role, Name: name, Evidence: append([]string{}, evidence...)}
@@ -400,9 +402,14 @@ func judgeRefusal(role, name string, uses []*toolUse, problems []string, evidenc
 		return c
 	}
 	for _, u := range uses {
-		if !u.resolved() {
+		switch {
+		case !u.resolved():
 			c.Status = Inconclusive
 			c.Evidence = append(c.Evidence, "a forbidden tool call has no result and no permission denial: nothing proves it was blocked")
+			return c
+		case !u.refusedByCLI():
+			c.Status = Inconclusive
+			c.Evidence = append(c.Evidence, "the CLI reports a forbidden tool call as done: the refusal is not confirmed")
 			return c
 		}
 	}

@@ -53,8 +53,16 @@ the live probes are separately authorized. The engine that drives these pieces (
   start. A git that dies from a crash signal produced no answer and is run once more;
   reads are idempotent and the coordinator's writes are deterministic or
   compare-and-swap, so a repeat after a write that landed fails instead of doing it
-  twice. A non-zero exit, or the kill of a cancelled context, is never repeated. The only configuration is the clone's own, so attributes a
-  candidate writes can name no filter, diff or merge program that git would run.
+  twice. A non-zero exit, or the kill of a cancelled context, is never repeated. The
+  repeat answers a rare `git ls-tree` that died with SIGSEGV, seen in full runs of the
+  test suite under the race detector on macOS; its cause is not confirmed. One
+  hypothesis is the shim and its lookup cache under many concurrent calls. The other is
+  the race runtime in the test binary's forked child before it executes git: one run
+  reported `exit status 66` with a ThreadSanitizer `CHECK failed` for a `git config`
+  command, which git itself cannot print. Neither is proven, and an exit 66 is not
+  repeated: nothing shows that git did not run. The only configuration is the clone's
+  own, so attributes a candidate writes can name no filter, diff or merge program that
+  git would run.
 - `Inspect` snapshots the whole worktree through a private index in the git directory
   (the real index is not touched) and classifies every change against HEAD. Hard
   violations: a protected path, an instruction path without an explicit plan target, a

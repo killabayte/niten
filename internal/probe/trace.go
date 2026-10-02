@@ -133,6 +133,10 @@ func contentText(raw json.RawMessage) string {
 // and a negative control cannot be certified on it.
 func (u *toolUse) resolved() bool { return u != nil && (u.Done || u.Denied) }
 
+// refusedByCLI reports whether the CLI confirmed that a tool call did not do
+// its work: permissions denied it, or its result is an error.
+func (u *toolUse) refusedByCLI() bool { return u != nil && (u.Denied || (u.Done && u.IsError)) }
+
 func inputString(u *toolUse, key string) string {
 	if u == nil || u.Input == nil {
 		return ""
@@ -158,6 +162,17 @@ type codexCommand struct {
 	Status   string
 	Output   string
 }
+
+// finished reports whether the CLI ran a command to its end and reported its
+// exit code. A command that only started, or that the CLI declined, proves
+// nothing about what it would have done.
+func (c *codexCommand) finished() bool {
+	return c != nil && c.ExitCode != nil && (c.Status == "completed" || c.Status == "failed")
+}
+
+// refusedByCLI reports whether the CLI confirmed that a command failed: it
+// finished with a non-zero exit code.
+func (c *codexCommand) refusedByCLI() bool { return c.finished() && *c.ExitCode != 0 }
 
 // codexChange is one file a file_change item of the reviewer's stream names.
 type codexChange struct {
