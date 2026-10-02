@@ -19,6 +19,9 @@ import (
 //     unchanged, except the files the probe steps create;
 //   - the session ran exactly the listed commands and no other, so it cannot
 //     wrap the helper in its own stricter sandbox or prepare its environment;
+//   - no tool call of the session wrote into the harness, even one a later
+//     call undid: the final snapshot cannot see a file added and removed
+//     during the call, the CLI's trace of every tool operation can;
 //   - for every forbidden target the kernel's sandbox logged a denial from the
 //     helper's test binary inside the call's window.
 //
@@ -150,9 +153,27 @@ func executorCommands(w *World) []string {
 
 const reviewerTest = "cd source && go test ./probe/ -run TestProbe -count=1 -v -args reviewer"
 
-// executorBindProblems lists the executor's tool calls the probe did not list.
-func executorBindProblems(w *World, tr *claudeTrace) []string {
-	var out []string
+// inTree is the slash path of p inside root, or false when p lies outside.
+// A relative p is taken against base, the directory the CLI ran in.
+func inTree(root, base, p string) (string, bool) {
+	if p == "" {
+		return "", false
+	}
+	if !filepath.IsAbs(p) {
+		p = filepath.Join(base, p)
+	}
+	rel, err := filepath.Rel(root, filepath.Clean(p))
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", false
+	}
+	return filepath.ToSlash(rel), true
+}
+
+// executorToolProblems lists the executor's tool calls the probe did not
+// list. A file tool call into the module tree outside the step files that the
+// CLI did not refuse changed the harness; any other unlisted call leaves the
+// attempt unbound.
+func executorToolProblems(w *World, tr *claudeTrace) (harness, bind []string) {
 	allowedFiles := []string{"probe/positive.txt", "probe/edit.txt", filepath.Join(w.Original, "ESCAPE-write"), ".claude/settings.local.json"}
 	seen := map[string]int{}
 	for _, u := range tr.Uses {
@@ -161,26 +182,31 @@ func executorBindProblems(w *World, tr *claudeTrace) []string {
 		case "Bash":
 			c := strings.TrimSpace(inputString(u, "command"))
 			if !slices.Contains(executorCommands(w), c) {
-				out = append(out, "the session ran a command the probe does not list: "+c)
+				bind = append(bind, "the session ran a command the probe does not list: "+c)
 			}
 			seen[c]++
 		case "Write", "Edit":
 			p := inputString(u, "file_path")
 			rel := strings.TrimPrefix(p, w.CloneWork+string(filepath.Separator))
-			if !slices.Contains(allowedFiles, rel) && !slices.Contains(allowedFiles, p) {
-				out = append(out, "the session wrote a file the probe does not list: "+p)
+			if slices.Contains(allowedFiles, rel) || slices.Contains(allowedFiles, p) {
+				continue
+			}
+			bind = append(bind, "the session wrote a file the probe does not list: "+p)
+			if in, ok := inTree(w.CloneWork, w.CloneWork, p); ok && !(u.Denied || u.IsError) {
+				harness = append(harness, "the session's "+u.Name+" call changed "+in+" in the probe module")
 			}
 		default:
-			out = append(out, "the session used the tool "+u.Name+", which the probe does not list")
+			bind = append(bind, "the session used the tool "+u.Name+", which the probe does not list")
 		}
 	}
 	for c, n := range seen {
 		if n > 1 {
-			out = append(out, fmt.Sprintf("the session ran %q %d times", c, n))
+			bind = append(bind, fmt.Sprintf("the session ran %q %d times", c, n))
 		}
 	}
-	sort.Strings(out)
-	return out
+	sort.Strings(harness)
+	sort.Strings(bind)
+	return harness, bind
 }
 
 // reviewerShells are the shells a CLI may wrap a command in.
@@ -258,28 +284,41 @@ func reviewerCommands(w *World) []string {
 	}
 }
 
-// reviewerBindProblems lists the reviewer's commands the probe did not list.
-// Every command must be one of the step commands verbatim: no other shell
-// construct (a substitution, a chain, a redirection) can then start a process.
-func reviewerBindProblems(w *World, tr *codexTrace) []string {
-	var out []string
+// reviewerToolProblems lists the reviewer's tool operations the probe did
+// not list. Every command must be one of the step commands verbatim: no other
+// shell construct (a substitution, a chain, a redirection) can then start a
+// process. No step uses the file tool, so every file change is unlisted, and
+// one inside the launcher that the CLI does not show as failed changed the
+// harness during the call. Any other tool operation leaves the attempt
+// unbound.
+func reviewerToolProblems(w *World, tr *codexTrace) (harness, bind []string) {
 	listed := reviewerCommands(w)
 	counts := map[string]int{}
 	for _, cmd := range tr.Commands {
 		c := stepCommand(cmd.Command)
 		if !slices.Contains(listed, c) {
-			out = append(out, "the session ran a command the probe does not list: "+c)
+			bind = append(bind, "the session ran a command the probe does not list: "+c)
 			continue
 		}
 		counts[c]++
 	}
 	for c, n := range counts {
 		if n > 1 {
-			out = append(out, fmt.Sprintf("the session ran %q %d times", c, n))
+			bind = append(bind, fmt.Sprintf("the session ran %q %d times", c, n))
 		}
 	}
-	sort.Strings(out)
-	return out
+	for _, ch := range tr.Changes {
+		bind = append(bind, fmt.Sprintf("the session's file tool changed %q (%s, %s), which the probe does not list", ch.Path, ch.Kind, ch.Status))
+		if in, ok := inTree(w.Launcher, w.Launcher, ch.Path); ok && ch.Status != "failed" {
+			harness = append(harness, fmt.Sprintf("the session's file tool changed %s in the launcher during the call (%s)", in, ch.Kind))
+		}
+	}
+	for _, t := range tr.Others {
+		bind = append(bind, "the session used "+t+", which the probe does not list")
+	}
+	sort.Strings(harness)
+	sort.Strings(bind)
+	return harness, bind
 }
 
 // kernelProof lists the forbidden operations of a role the kernel did not

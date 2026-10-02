@@ -4,7 +4,9 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"os"
+	"slices"
 	"strings"
 )
 
@@ -157,36 +159,101 @@ type codexCommand struct {
 	Output   string
 }
 
-// codexTrace is what the reviewer's --json stream shows.
+// codexChange is one file a file_change item of the reviewer's stream names.
+type codexChange struct {
+	Path   string
+	Kind   string
+	Status string
+}
+
+// codexTrace is what the reviewer's --json stream shows. Every item counts
+// from its first event: a command or file change that started and never
+// completed was still an operation of the session.
 type codexTrace struct {
 	Completed bool
 	Commands  []codexCommand
+	Changes   []codexChange
 	Collab    bool
+	Others    []string // item types that are tool operations the probe does not list
 }
+
+// codexMessages are item types that report the session's output, not an
+// operation of a tool.
+var codexMessages = []string{"agent_message", "reasoning", "todo_list", "error"}
 
 func parseCodex(stdout string) *codexTrace {
 	tr := &codexTrace{}
-	for _, line := range readLines(stdout) {
+	type change struct {
+		Path string `json:"path"`
+		Kind string `json:"kind"`
+	}
+	type item struct {
+		ID         string   `json:"id"`
+		Type       string   `json:"type"`
+		Command    string   `json:"command"`
+		ExitCode   *int     `json:"exit_code"`
+		Status     string   `json:"status"`
+		Aggregated string   `json:"aggregated_output"`
+		Changes    []change `json:"changes"`
+	}
+	var order []string
+	items := map[string]*item{}
+	for n, line := range readLines(stdout) {
 		var ev struct {
 			Type string `json:"type"`
-			Item *struct {
-				Type       string `json:"type"`
-				Command    string `json:"command"`
-				ExitCode   *int   `json:"exit_code"`
-				Status     string `json:"status"`
-				Aggregated string `json:"aggregated_output"`
-			} `json:"item"`
+			Item *item  `json:"item"`
 		}
 		if json.Unmarshal(line, &ev) != nil {
 			continue
 		}
-		switch {
-		case ev.Type == "turn.completed":
+		if ev.Type == "turn.completed" {
 			tr.Completed = true
-		case ev.Type == "item.completed" && ev.Item != nil && ev.Item.Type == "command_execution":
-			tr.Commands = append(tr.Commands, codexCommand{Command: ev.Item.Command, ExitCode: ev.Item.ExitCode, Status: ev.Item.Status, Output: ev.Item.Aggregated})
-		case ev.Item != nil && ev.Item.Type == "collab_tool_call":
+		}
+		if !strings.HasPrefix(ev.Type, "item.") || ev.Item == nil {
+			continue
+		}
+		// The events of one item share its id and type; an event without an
+		// id is an item of its own.
+		key := ev.Item.Type + "/" + ev.Item.ID
+		if ev.Item.ID == "" {
+			key = fmt.Sprintf("%s/#%d", ev.Item.Type, n)
+		}
+		cur, ok := items[key]
+		if !ok {
+			order = append(order, key)
+			items[key] = ev.Item
+			continue
+		}
+		// A later event updates the item; the files it names accumulate.
+		changes := append(cur.Changes, ev.Item.Changes...)
+		if ev.Item.Command == "" {
+			ev.Item.Command = cur.Command
+		}
+		*cur = *ev.Item
+		cur.Changes = changes
+	}
+	for _, key := range order {
+		it := items[key]
+		switch {
+		case it.Type == "command_execution":
+			tr.Commands = append(tr.Commands, codexCommand{Command: it.Command, ExitCode: it.ExitCode, Status: it.Status, Output: it.Aggregated})
+		case it.Type == "file_change":
+			if len(it.Changes) == 0 {
+				tr.Changes = append(tr.Changes, codexChange{Status: it.Status})
+			}
+			seen := map[change]bool{}
+			for _, c := range it.Changes {
+				if !seen[c] {
+					seen[c] = true
+					tr.Changes = append(tr.Changes, codexChange{Path: c.Path, Kind: c.Kind, Status: it.Status})
+				}
+			}
+		case it.Type == "collab_tool_call":
 			tr.Collab = true
+			tr.Others = append(tr.Others, it.Type)
+		case slices.Contains(codexMessages, it.Type):
+		default:
+			tr.Others = append(tr.Others, it.Type)
 		}
 	}
 	return tr

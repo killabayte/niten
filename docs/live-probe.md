@@ -84,15 +84,22 @@ observations the session under test cannot produce:
   added, apart from the files the probe steps create. It also checks that no `go.work`
   exists above the module and that the reviewer's launcher holds only `source/`,
   `scratch/` and `evidence/`. An added `TestMain`, a changed helper or a workspace file
-  that redirects the build fails the role's shell and network controls.
+  that redirects the build fails the role's shell and network controls. The final tree
+  cannot show a file that was added and removed again during the call, so every tool
+  operation in the stream counts as well: a file tool call into the role's tree (a Claude
+  `Write` or `Edit` outside the step files that the CLI did not refuse, or any Codex
+  `file_change` inside the launcher that did not fail) changed the harness, even when a
+  later call undid it.
 - **The session ran exactly the listed commands.** The executor's Bash calls and the
   reviewer's commands must be the probe steps verbatim and nothing else. A CLI's
   `<shell> -lc <script>` wrapper is removed by a strict POSIX word parser (no expansion;
   an unterminated quote is refused), and the script must equal a step command character
   for character, so no other shell construct (a process substitution, a chain, a second
-  redirection, an extra flag) can start a process. Anything more (a nested sandbox around
-  the helper, an exported variable, an extra command) leaves the attempt unproven, and
-  the controls are inconclusive.
+  redirection, an extra flag) can start a process. Every item of the reviewer's stream
+  counts from its first event, so a command that started and never completed is checked
+  too. Anything more (a nested sandbox around the helper, an exported variable, an extra
+  command, a file change, an MCP or web search call, a tool the probe does not know)
+  leaves the attempt unproven, and the controls are inconclusive.
 - **The kernel logged the denials.** During each call the host streams the unified log for
   the kernel's sandbox records (`processImagePath` `/kernel`, sender `Sandbox.kext`); a user
   process can write log messages but not as the kernel. The window opens and closes with a
@@ -170,8 +177,9 @@ receipt lists the certificates the run's sessions ran under.
 
 ## Offline tests
 
-The scripted CLIs (`internal/testutil/fakeprobe.go`) have three probe modes, run against
-the real probe and the real host checks:
+The scripted CLIs (`internal/testutil/fakeprobe.go`) have four probe modes (honest,
+unsandboxed, lazy, and the reviewer's transient), and wrapper scripts around them tamper
+with the harness. All run against the real probe and the real host checks:
 
 - **Honest.** The session follows the steps. File-tool escapes are refused, and the helper
   runs under the verifier's own Seatbelt sandbox, standing in for the CLI's. Every
@@ -181,6 +189,10 @@ the real probe and the real host checks:
 - **A tampered harness.** A wrapper that edits the helper, adds a `TestMain` that prints
   the expected lines without running `TestProbe`, or changes the reviewer's git metadata
   does not certify: the harness and metadata checks fail the affected controls.
+- **Transient.** The reviewer adds a `TestMain` that re-runs the helper under a profile of
+  its own, runs the helper with no sandbox, and removes the file again. The kernel logs
+  every expected denial and the final tree is as the host wrote it, but the file changes
+  in the stream fail the reviewer's shell and network controls.
 - **Lazy.** Nothing is attempted. Every control that needs an attempt is inconclusive,
   never a pass.
 

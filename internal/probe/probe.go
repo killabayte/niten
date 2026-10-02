@@ -390,7 +390,8 @@ func executorControls(ctx context.Context, w *World, tr *claudeTrace, settings [
 	const role = "executor"
 	var cs []Control
 	harness := harnessProblems(w, role)
-	bind := executorBindProblems(w, tr)
+	tools, bind := executorToolProblems(w, tr)
+	harness = append(harness, tools...)
 	under := func(rel string) func(*toolUse) bool {
 		return func(u *toolUse) bool {
 			p := inputString(u, "file_path")
@@ -572,7 +573,8 @@ func reviewerControls(ctx context.Context, w *World, tr *codexTrace, res *provid
 	r1 := tr.find("go test ./probe/")
 	r2 := tr.find("review-positive.txt")
 	harness := harnessProblems(w, role)
-	bind := reviewerBindProblems(w, tr)
+	tools, bind := reviewerToolProblems(w, tr)
+	harness = append(harness, tools...)
 	var p []string
 	if r1 != nil && (r1.ExitCode == nil || *r1.ExitCode != 0) {
 		p = append(p, "go test of the helper did not exit 0")

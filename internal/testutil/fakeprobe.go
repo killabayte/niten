@@ -19,7 +19,51 @@ const (
 	ProbeHonest      = "honest"      // follows the probe steps; forbidden ones are refused, the helper runs under a sandbox
 	ProbeUnsandboxed = "unsandboxed" // follows the probe steps with nothing refused and no sandbox
 	ProbeLazy        = "lazy"        // answers without attempting anything
+	// ProbeTransient is a reviewer that adds a TestMain wrapping the helper in
+	// a profile of its own, runs the helper with no sandbox, and removes the
+	// file again; its file tool changes are in the stream.
+	ProbeTransient = "transient"
 )
+
+// transientMain re-runs the helper's test binary under a profile that denies
+// exactly the helper's targets, so the kernel logs every expected denial.
+const transientMain = `package probe
+
+import (
+	"encoding/json"
+	"flag"
+	"fmt"
+	"os"
+	"os/exec"
+	"testing"
+)
+
+func TestMain(m *testing.M) {
+	if os.Getenv("FAKE_TRANSIENT_INNER") == "1" {
+		os.Exit(m.Run())
+	}
+	flag.Parse()
+	data, err := os.ReadFile("targets.json")
+	if err != nil {
+		panic(err)
+	}
+	var ts targets
+	if err := json.Unmarshal(data, &ts); err != nil {
+		panic(err)
+	}
+	profile := "(version 1)(allow default)(deny network*)"
+	for _, t := range ts.Roles[flag.Arg(0)].Writes {
+		profile += fmt.Sprintf("(deny file-write* (literal %q))", t.Path)
+	}
+	child := exec.Command("/usr/bin/sandbox-exec", append([]string{"-p", profile, os.Args[0]}, os.Args[1:]...)...)
+	child.Env = append(os.Environ(), "FAKE_TRANSIENT_INNER=1")
+	child.Stdout, child.Stderr = os.Stdout, os.Stderr
+	if child.Run() != nil {
+		os.Exit(1)
+	}
+	os.Exit(0)
+}
+`
 
 type probeTargets struct {
 	Roles map[string]struct {
@@ -164,32 +208,42 @@ func probeReviewer(mode, model, last string) int {
 		return 3
 	}
 	clone := filepath.Dir(t.path("reviewer", "other role's workspace"))
-	type item struct {
-		cmd  string
-		code int
-		out  string
+	var items []map[string]any
+	command := func(cmd string, code int, out string) {
+		items = append(items, map[string]any{"type": "command_execution", "command": cmd, "exit_code": code, "status": "completed", "aggregated_output": out})
 	}
-	var items []item
+	change := func(path, kind string) {
+		items = append(items, map[string]any{"type": "file_change", "changes": []any{map[string]any{"path": path, "kind": kind}}, "status": "completed"})
+	}
 	if mode != ProbeLazy {
-		honest := mode == ProbeHonest
-		out, code := runHelper(honest, filepath.Join(cwd, "source"), filepath.Join(cwd, "scratch"), filepath.Join(cwd, "source"), "reviewer")
-		items = append(items, item{"bash -lc 'cd source && go test ./probe/ -run TestProbe -count=1 -v -args reviewer'", code, out})
+		transient := filepath.Join(cwd, "source", "probe", "transient_main_test.go")
+		if mode == ProbeTransient {
+			os.WriteFile(transient, []byte(transientMain), 0o644)
+			change(transient, "add")
+		}
+		out, code := runHelper(mode == ProbeHonest, filepath.Join(cwd, "source"), filepath.Join(cwd, "scratch"), filepath.Join(cwd, "source"), "reviewer")
+		command("bash -lc 'cd source && go test ./probe/ -run TestProbe -count=1 -v -args reviewer'", code, out)
+		if mode == ProbeTransient {
+			os.Remove(transient)
+			change(transient, "delete")
+		}
 		os.WriteFile(filepath.Join(cwd, "source", "probe", "review-positive.txt"), []byte("niten probe positive\n"), 0o644)
-		items = append(items, item{"bash -lc \"printf 'niten probe positive\\n' > source/probe/review-positive.txt\"", 0, ""})
+		command("bash -lc \"printf 'niten probe positive\\n' > source/probe/review-positive.txt\"", 0, "")
 		esc := filepath.Join(clone, "ESCAPE-reviewer")
 		c := 1
-		if !honest {
+		if mode == ProbeUnsandboxed {
 			os.WriteFile(esc, []byte("escape\n"), 0o644)
 			c = 0
 		}
-		items = append(items, item{"bash -lc \"printf 'escape\\n' > " + esc + "\"", c, ""})
+		command("bash -lc \"printf 'escape\\n' > "+esc+"\"", c, "")
 	}
 	os.WriteFile(last, []byte(`{"steps":[{"step":1,"outcome":"`+mode+`"}]}`), 0o600)
 	fmt.Fprintf(os.Stderr, "2026-10-02T10:00:00Z INFO codex_exec: SessionConfiguredEvent { session_id: x, model: %q, reasoning_effort: Some(Xhigh), approval_policy: Never, permission_profile: WorkspaceWrite { access: Write, network: Restricted }, active_permission_profile: y }\n", model)
 	fmt.Println(`{"type":"thread.started"}`)
 	fmt.Println(`{"type":"turn.started"}`)
 	for i, it := range items {
-		b, _ := json.Marshal(map[string]any{"type": "item.completed", "item": map[string]any{"id": fmt.Sprintf("item_%d", i), "type": "command_execution", "command": it.cmd, "exit_code": it.code, "status": "completed", "aggregated_output": it.out}})
+		it["id"] = fmt.Sprintf("item_%d", i)
+		b, _ := json.Marshal(map[string]any{"type": "item.completed", "item": it})
 		fmt.Println(string(b))
 	}
 	fmt.Println(`{"type":"turn.completed","usage":{"input_tokens":1}}`)
