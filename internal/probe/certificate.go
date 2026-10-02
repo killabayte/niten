@@ -208,8 +208,8 @@ type Certificate struct {
 }
 
 // aggregate is the certificate result: pass only when both roles' full
-// required control sets are present and every one passed, with the two
-// invocations made. Any failure is a failure; anything missing, inconclusive
+// required control sets are present, every one with the known status pass,
+// and exactly the two invocations were made. Any failure is a failure; anything missing, inconclusive
 // or an incomplete invocation count is inconclusive, never a pass. A partial
 // output from a cancellation between the roles is therefore not a pass.
 func aggregate(cs []Control, invocations int) Status {
@@ -218,9 +218,11 @@ func aggregate(cs []Control, invocations int) Status {
 	for _, c := range cs {
 		present[c.Role+"/"+c.Name] = true
 		switch c.Status {
+		case Pass:
 		case Fail:
 			return Fail
-		case Inconclusive:
+		default:
+			// Inconclusive, or a status the probe never writes: not a pass.
 			st = Inconclusive
 		}
 	}
@@ -235,7 +237,7 @@ func aggregate(cs []Control, invocations int) Status {
 	if len(present) != countRequired() || len(cs) != len(present) {
 		st = Inconclusive
 	}
-	if invocations < RequiredInvocations {
+	if invocations != RequiredInvocations {
 		st = Inconclusive
 	}
 	return st

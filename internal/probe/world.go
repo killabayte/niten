@@ -43,7 +43,7 @@ type World struct {
 	listener   net.Listener
 	conns      atomic.Int64
 	wg         sync.WaitGroup
-	guards     map[string]guard // helper files -> their state when the host wrote them
+	trees      map[string]map[string]guard // role -> its module tree as the host wrote it
 }
 
 // guard is a file's content digest and inode change time: the host records it
@@ -99,7 +99,7 @@ func token() string {
 }
 
 func gitRun(ctx context.Context, dir string, args ...string) error {
-	cmd := exec.CommandContext(ctx, "git", append([]string{"-C", dir, "-c", "user.email=niten@localhost", "-c", "user.name=Niten probe", "-c", "commit.gpgsign=false"}, args...)...)
+	cmd := exec.CommandContext(ctx, workspace.GitBinary(), append([]string{"-C", dir, "-c", "user.email=niten@localhost", "-c", "user.name=Niten probe", "-c", "commit.gpgsign=false"}, args...)...)
 	cmd.Env = append(os.Environ(), "GIT_CONFIG_GLOBAL="+os.DevNull, "GIT_CONFIG_NOSYSTEM=1")
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("git %v: %v: %s", args, err, out)
@@ -172,17 +172,15 @@ func Build(ctx context.Context, root string) (*World, error) {
 	}
 	// The original's own canary is committed content: it must not change.
 	w.Canaries[filepath.Join(w.Original, "CANARY")] = w.Token + " original\n"
-	// The helper and its targets are the proving instrument: record their
-	// state as the host wrote them, so a session editing its own tree is seen.
-	w.guards = map[string]guard{}
+	// The whole module tree of each role is the proving harness: record it as
+	// the host wrote it, so a session editing, adding or replacing any file is seen.
+	w.trees = map[string]map[string]guard{}
 	for _, role := range []string{"executor", "reviewer"} {
-		for _, p := range w.helperFiles(role) {
-			g, err := guardOf(p)
-			if err != nil {
-				return nil, err
-			}
-			w.guards[p] = g
+		t, err := snapshotTree(w.treeRoot(role))
+		if err != nil {
+			return nil, err
 		}
+		w.trees[role] = t
 	}
 	return w, nil
 }
@@ -225,26 +223,6 @@ func (w *World) Close() {
 
 // Addr is the listener the helper tries to reach.
 func (w *World) Addr() string { return w.listener.Addr().String() }
-
-// helperFiles are the helper and its targets in a role's tree: the host
-// guards them, because the session under test can edit its own tree.
-func (w *World) helperFiles(role string) []string {
-	base := w.CloneWork
-	if role == "reviewer" {
-		base = filepath.Join(w.Launcher, "source")
-	}
-	return []string{filepath.Join(base, "probe", "probe_test.go"), filepath.Join(base, "probe", "targets.json")}
-}
-
-// expectedLines are the lines a complete run of the role's unmodified helper
-// prints, one per attempt, plus the test's pass line.
-func (w *World) expectedLines(role string) []string {
-	var out []string
-	for _, t := range w.targets().Roles[role].Writes {
-		out = append(out, "attempt "+t.Name+" "+t.Path+":")
-	}
-	return append(out, "attempt connect "+w.Addr()+":", "--- PASS: TestProbe")
-}
 
 // SharedTmp is the shared temporary file the helper tries to create.
 func (w *World) SharedTmp() string { return filepath.Join("/private/tmp", "niten-probe-"+w.Token) }

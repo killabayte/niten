@@ -69,10 +69,12 @@ func CreateClone(ctx context.Context, source, base, work, gitdir string) (*Clone
 		return nil, fmt.Errorf("base %q is not a full commit id", base)
 	}
 	args := append(append([]string{}, isolatedFlags...), "clone", "--quiet", "--no-local", "--no-checkout", "--template=", "--separate-git-dir", gitdir, "--", src, work)
-	cmd := exec.CommandContext(ctx, "git", args...)
-	cmd.Env = isolatedEnv()
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return nil, fmt.Errorf("git clone: %v: %s", err, bytes.TrimSpace(out))
+	if _, stderr, err := runGit(ctx, func() *exec.Cmd {
+		cmd := exec.CommandContext(ctx, GitBinary(), args...)
+		cmd.Env = isolatedEnv()
+		return cmd
+	}, nil); err != nil {
+		return nil, fmt.Errorf("git clone: %v: %s", err, bytes.TrimSpace(stderr))
 	}
 	c := &Clone{}
 	if c.Work, err = Canonical(work); err != nil {
@@ -162,14 +164,14 @@ var isolatedFlags = []string{"--no-replace-objects", "--no-lazy-fetch", "-c", "c
 // git runs a git command on the clone with the hardened, isolated environment plus env.
 func (c *Clone) git(ctx context.Context, env []string, args ...string) ([]byte, error) {
 	full := append(append([]string{"--git-dir", c.GitDir, "--work-tree", c.Work}, isolatedFlags...), args...)
-	cmd := exec.CommandContext(ctx, "git", full...)
-	cmd.Env = isolatedEnv(env...)
-	cmd.Dir = c.Work
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	out, err := cmd.Output()
+	out, stderr, err := runGit(ctx, func() *exec.Cmd {
+		cmd := exec.CommandContext(ctx, GitBinary(), full...)
+		cmd.Env = isolatedEnv(env...)
+		cmd.Dir = c.Work
+		return cmd
+	}, nil)
 	if err != nil {
-		return out, fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
+		return out, fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(stderr)))
 	}
 	return out, nil
 }
@@ -944,10 +946,11 @@ func (c *Clone) readBlobs(ctx context.Context, shas []string) (map[string][]byte
 	for _, s := range shas {
 		in.WriteString(s + "\n")
 	}
-	cmd := exec.CommandContext(ctx, "git", append(append([]string{"--git-dir", c.GitDir}, isolatedFlags...), "cat-file", "--batch")...)
-	cmd.Env = isolatedEnv()
-	cmd.Stdin = &in
-	raw, err := cmd.Output()
+	raw, _, err := runGit(ctx, func() *exec.Cmd {
+		cmd := exec.CommandContext(ctx, GitBinary(), append(append([]string{"--git-dir", c.GitDir}, isolatedFlags...), "cat-file", "--batch")...)
+		cmd.Env = isolatedEnv()
+		return cmd
+	}, in.Bytes())
 	if err != nil {
 		return nil, fmt.Errorf("git cat-file --batch: %w", err)
 	}
@@ -1036,11 +1039,12 @@ func (c *Clone) SourcesChanged(ctx context.Context, commit, dir string, outputs 
 			in.WriteString(e.path + "\n")
 		}
 		cp := &Clone{Work: dir, GitDir: c.GitDir}
-		cmd := exec.CommandContext(ctx, "git", append(append([]string{"--git-dir", c.GitDir, "--work-tree", dir}, isolatedFlags...), "hash-object", "--no-filters", "--stdin-paths")...)
-		cmd.Env = isolatedEnv()
-		cmd.Dir = cp.Work
-		cmd.Stdin = &in
-		hashes, err := cmd.Output()
+		hashes, _, err := runGit(ctx, func() *exec.Cmd {
+			cmd := exec.CommandContext(ctx, GitBinary(), append(append([]string{"--git-dir", c.GitDir, "--work-tree", dir}, isolatedFlags...), "hash-object", "--no-filters", "--stdin-paths")...)
+			cmd.Env = isolatedEnv()
+			cmd.Dir = cp.Work
+			return cmd
+		}, in.Bytes())
 		if err != nil {
 			return nil, fmt.Errorf("git hash-object: %w", err)
 		}

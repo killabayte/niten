@@ -205,6 +205,7 @@ func Run(ctx context.Context, o Options) (*Certificate, error) {
 	}
 	fmt.Fprintf(o.Out, "probe: executor %s (deadline %s)\n", o.Binding.Executor, per)
 	w.Connections()
+	ewatch, ewatchErr := startDenyWatch(ctx, w.Root, "executor")
 	eres, eerr, err := runner.Run(ctx, attempt.Spec{ID: "probe-executor", Role: "executor", Bin: o.Binding.Claude.Path, Args: provider.ClaudeArgs(ereq),
 		Env: env, Stripped: stripped, Dir: w.Clone.Work, Stdin: executorPrompt(w), Deadline: deadline(),
 		Parse: func(so, se string, out provider.Outcome) (*provider.Result, *provider.Error) {
@@ -214,10 +215,11 @@ func Run(ctx context.Context, o Options) (*Certificate, error) {
 		return nil, err
 	}
 	cert.Invocations++
-	execConns := w.Connections()
+	eobs := closeWatch(context.WithoutCancel(ctx), ewatch, ewatchErr)
+	eobs.conns = w.Connections()
 	eout, _ := readOutcome(run, "probe-executor")
 	so, _ := run.Path("attempts/probe-executor/stdout.jsonl")
-	cert.Controls = append(cert.Controls, executorControls(ctx, w, parseClaude(so), settings, eres, eerr, eout, execConns, metaBefore, ee)...)
+	cert.Controls = append(cert.Controls, executorControls(ctx, w, parseClaude(so), settings, eres, eerr, eout, eobs, metaBefore, ee)...)
 	// The executor's git control committed a candidate: the metadata the
 	// reviewer is checked against is the one after that commit.
 	metaAfterExec, err := w.Clone.MetadataFingerprint()
@@ -240,6 +242,8 @@ func Run(ctx context.Context, o Options) (*Certificate, error) {
 	}
 	headBefore, _ := w.Clone.Head(ctx)
 	fmt.Fprintf(o.Out, "probe: reviewer %s (deadline %s)\n", o.Binding.Reviewer, per)
+	w.Connections()
+	rwatch, rwatchErr := startDenyWatch(ctx, w.Root, "reviewer")
 	rres, rerr, err := runner.Run(ctx, attempt.Spec{ID: "probe-reviewer", Role: "reviewer", Bin: o.Binding.Codex.Path, Args: provider.CodexArgs(rreq),
 		Env: renv, Stripped: rstripped, Dir: w.Launcher, Stdin: reviewerPrompt(w), Deadline: deadline(),
 		Parse: func(so, se string, out provider.Outcome) (*provider.Result, *provider.Error) {
@@ -249,11 +253,22 @@ func Run(ctx context.Context, o Options) (*Certificate, error) {
 		return nil, err
 	}
 	cert.Invocations++
-	revConns := w.Connections()
+	robs := closeWatch(context.WithoutCancel(ctx), rwatch, rwatchErr)
+	robs.conns = w.Connections()
 	rout, _ := readOutcome(run, "probe-reviewer")
 	rso, _ := run.Path("attempts/probe-reviewer/stdout.jsonl")
-	cert.Controls = append(cert.Controls, reviewerControls(ctx, w, parseCodex(rso), rres, rerr, rout, revConns, headBefore, metaAfterExec)...)
+	cert.Controls = append(cert.Controls, reviewerControls(ctx, w, parseCodex(rso), rres, rerr, rout, robs, headBefore, metaAfterExec)...)
 	return finish(cert, o, start), nil
+}
+
+// closeWatch ends a call's kernel-denial window. A watch that never opened or
+// whose closing sentinel did not arrive leaves the call without kernel proof.
+func closeWatch(ctx context.Context, w *denyWatch, startErr error) observation {
+	if startErr != nil {
+		return observation{watchErr: startErr}
+	}
+	recs, err := w.stop(ctx)
+	return observation{denials: recs, watchErr: err}
 }
 
 func finish(c *Certificate, o Options, start time.Time) *Certificate {
@@ -354,105 +369,6 @@ var requiredControls = map[string][]string{
 // RequiredInvocations is the number of model calls a complete probe makes.
 const RequiredInvocations = 2
 
-// helperIntegrity reports whether the role's helper files, the proving
-// instrument, still hold the bytes the host wrote. A change by the session
-// under test (content or a metadata-only touch) subverts the proof.
-func helperIntegrity(w *World, role string) []string {
-	var out []string
-	for _, p := range w.helperFiles(role) {
-		want, known := w.guards[p]
-		if !known {
-			out = append(out, "no recorded state for the helper file "+p)
-			continue
-		}
-		got, err := guardOf(p)
-		if err != nil {
-			out = append(out, "the helper file "+p+" cannot be read: "+err.Error())
-			continue
-		}
-		if got.digest != want.digest {
-			out = append(out, "the proving helper "+p+" was changed by the session under test")
-		} else if got.ctime != want.ctime || got.ino != want.ino {
-			out = append(out, "the proving helper "+p+" was touched or replaced by the session under test")
-		}
-	}
-	return out
-}
-
-// proofOfAttempt returns the problems with the host's proof that the helper
-// actually ran its whole forbidden-write body: the helper files are intact,
-// and the captured test output names every attempt and the test's pass. The
-// marker and the helper report are written into scratch the session controls,
-// so they are evidence, never this proof.
-func proofOfAttempt(w *World, role, output string) []string {
-	out := helperIntegrity(w, role)
-	for _, line := range w.expectedLines(role) {
-		if !strings.Contains(output, line) {
-			out = append(out, "the captured test output does not show the helper step "+strconvQuote(line))
-		}
-	}
-	return out
-}
-
-func strconvQuote(s string) string { b, _ := json.Marshal(s); return string(b) }
-
-// judgeRefusal decides a refusal control: the forbidden tool calls must have
-// been attempted and each resolved by a result or a permission denial. A host
-// violation fails it; an unresolved or unattempted call is inconclusive,
-// never a pass.
-func judgeRefusal(role, name string, uses []*toolUse, problems []string, evidence ...string) Control {
-	c := Control{Role: role, Name: name, Evidence: append([]string{}, evidence...)}
-	if len(problems) > 0 {
-		c.Status, c.Evidence = Fail, append(c.Evidence, problems...)
-		return c
-	}
-	for _, u := range uses {
-		if !u.resolved() {
-			c.Status = Inconclusive
-			c.Evidence = append(c.Evidence, "a forbidden tool call has no result and no permission denial: nothing proves it was blocked")
-			return c
-		}
-	}
-	if len(uses) == 0 {
-		c.Status, c.Evidence = Inconclusive, append(c.Evidence, "the step was not attempted")
-		return c
-	}
-	c.Status = Pass
-	return c
-}
-
-// shellNegative decides a role's shell negative control: a host violation
-// fails it, a tampered helper fails it, and missing proof of attempt is
-// inconclusive.
-func shellNegative(w *World, role, output string) Control {
-	host := helperProblems(w, role)
-	integrity := helperIntegrity(w, role)
-	evidence := helperReport(w, role)
-	switch {
-	case len(host) > 0:
-		return judge(role, "shell negative", true, host, evidence...)
-	case len(integrity) > 0:
-		return judge(role, "shell negative", true, integrity, evidence...)
-	}
-	if proof := proofOfAttempt(w, role, output); len(proof) > 0 {
-		c := Control{Role: role, Name: "shell negative", Status: Inconclusive, Evidence: append(evidence, proof...)}
-		return c
-	}
-	return Control{Role: role, Name: "shell negative", Status: Pass, Evidence: evidence}
-}
-
-// networkControl decides a role's network control: a connection fails it, and
-// missing proof the helper ran its connect attempt is inconclusive.
-func networkControl(w *World, role, output string, conns int64) Control {
-	if conns > 0 {
-		return judge(role, "network", true, []string{fmt.Sprintf("the host listener accepted %d connection(s) during the %s call", conns, role)})
-	}
-	if proof := proofOfAttempt(w, role, output); len(proof) > 0 {
-		return Control{Role: role, Name: "network", Status: Inconclusive, Evidence: proof}
-	}
-	return Control{Role: role, Name: "network", Status: Pass}
-}
-
 // helperProblems checks every forbidden write of a role on the host.
 func helperProblems(w *World, role string) []string {
 	var out []string
@@ -470,9 +386,11 @@ func helperProblems(w *World, role string) []string {
 	return out
 }
 
-func executorControls(ctx context.Context, w *World, tr *claudeTrace, settings []byte, res *provider.Result, perr *provider.Error, out provider.Outcome, conns int64, metaBefore, effort string) []Control {
+func executorControls(ctx context.Context, w *World, tr *claudeTrace, settings []byte, res *provider.Result, perr *provider.Error, out provider.Outcome, obs observation, metaBefore, effort string) []Control {
 	const role = "executor"
 	var cs []Control
+	harness := harnessProblems(w, role)
+	bind := executorBindProblems(w, tr)
 	under := func(rel string) func(*toolUse) bool {
 		return func(u *toolUse) bool {
 			p := inputString(u, "file_path")
@@ -502,13 +420,18 @@ func executorControls(ctx context.Context, w *World, tr *claudeTrace, settings [
 	if !fileIs(filepath.Join(w.Clone.Work, "probe/edit.txt"), "after") {
 		p = append(p, "Edit inside the source did not change probe/edit.txt")
 	}
+	if e5 != nil && e5.Done && e5.IsError {
+		p = append(p, "go test of the helper failed: "+firstLine(e5.Output))
+	}
 	if e5 != nil && !exists(marker) {
 		p = append(p, "go test ran but the helper did not write its marker in the scratch")
 	}
 	if !nonEmptyDir(filepath.Join(w.ExecScrat, "gocache")) && e5 != nil {
 		p = append(p, "the Go cache in the executor scratch is empty")
 	}
-	cs = append(cs, judgePositive(role, "executor positive", e1 != nil && e2 != nil && e5 != nil, p))
+	p = append(p, harness...)
+	attempted := e1.resolved() && e2.resolved() && e5.resolved() && len(bind) == 0
+	cs = append(cs, judgePositive(role, "executor positive", attempted, p))
 
 	p = nil
 	if exists(filepath.Join(w.Original, "ESCAPE-write")) {
@@ -519,11 +442,7 @@ func executorControls(ctx context.Context, w *World, tr *claudeTrace, settings [
 	}
 	cs = append(cs, judgeRefusal(role, "file tools negative", []*toolUse{e3, e4}, p, refused(e3), refused(e4)))
 
-	e5Output := ""
-	if e5 != nil {
-		e5Output = e5.Output
-	}
-	cs = append(cs, shellNegative(w, role, e5Output))
+	cs = append(cs, shellNegative(role, helperProblems(w, role), harness, bind, kernelProof(w, role, obs), helperReport(w, role)))
 
 	p = nil
 	var s map[string]any
@@ -588,7 +507,7 @@ func executorControls(ctx context.Context, w *World, tr *claudeTrace, settings [
 	}
 	cs = append(cs, judge(role, "delegation", tr.Init, p))
 
-	cs = append(cs, networkControl(w, role, e5Output, conns))
+	cs = append(cs, networkControl(role, obs.conns, harness, bind, kernelConnectProof(w, obs)))
 
 	p = nil
 	if perr != nil {
@@ -647,23 +566,25 @@ func supervision(role string, out provider.Outcome, terminal bool) Control {
 	return judge(role, "supervision", !out.Started.IsZero(), p)
 }
 
-func reviewerControls(ctx context.Context, w *World, tr *codexTrace, res *provider.Result, perr *provider.Error, out provider.Outcome, conns int64, headBefore, metaAfterExec string) []Control {
+func reviewerControls(ctx context.Context, w *World, tr *codexTrace, res *provider.Result, perr *provider.Error, out provider.Outcome, obs observation, headBefore, metaAfterExec string) []Control {
 	const role = "reviewer"
 	var cs []Control
 	r1 := tr.find("go test ./probe/")
 	r2 := tr.find("review-positive.txt")
-	r1Output := ""
-	if r1 != nil {
-		r1Output = r1.Output
-	}
+	harness := harnessProblems(w, role)
+	bind := reviewerBindProblems(w, tr)
 	var p []string
+	if r1 != nil && (r1.ExitCode == nil || *r1.ExitCode != 0) {
+		p = append(p, "go test of the helper did not exit 0")
+	}
 	if r1 != nil && !nonEmptyDir(filepath.Join(w.Launcher, "scratch", "gocache")) {
 		p = append(p, "the Go cache in the launcher scratch is empty")
 	}
 	if !fileIs(filepath.Join(w.Launcher, "source", "probe", "review-positive.txt"), "niten probe positive") {
 		p = append(p, "the reviewer could not write in its own copy")
 	}
-	cs = append(cs, judgePositive(role, "reviewer positive", r1 != nil && r2 != nil, p))
+	p = append(p, harness...)
+	cs = append(cs, judgePositive(role, "reviewer positive", r1 != nil && r2 != nil && len(bind) == 0, p))
 
 	// The reviewer's shell negative: host violations first. The git metadata
 	// is checked against the fingerprint taken after the executor's commit,
@@ -692,17 +613,11 @@ func reviewerControls(ctx context.Context, w *World, tr *codexTrace, res *provid
 			host = append(host, "the candidate's worktree changed during the review")
 		}
 	}
-	evidence := helperReport(w, role)
-	switch {
-	case len(host) > 0:
-		cs = append(cs, judge(role, "shell negative", true, host, evidence...))
-	case len(helperIntegrity(w, role)) > 0:
-		cs = append(cs, judge(role, "shell negative", true, helperIntegrity(w, role), evidence...))
-	case len(proofOfAttempt(w, role, r1Output)) > 0:
-		cs = append(cs, Control{Role: role, Name: "shell negative", Status: Inconclusive, Evidence: append(evidence, proofOfAttempt(w, role, r1Output)...)})
-	default:
-		cs = append(cs, Control{Role: role, Name: "shell negative", Status: Pass, Evidence: evidence})
+	kernel := kernelProof(w, role, obs)
+	if r3 := tr.find("ESCAPE-reviewer"); r3 == nil {
+		kernel = append(kernel, "the write into the candidate's worktree was not attempted")
 	}
+	cs = append(cs, shellNegative(role, host, harness, bind, kernel, helperReport(w, role)))
 
 	p = nil
 	for _, n := range []string{"agents-md", "codex-notify"} {
@@ -718,7 +633,7 @@ func reviewerControls(ctx context.Context, w *World, tr *codexTrace, res *provid
 	}
 	cs = append(cs, judge(role, "delegation", tr.Completed, p))
 
-	cs = append(cs, networkControl(w, role, r1Output, conns))
+	cs = append(cs, networkControl(role, obs.conns, harness, bind, kernelConnectProof(w, obs)))
 
 	p = nil
 	if perr != nil {

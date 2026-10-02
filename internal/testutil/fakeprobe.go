@@ -72,7 +72,8 @@ func runHelper(sandboxed bool, source, scratch, pkgDir, role string) (string, in
 		return err.Error(), 127
 	}
 	goroot, _ := filepath.EvalSymlinks(strings.TrimSpace(string(rootOut)))
-	sb, err := sandbox.New(filepath.Join(filepath.Dir(scratch), "fake-profiles-"+role))
+	// Outside the role's guarded tree and the launcher.
+	sb, err := sandbox.New(filepath.Join(filepath.Dir(filepath.Dir(scratch)), "fake-profiles-"+role))
 	if err != nil {
 		return err.Error(), 126
 	}
