@@ -147,6 +147,12 @@ func (c *Clone) checkPointer() error {
 // ignored, so the only configuration is the clone's own (written by Niten,
 // outside every model write root). Without filter, diff or merge driver
 // definitions, attributes a candidate writes cannot make git run a program.
+// IsolatedGitEnv is the environment of a git command that must touch only the
+// repository its arguments name: every GIT_* variable of the caller removed
+// (GIT_DIR or GIT_WORK_TREE would redirect it, and -C does not override them),
+// the global and system configuration and system attributes off.
+func IsolatedGitEnv() []string { return isolatedEnv() }
+
 func isolatedEnv(extra ...string) []string {
 	return append(append(gitEnv(), "GIT_CONFIG_GLOBAL="+os.DevNull, "GIT_CONFIG_NOSYSTEM=1", "GIT_ATTR_NOSYSTEM=1"), extra...)
 }

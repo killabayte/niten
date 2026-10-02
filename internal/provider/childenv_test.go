@@ -34,3 +34,20 @@ func TestBashRules(t *testing.T) {
 		t.Fatalf("%v", got)
 	}
 }
+
+// A model's git must work on its own working copy: GIT_DIR, GIT_WORK_TREE and
+// every other git variable of the coordinator never reach it.
+func TestChildEnvRemovesGitVariables(t *testing.T) {
+	env, stripped, err := ChildEnv([]string{"GIT_DIR=/elsewhere/.git", "GIT_WORK_TREE=/elsewhere", "GIT_INDEX_FILE=/x", "HOME=/h"}, nil, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, kv := range env {
+		if strings.HasPrefix(kv, "GIT_") {
+			t.Fatalf("%s reached the model", kv)
+		}
+	}
+	if !slices.Equal(stripped, []string{"GIT_DIR", "GIT_INDEX_FILE", "GIT_WORK_TREE"}) {
+		t.Fatalf("stripped %v", stripped)
+	}
+}

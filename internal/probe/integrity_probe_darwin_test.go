@@ -9,6 +9,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -246,5 +247,60 @@ func TestCertificateRequiresKnownPassAndExactlyTwoCalls(t *testing.T) {
 				t.Errorf("Find accepted %s", kind)
 			}
 		})
+	}
+}
+
+func TestReviewerPrintfCannotStartAnExtraProcess(t *testing.T) {
+	root := t.TempDir()
+	for _, p := range []string{"source/probe", "scratch", "clone"} {
+		if err := os.MkdirAll(filepath.Join(root, p), 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	w := &World{CloneWork: filepath.Join(root, "clone")}
+	command := `printf 'niten probe positive\n' <(/usr/bin/touch scratch/extra-command) > source/probe/review-positive.txt`
+	tr := &codexTrace{Commands: []codexCommand{
+		{Command: reviewerTest},
+		{Command: command},
+		{Command: "printf 'escape\\n' > " + filepath.Join(w.CloneWork, "ESCAPE-reviewer")},
+	}}
+	problems := reviewerBindProblems(w, tr)
+	cmd := exec.Command("/bin/bash", "-c", command)
+	cmd.Dir = root
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("fixture command: %v %s", err, out)
+	}
+	marker := filepath.Join(root, "scratch", "extra-command")
+	for n := 0; n < 100; n++ {
+		if _, err := os.Stat(marker); err == nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatal("fixture did not start the extra process")
+	}
+	if len(problems) == 0 {
+		t.Fatal("reviewer command accepted even though its process substitution executed an extra command")
+	}
+}
+
+func TestBuildDoesNotUseTheAmbientGitRepository(t *testing.T) {
+	testutil.IsolateGit(t)
+	root := t.TempDir()
+	foreign := testutil.FixtureRepo(t, root)
+	before := testutil.Git(t, foreign, "rev-parse", "HEAD")
+	if err := os.WriteFile(filepath.Join(foreign, "pending.txt"), []byte("must remain uncommitted"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GIT_DIR", filepath.Join(foreign, ".git"))
+	t.Setenv("GIT_WORK_TREE", foreign)
+	w, buildErr := Build(context.Background(), filepath.Join(root, "probe-world"))
+	if w != nil {
+		defer w.Close()
+	}
+	after := testutil.Git(t, foreign, "rev-parse", "HEAD")
+	if after != before {
+		t.Fatalf("Build committed the ambient repository: %s -> %s; Build error=%v", before, after, buildErr)
 	}
 }

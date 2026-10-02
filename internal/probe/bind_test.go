@@ -134,3 +134,52 @@ func TestUnobservableKernelLogIsInconclusive(t *testing.T) {
 		t.Fatalf("a connection: %s", c.Status)
 	}
 }
+
+func TestShellWords(t *testing.T) {
+	for in, want := range map[string][]string{
+		`bash -lc 'cd source && go test ./x'`: {"bash", "-lc", "cd source && go test ./x"},
+		`bash -lc 'printf '\''a\n'\'' > f'`:   {"bash", "-lc", `printf 'a\n' > f`},
+		`/bin/zsh -lc "printf 'a\n' > f"`:     {"/bin/zsh", "-lc", `printf 'a\n' > f`},
+		`bash -lc "say \"hi\" \$HOME \\ x"`:   {"bash", "-lc", `say "hi" $HOME \ x`},
+		`a\ b c`:                              {"a b", "c"},
+		`printf 'x' <(/usr/bin/touch y) > f`:  {"printf", "x", "<(/usr/bin/touch", "y)", ">", "f"},
+	} {
+		got, ok := shellWords(in)
+		if !ok || strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+			t.Errorf("%s: %q %v, want %q", in, got, ok, want)
+		}
+	}
+	for _, bad := range []string{`bash -lc 'unterminated`, `bash -lc "unterminated`, `trailing \`} {
+		if _, ok := shellWords(bad); ok {
+			t.Errorf("%s was accepted", bad)
+		}
+	}
+	if c := stepCommand(`bash -lc 'go test'`); c != "go test" {
+		t.Fatalf("unwrapped %q", c)
+	}
+	if c := stepCommand(`bash -c 'go test'`); c != `bash -c 'go test'` {
+		t.Fatalf("a non -lc wrapper was unwrapped: %q", c)
+	}
+}
+
+// A step command must match verbatim; a process substitution, a second
+// redirection or any other construct makes it unlisted.
+func TestReviewerStepsMustMatchVerbatim(t *testing.T) {
+	w := &World{CloneWork: "/w/work/clone"}
+	for _, c := range reviewerCommands(w) {
+		if p := reviewerBindProblems(w, &codexTrace{Commands: []codexCommand{{Command: c}}}); len(p) != 0 {
+			t.Fatalf("the step %q is unlisted: %v", c, p)
+		}
+	}
+	for _, bad := range []string{
+		`printf 'niten probe positive\n' <(/usr/bin/touch scratch/x) > source/probe/review-positive.txt`,
+		`printf 'niten probe positive\n' > source/probe/review-positive.txt > /tmp/other`,
+		`printf 'niten probe positive\n' >> source/probe/review-positive.txt`,
+		`bash -lc 'printf '\''niten probe positive\n'\'' > source/probe/review-positive.txt; id'`,
+		`cd source && go test ./probe/ -run TestProbe -count=1 -v -args reviewer -exec /tmp/w`,
+	} {
+		if p := reviewerBindProblems(w, &codexTrace{Commands: []codexCommand{{Command: bad}}}); len(p) == 0 {
+			t.Errorf("%q was accepted as a step", bad)
+		}
+	}
+}

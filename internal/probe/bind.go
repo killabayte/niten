@@ -6,7 +6,6 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"regexp"
 	"slices"
 	"sort"
 	"strings"
@@ -184,53 +183,99 @@ func executorBindProblems(w *World, tr *claudeTrace) []string {
 	return out
 }
 
-var reShellWrap = regexp.MustCompile(`^(?:/bin/|/usr/bin/)?(?:ba|z)?sh -lc (.*)$`)
+// reviewerShells are the shells a CLI may wrap a command in.
+var reviewerShells = []string{"bash", "/bin/bash", "zsh", "/bin/zsh", "sh", "/bin/sh"}
 
-// unwrap removes the shell wrapper a CLI puts around a command.
-func unwrap(c string) string {
-	c = strings.TrimSpace(c)
-	if m := reShellWrap.FindStringSubmatch(c); m != nil {
-		c = strings.TrimSpace(m[1])
-		if len(c) >= 2 && (c[0] == '\'' || c[0] == '"') && c[len(c)-1] == c[0] {
-			q := c[0]
-			c = c[1 : len(c)-1]
-			if q == '"' {
-				c = strings.ReplaceAll(strings.ReplaceAll(c, `\"`, `"`), `\\`, `\`)
+// shellWords splits a displayed command line into its words with POSIX
+// quoting and no expansion: single quotes are literal, double quotes take only
+// the \" \\ \$ \` escapes, and a backslash outside quotes escapes the next
+// character. An unterminated quote or a trailing backslash is refused.
+func shellWords(s string) ([]string, bool) {
+	var words []string
+	var cur strings.Builder
+	inWord := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c == ' ' || c == '\t':
+			if inWord {
+				words, inWord = append(words, cur.String()), false
+				cur.Reset()
 			}
+		case c == '\'':
+			j := strings.IndexByte(s[i+1:], '\'')
+			if j < 0 {
+				return nil, false
+			}
+			cur.WriteString(s[i+1 : i+1+j])
+			i += j + 1
+			inWord = true
+		case c == '"':
+			i++
+			for ; i < len(s) && s[i] != '"'; i++ {
+				if s[i] == '\\' && i+1 < len(s) && strings.IndexByte("\"\\$`", s[i+1]) >= 0 {
+					i++
+				}
+				cur.WriteByte(s[i])
+			}
+			if i >= len(s) {
+				return nil, false
+			}
+			inWord = true
+		case c == '\\':
+			if i+1 >= len(s) {
+				return nil, false
+			}
+			i++
+			cur.WriteByte(s[i])
+			inWord = true
+		default:
+			cur.WriteByte(c)
+			inWord = true
 		}
+	}
+	if inWord {
+		words = append(words, cur.String())
+	}
+	return words, true
+}
+
+// stepCommand is the script a CLI ran: the script of an exact
+// `<shell> -lc <script>` wrapper, or the command itself.
+func stepCommand(c string) string {
+	if words, ok := shellWords(c); ok && len(words) == 3 && slices.Contains(reviewerShells, words[0]) && words[1] == "-lc" {
+		return words[2]
 	}
 	return c
 }
 
+// reviewerCommands are the reviewer's step commands, verbatim.
+func reviewerCommands(w *World) []string {
+	return []string{
+		reviewerTest,
+		`printf 'niten probe positive\n' > source/probe/review-positive.txt`,
+		`printf 'escape\n' > ` + filepath.Join(w.CloneWork, "ESCAPE-reviewer"),
+	}
+}
+
 // reviewerBindProblems lists the reviewer's commands the probe did not list.
-// The test command must be exact; the two writes are plain printf redirects
-// with no other shell construct.
+// Every command must be one of the step commands verbatim: no other shell
+// construct (a substitution, a chain, a redirection) can then start a process.
 func reviewerBindProblems(w *World, tr *codexTrace) []string {
 	var out []string
+	listed := reviewerCommands(w)
 	counts := map[string]int{}
 	for _, cmd := range tr.Commands {
-		c := unwrap(cmd.Command)
-		kind := ""
-		switch {
-		case c == reviewerTest:
-			kind = "test"
-		case strings.HasPrefix(c, "printf ") && !strings.ContainsAny(c, ";|&`\n") && !strings.Contains(c, "$("):
-			switch {
-			case strings.HasSuffix(c, "> source/probe/review-positive.txt"):
-				kind = "positive"
-			case strings.HasSuffix(c, "> "+filepath.Join(w.CloneWork, "ESCAPE-reviewer")):
-				kind = "escape"
-			}
-		}
-		if kind == "" {
+		c := stepCommand(cmd.Command)
+		if !slices.Contains(listed, c) {
 			out = append(out, "the session ran a command the probe does not list: "+c)
 			continue
 		}
-		counts[kind]++
+		counts[c]++
 	}
-	for k, n := range counts {
+	for c, n := range counts {
 		if n > 1 {
-			out = append(out, fmt.Sprintf("the session ran the %s step %d times", k, n))
+			out = append(out, fmt.Sprintf("the session ran %q %d times", c, n))
 		}
 	}
 	sort.Strings(out)

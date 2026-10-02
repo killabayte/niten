@@ -98,9 +98,20 @@ func token() string {
 	return hex.EncodeToString(b[:])
 }
 
+// gitRun runs git on the probe's own original repository only: the caller's
+// GIT_* variables are removed (GIT_DIR or GIT_WORK_TREE would redirect the
+// command, and -C does not override them), and every command after init names
+// the repository's git directory and work tree explicitly.
 func gitRun(ctx context.Context, dir string, args ...string) error {
-	cmd := exec.CommandContext(ctx, workspace.GitBinary(), append([]string{"-C", dir, "-c", "user.email=niten@localhost", "-c", "user.name=Niten probe", "-c", "commit.gpgsign=false"}, args...)...)
-	cmd.Env = append(os.Environ(), "GIT_CONFIG_GLOBAL="+os.DevNull, "GIT_CONFIG_NOSYSTEM=1")
+	full := []string{"-c", "user.email=niten@localhost", "-c", "user.name=Niten probe", "-c", "commit.gpgsign=false", "-c", "core.hooksPath=" + os.DevNull}
+	if len(args) > 0 && args[0] == "init" {
+		full = append(append(full, args...), dir)
+	} else {
+		full = append(append(full, "--git-dir", filepath.Join(dir, ".git"), "--work-tree", dir), args...)
+	}
+	cmd := exec.CommandContext(ctx, workspace.GitBinary(), full...)
+	cmd.Env = workspace.IsolatedGitEnv()
+	cmd.Dir = dir
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("git %v: %v: %s", args, err, out)
 	}

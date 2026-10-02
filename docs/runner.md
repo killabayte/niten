@@ -130,9 +130,10 @@ write failure is an error, never a clean outcome.
 alive with the recorded start time. A reused PID, a dead leader or an unreadable process
 table is never grounds for a signal; members left in a dead leader's group are reported.
 
-`FilterEnv` removes API keys and model overrides (`ANTHROPIC_*`, `OPENAI_*`,
-`CLAUDE_CODE_*`, `CODEX_API_KEY`, `RUST_LOG` and the other built-in names) plus the
-configured `strip_env` names, and returns only the removed names for the record.
+`FilterEnv` removes API keys, model overrides and git's own variables (`ANTHROPIC_*`,
+`OPENAI_*`, `GIT_*`, `CLAUDE_CODE_*`, `CODEX_API_KEY`, `RUST_LOG` and the other built-in
+names) plus the configured `strip_env` names, and returns only the removed names for the
+record.
 
 ## Adapters
 

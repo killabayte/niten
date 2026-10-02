@@ -8,15 +8,17 @@ import (
 )
 
 // Built-in names and prefixes that never reach a model's process: API keys
-// (they would switch from subscription auth to metered API access) and model
-// or effort overrides that would silently replace the requested model. The
+// (they would switch from subscription auth to metered API access), model or
+// effort overrides that would silently replace the requested model, and git's
+// own variables (GIT_DIR or GIT_WORK_TREE would point the model's git at
+// another repository than its working copy). The
 // configured strip_env names are added on top; they cannot remove these.
 var (
 	BuiltinStripNames = []string{
 		"CLAUDECODE", "CODEX_API_KEY", "MAX_THINKING_TOKENS", "RUST_LOG",
 		"CLAUDE_CODE_SUBAGENT_MODEL", "CLAUDE_CODE_EFFORT_LEVEL", "ANTHROPIC_MODEL",
 	}
-	BuiltinStripPrefixes = []string{"ANTHROPIC_", "OPENAI_", "CLAUDE_CODE_"}
+	BuiltinStripPrefixes = []string{"ANTHROPIC_", "OPENAI_", "CLAUDE_CODE_", "GIT_"}
 )
 
 // FilterEnv returns base without the built-in and extra names, and the sorted

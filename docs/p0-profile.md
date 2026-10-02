@@ -245,7 +245,7 @@ equivalent does not mean a charge against the subscription:
 describes it for print mode. We do not accept the claim "it is only an SDK option".
 In v0.1 we do not rely on it; absence from the help does not prove absence of support.
 
-Builtin child-env filtering covers ANTHROPIC_*, OPENAI_*, CLAUDE_CODE_* and
+Builtin child-env filtering covers ANTHROPIC_*, OPENAI_*, CLAUDE_CODE_*, GIT_* and
 CODEX_API_KEY, model overrides and the user's strip_env. The adapter then sets
 its own verified values. In particular, CLAUDE_CODE_SUBAGENT_MODEL,
 CLAUDE_CODE_EFFORT_LEVEL and ANTHROPIC_MODEL are removed. The profile does not let the model
