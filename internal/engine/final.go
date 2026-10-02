@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"slices"
 	"sort"
 	"strings"
@@ -87,6 +88,8 @@ type Receipt struct {
 	Turns           []*TurnView       `json:"turns"`
 	Models          receiptModels     `json:"models"`
 	Artifacts       []artifactRef     `json:"artifacts"`
+	// Certificates are the live profile certificates the run's sessions ran under.
+	Certificates []certRef `json:"certificates"`
 }
 
 type receiptRepo struct {
@@ -199,6 +202,13 @@ func (e *Engine) finish(ctx context.Context) (*Outcome, error) {
 		gate(err == nil && f.Candidate != nil && tree == f.Candidate.Tree, "the head tree differs from the checked one")
 		ins, err := e.clone.Inspect(ctx, e.rules(f))
 		gate(err == nil && len(ins.Changes) == 0 && len(ins.Violations) == 0, "the worktree differs from the head candidate")
+	}
+	for _, c := range sessionCertificates(e.events) {
+		if c.Skipped {
+			continue
+		}
+		raw, err := os.ReadFile(c.Path)
+		gate(err == nil && digest(raw) == c.SHA256, "the live certificate %s changed or is missing", c.Path)
 	}
 	pids, err := holders.List([]string{e.work})
 	gate(err == nil && len(pids) == 0, "processes still hold the run's work area: %v %v", pids, err)
@@ -542,7 +552,7 @@ func (e *Engine) saveReceipt(status contract.RunState) error {
 		SemanticsDigest: e.c.SemanticsDigest, Repository: receiptRepo{ID: repo.ID, Path: repo.Path, BaseCommit: repo.BaseCommit, BaseTree: repo.BaseTree},
 		Final:    receiptFinal{Commit: f.Candidate.Commit, Tree: f.Candidate.Tree, Branch: "niten", Clone: snap.CloneWork, GitDir: snap.CloneGitDir},
 		Criteria: crit, Checks: f.Checks.Results, FinalReview: *f.Review, Findings: snap.Findings, PendingExternal: nonNil(pending),
-		Attestations: snap.Attestations, Turns: snap.Turns, Artifacts: arts,
+		Attestations: snap.Attestations, Turns: snap.Turns, Artifacts: arts, Certificates: sessionCertificates(events),
 		Limits: receiptLimits{Effective: snap.Limits, History: snap.LimitHistory, Invocations: snap.Invocations, ActiveMS: snap.ActiveMS}}
 	for _, s := range snap.Steps {
 		rs := receiptStep{ID: s.ID, AcceptedAt: s.AcceptedAt, Repairs: s.Repairs, Reviews: s.Reviews}
@@ -600,6 +610,24 @@ func (e *Engine) saveReceipt(status contract.RunState) error {
 	}
 	_, err = e.run.Replace("execution.md", md)
 	return err
+}
+
+// sessionCertificates lists the distinct certificates the sessions recorded.
+func sessionCertificates(events []store.Event) []certRef {
+	out := []certRef{}
+	for _, ev := range events {
+		if ev.Type != evSession {
+			continue
+		}
+		var d sessionData
+		if json.Unmarshal(ev.Data, &d) != nil || d.Certificate == nil {
+			continue
+		}
+		if !slices.Contains(out, *d.Certificate) {
+			out = append(out, *d.Certificate)
+		}
+	}
+	return out
 }
 
 func justification(s *State, path string) string {

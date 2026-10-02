@@ -27,6 +27,7 @@ import (
 	"github.com/killabayte/niten/internal/config"
 	"github.com/killabayte/niten/internal/contract"
 	"github.com/killabayte/niten/internal/plan"
+	"github.com/killabayte/niten/internal/probe"
 	"github.com/killabayte/niten/internal/store"
 	"github.com/killabayte/niten/internal/verify"
 	"github.com/killabayte/niten/internal/verify/sandbox"
@@ -47,6 +48,9 @@ type Options struct {
 	Heartbeat time.Duration
 	// NewBackend creates the verifier sandbox backend.
 	NewBackend func(profileDir string) (*sandbox.Seatbelt, error)
+	// SkipCertificate runs without a live profile certificate. Only tests on
+	// scripted CLIs set it; a real run needs `niten doctor --live` first.
+	SkipCertificate bool
 }
 
 // Outcome is how a session ended.
@@ -83,6 +87,8 @@ type Engine struct {
 	runner      *attempt.Runner
 	// inSession is set once this process recorded its session boundary.
 	inSession bool
+	// cert is the live profile certificate this session runs under.
+	cert certRef
 	// crashAt is a test hook: a non-nil error at a named point stops the
 	// engine there, as a crash would.
 	crashAt func(point string) error
@@ -350,7 +356,7 @@ func (e *Engine) Resume(ctx context.Context, r ResumeOptions) (Outcome, error) {
 		// The journal ends inside a session: the coordinator crashed. Mark the
 		// boundary before recovery records anything, so the downtime is not
 		// counted as active time.
-		if err := e.emit(evSession, sessionData{Command: "recover", ContractSHA256: e.contractSHA, ConfigSHA256: e.configSHA}); err != nil {
+		if err := e.emit(evSession, sessionData{Command: "recover", ContractSHA256: e.contractSHA, ConfigSHA256: e.configSHA, Certificate: &e.cert}); err != nil {
 			return e.failure(err)
 		}
 		e.inSession = true
@@ -415,7 +421,7 @@ func (e *Engine) session(ctx context.Context, command string) (Outcome, error) {
 		}
 	}
 	if !e.inSession {
-		if err := e.emit(evSession, sessionData{Command: command, ContractSHA256: e.contractSHA, ConfigSHA256: e.configSHA}); err != nil {
+		if err := e.emit(evSession, sessionData{Command: command, ContractSHA256: e.contractSHA, ConfigSHA256: e.configSHA, Certificate: &e.cert}); err != nil {
 			return e.failure(err)
 		}
 		e.inSession = true
@@ -710,6 +716,9 @@ func (e *Engine) setup(ctx context.Context) error {
 		}
 		m.Bin = bin
 	}
+	if err := e.certify(ctx); err != nil {
+		return err
+	}
 	if e.st.CloneWork != "" {
 		c, err := workspace.OpenClone(e.st.CloneWork, e.st.CloneGitDir)
 		if err != nil {
@@ -758,6 +767,49 @@ func (e *Engine) advancedByPendingTurn(ctx context.Context, c *workspace.Clone, 
 		}
 	}
 	return false
+}
+
+// certRef names the certificate a session runs under.
+type certRef struct {
+	Fingerprint string `json:"fingerprint"`
+	SHA256      string `json:"sha256,omitempty"`
+	Path        string `json:"path,omitempty"`
+	Skipped     bool   `json:"skipped,omitempty"`
+}
+
+// certify requires a passing live certificate for exactly this run's binding:
+// the binaries, models, settings template, managed policy, environment policy,
+// adapter argv and OS. It runs before any model and in every session, so an
+// updated CLI or template needs a new certification.
+func (e *Engine) certify(ctx context.Context) error {
+	tmpl, err := e.settingsTemplate()
+	if err != nil {
+		return err
+	}
+	cmds, err := e.policyCommands()
+	if err != nil {
+		return err
+	}
+	var argvs [][]string
+	for _, c := range cmds {
+		argvs = append(argvs, c.Argv)
+	}
+	b, err := probe.Bind(ctx, probe.BindInput{Claude: e.exec.Bin, Codex: e.rev.Bin, Executor: e.c.Models.Executor, Reviewer: e.c.Models.Reviewer,
+		SettingsTemplate: tmpl, StripEnv: e.c.Policy.StripEnv, Commands: argvs, MaxBudgetUSD: e.c.Limits.ClaudeMaxBudgetUSD})
+	if err != nil {
+		return fmt.Errorf("live certificate: %w", err)
+	}
+	e.cert = certRef{Fingerprint: b.Fingerprint()}
+	if e.o.SkipCertificate {
+		e.cert.Skipped = true
+		return nil
+	}
+	_, path, sha, err := probe.Find(e.o.Store.Root, e.cert.Fingerprint)
+	if err != nil {
+		return err
+	}
+	e.cert.Path, e.cert.SHA256 = path, sha
+	return nil
 }
 
 // createClone makes the run's owned clone at the base commit. A clone left

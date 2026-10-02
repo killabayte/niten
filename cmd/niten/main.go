@@ -87,12 +87,12 @@ error, 3 needs input, 4 paused, 5 implemented with pending external criteria, 13
 }
 
 // doctor reports the offline facts the P0a gate depends on: the embedded
-// contract schemas and the verifier sandbox backend. It never starts a model;
-// --live is refused because live probes need their own authorization.
+// contract schemas and the verifier sandbox backend. It never starts a model.
+// --live runs the live profile probe instead, which does.
 func doctor(args []string, stdout, stderr io.Writer) contract.ExitCode {
 	fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	live := fs.Bool("live", false, "run the separately authorized live model probes (not available in this build)")
+	live := fs.Bool("live", false, "run the live profile probe: one claude and one codex invocation (needs a separately authorized budget)")
 	configPath := fs.String("config", "", "config file (default: $XDG_CONFIG_HOME/niten/config.toml or ~/.config/niten/config.toml)")
 	if err := fs.Parse(args); err != nil {
 		return contract.ExitFormat
@@ -102,8 +102,7 @@ func doctor(args []string, stdout, stderr io.Writer) contract.ExitCode {
 		return contract.ExitFormat
 	}
 	if *live {
-		fmt.Fprintln(stderr, "niten doctor --live: live probes are not part of this build; they require a separately authorized run (docs/roadmap.md, P0a)")
-		return contract.ExitFormat
+		return doctorLive(*configPath, stdout, stderr)
 	}
 
 	ok := true

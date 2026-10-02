@@ -127,80 +127,40 @@ func goCommand(ctx context.Context, bin string, args ...string) (string, error) 
 	return out.String(), err
 }
 
-// childEnv is a model process environment: the coordinator's environment
-// without API keys, model overrides and the configured names, with the
-// temporary and Go cache directories pinned to the attempt's scratch.
+// childEnv is a model process environment (see provider.ChildEnv).
 func (e *Engine) childEnv(scratch string, extra ...string) (env, stripped []string, err error) {
-	env, stripped = provider.FilterEnv(e.o.Environ(), e.c.Policy.StripEnv)
-	for _, d := range []string{"tmp", "gocache"} {
-		if err := os.MkdirAll(filepath.Join(scratch, d), 0o700); err != nil {
-			return nil, nil, err
-		}
-	}
-	set := map[string]string{
-		"TMPDIR": filepath.Join(scratch, "tmp"), "GOTMPDIR": filepath.Join(scratch, "tmp"),
-		"GOCACHE": filepath.Join(scratch, "gocache"), "GOTOOLCHAIN": "local",
-	}
-	out := make([]string, 0, len(env)+len(set)+len(extra))
-	for _, kv := range env {
-		k, _, _ := strings.Cut(kv, "=")
-		if _, replaced := set[k]; !replaced {
-			out = append(out, kv)
-		}
-	}
-	keys := make([]string, 0, len(set))
-	for k := range set {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	for _, k := range keys {
-		out = append(out, k+"="+set[k])
-	}
-	return append(out, extra...), stripped, nil
+	return provider.ChildEnv(e.o.Environ(), e.c.Policy.StripEnv, scratch, extra...)
 }
 
-// allowedBash turns the allowed check commands into Claude Bash permission
-// prefixes, plus read-only git inspection. Prefixes are a convenience, not an
-// isolation boundary: the settings sandbox is.
+// allowedBash are the executor's Bash permission prefixes (see provider.BashRules).
 func (e *Engine) allowedBash() ([]string, error) {
 	cmds, err := e.policyCommands()
 	if err != nil {
 		return nil, err
 	}
-	seen := map[string]bool{}
-	var out []string
-	add := func(r string) {
-		if !seen[r] {
-			seen[r] = true
-			out = append(out, r)
-		}
-	}
+	var argvs [][]string
 	for _, c := range cmds {
-		n := 2
-		if len(c.Argv) < n {
-			n = len(c.Argv)
-		}
-		if n > 0 {
-			add("Bash(" + strings.Join(c.Argv[:n], " ") + ":*)")
-		}
+		argvs = append(argvs, c.Argv)
 	}
-	for _, g := range []string{"git diff", "git log", "git blame", "git status"} {
-		add("Bash(" + g + ":*)")
-	}
-	return out, nil
+	return provider.BashRules(argvs), nil
 }
 
-// settingsTemplate is the configured template, or the built-in copy of
-// examples/claude-settings.template.json.
-func (e *Engine) settingsTemplate() ([]byte, error) {
-	if p := e.cfg.ClaudeSettingsTemplate; p != "" {
-		b, err := os.ReadFile(p)
+// SettingsTemplate is the configured Claude settings template at path, or
+// the built-in copy of examples/claude-settings.template.json when path is "".
+// Runs and the live probe use the same bytes.
+func SettingsTemplate(path string) ([]byte, error) {
+	if path != "" {
+		b, err := os.ReadFile(path)
 		if err != nil {
 			return nil, fmt.Errorf("claude settings template: %w", err)
 		}
 		return b, nil
 	}
 	return defaultSettingsTemplate, nil
+}
+
+func (e *Engine) settingsTemplate() ([]byte, error) {
+	return SettingsTemplate(e.cfg.ClaudeSettingsTemplate)
 }
 
 // renderSettings writes the executor settings for one attempt into its control

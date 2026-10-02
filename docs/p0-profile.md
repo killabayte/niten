@@ -312,6 +312,10 @@ ten minutes each/twenty minutes total, no retry. P0b requires its own authorizat
 it is not automatically chained after P0a. Prepare refuses context-repo plans
 without this certificate, while the single-project pilot can proceed on P0a.
 
+The harness for the executor and reviewer controls is `niten doctor --live`, described in
+[live probe](live-probe.md). The settings template now also denies writes to `/tmp` and
+`/private/tmp`, the shared temp this section requires closed.
+
 Certificates cover binaries/versions, policy templates, effective managed policy,
 env policy, models/effort, OS and role topology. Concrete generated paths are
 validated offline and recorded per invocation; a new temporary directory alone

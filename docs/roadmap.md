@@ -66,6 +66,14 @@ refuses the run without killing any other holder ([P0 profiles](p0-profile.md)).
 authorized executor and reviewer live probes. The export CAS and the external store
 are recorded as contract decisions and are implemented in P2/P5.
 
+Live harness status, 2026-10-02: `niten doctor --live` is implemented and tested offline
+on scripted CLIs ([live probe](live-probe.md)). It runs one executor and one reviewer
+invocation under the budget above and judges every control of the P0a table by tool events
+and host observations. Its certificate binds the binaries, models, settings template,
+managed policy, environment filter, adapter argv and OS. `run` and `resume` refuse to start
+without a passing certificate for their exact binding. The live probe itself has not run;
+it needs the separate authorization.
+
 ## P0b Add context repositories only when needed
 
 Extend the verifier and CLI probes with read-only context roots, including

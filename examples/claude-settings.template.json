@@ -11,7 +11,8 @@
       "denyWrite": [
         "{{ORIGINAL_REPO}}", "{{STORE}}", "{{GITDIR}}", "{{CONTEXT_COPY}}",
         "{{SOURCE}}/.git", "{{SOURCE}}/.claude", "{{SOURCE}}/.codex",
-        "{{SOURCE}}/.agents", "{{SOURCE}}/.mcp.json", "{{CLAUDE_HOME}}", "{{CODEX_HOME}}"
+        "{{SOURCE}}/.agents", "{{SOURCE}}/.mcp.json", "{{CLAUDE_HOME}}", "{{CODEX_HOME}}",
+        "/tmp", "/private/tmp"
       ],
       "denyRead": ["{{STORE}}", "{{CLAUDE_HOME}}", "{{CODEX_HOME}}"]
     },

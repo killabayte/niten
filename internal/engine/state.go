@@ -311,9 +311,10 @@ func stopping(st contract.RunState) bool {
 // Event payloads.
 type (
 	sessionData struct {
-		Command        string `json:"command"`
-		ContractSHA256 string `json:"contract_sha256"`
-		ConfigSHA256   string `json:"config_sha256,omitempty"`
+		Command        string   `json:"command"`
+		ContractSHA256 string   `json:"contract_sha256"`
+		ConfigSHA256   string   `json:"config_sha256,omitempty"`
+		Certificate    *certRef `json:"certificate,omitempty"`
 	}
 	cloneData struct {
 		Work     string `json:"work"`

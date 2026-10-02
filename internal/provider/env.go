@@ -1,6 +1,8 @@
 package provider
 
 import (
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 )
@@ -52,4 +54,61 @@ func FilterEnv(base []string, extra []string) (env []string, stripped []string) 
 		env = []string{}
 	}
 	return env, stripped
+}
+
+// ChildEnv is a model process environment: base without API keys, model
+// overrides and the configured names, with the temporary and Go cache
+// directories pinned to the attempt's scratch, plus extra. It returns the
+// removed names, never their values.
+func ChildEnv(base, strip []string, scratch string, extra ...string) (env, stripped []string, err error) {
+	env, stripped = FilterEnv(base, strip)
+	for _, d := range []string{"tmp", "gocache"} {
+		if err := os.MkdirAll(filepath.Join(scratch, d), 0o700); err != nil {
+			return nil, nil, err
+		}
+	}
+	set := map[string]string{
+		"TMPDIR": filepath.Join(scratch, "tmp"), "GOTMPDIR": filepath.Join(scratch, "tmp"),
+		"GOCACHE": filepath.Join(scratch, "gocache"), "GOTOOLCHAIN": "local",
+	}
+	out := make([]string, 0, len(env)+len(set)+len(extra))
+	for _, kv := range env {
+		k, _, _ := strings.Cut(kv, "=")
+		if _, replaced := set[k]; !replaced {
+			out = append(out, kv)
+		}
+	}
+	keys := make([]string, 0, len(set))
+	for k := range set {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		out = append(out, k+"="+set[k])
+	}
+	return append(out, extra...), stripped, nil
+}
+
+// BashRules turns allowed check commands into Claude Bash permission
+// prefixes, plus read-only git inspection. Prefixes are a convenience, not an
+// isolation boundary: the settings sandbox is.
+func BashRules(argvs [][]string) []string {
+	seen := map[string]bool{}
+	var out []string
+	add := func(r string) {
+		if !seen[r] {
+			seen[r] = true
+			out = append(out, r)
+		}
+	}
+	for _, argv := range argvs {
+		n := min(2, len(argv))
+		if n > 0 {
+			add("Bash(" + strings.Join(argv[:n], " ") + ":*)")
+		}
+	}
+	for _, g := range []string{"git diff", "git log", "git blame", "git status"} {
+		add("Bash(" + g + ":*)")
+	}
+	return out
 }

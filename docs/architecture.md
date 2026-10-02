@@ -496,6 +496,7 @@ compare-and-swap of the original bytes.
 | `internal/attempt` | The durable attempt protocol and crash recovery (P2) |
 | `internal/procinfo` | Kernel process identity: start time, parent, process group |
 | `internal/holders` | Processes holding a directory tree, failing closed (P2) |
+| `internal/probe` | The live profile probe, its controls and the certificate runs require (P0a) |
 
 Message schemas and embedded prompts live next to the package that uses them and
 are embedded via `go:embed`. The engine starts at most one worker per role.
