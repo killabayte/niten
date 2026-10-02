@@ -101,7 +101,7 @@ paths:
 | Status | When |
 |---|---|
 | `unknown` | the sandboxed run failed (a holder outside the attempt's group, a scan error, an unavailable backend), or `Seal` failed |
-| `invalidated` | the check edited or removed the code under test, added a file to the source tree that is not a declared output, or group members outlived it |
+| `invalidated` | the check edited or removed the code under test, added a file to the source tree that is not a declared output, or group members outlived it (after a timeout, the members the coordinator's own kill stops are not counted) |
 | `failed` | timeout, wrong exit code or signal, truncated output, an unmet stdout expectation |
 | `passed` | none of the above |
 
