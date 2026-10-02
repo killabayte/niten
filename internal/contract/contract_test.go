@@ -26,6 +26,8 @@ func validateNamed(name string, data []byte) error {
 		return err
 	case MessageKind(name).Valid():
 		return ValidatePayload(MessageKind(name), data)
+	case slicesContains(documentNames, name):
+		return ValidateDocument(name, data)
 	default:
 		return ValidateRecord(name, data)
 	}
@@ -40,7 +42,7 @@ func TestSchemasCompileAndAreListed(t *testing.T) {
 	if !sort.StringsAreSorted(names) {
 		t.Fatalf("Schemas() not sorted: %v", names)
 	}
-	want := 1 + len(MessageKinds) + len(recordNames)
+	want := 1 + len(MessageKinds) + len(recordNames) + len(documentNames)
 	if len(names) != want {
 		t.Fatalf("Schemas() = %d names, want %d: %v", len(names), want, names)
 	}

@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"syscall"
@@ -184,7 +185,13 @@ func (c *Clone) TreeOf(ctx context.Context, commit string) (string, error) {
 // alternates. The index, logs and objects change through Niten's own commits
 // and are left out; a candidate is compared against the fingerprint taken
 // after the coordinator's last commit.
-func (c *Clone) MetadataFingerprint() (string, error) {
+func (c *Clone) MetadataFingerprint() (string, error) { return c.MetadataFingerprintExcept() }
+
+// MetadataFingerprintExcept is MetadataFingerprint without the named files of
+// the git directory (slash-separated, relative to it), whether they exist or
+// not. A recovery uses it to check that nothing changed but one ref its own
+// recorded plan expects.
+func (c *Clone) MetadataFingerprintExcept(skip ...string) (string, error) {
 	h := sha256.New()
 	var paths []string
 	for _, name := range []string{"HEAD", "config", "packed-refs", "shallow", "objects/info/alternates", "commondir"} {
@@ -201,6 +208,9 @@ func (c *Clone) MetadataFingerprint() (string, error) {
 	}
 	sort.Strings(paths)
 	for _, rel := range paths {
+		if slices.Contains(skip, rel) {
+			continue
+		}
 		p := filepath.Join(c.GitDir, filepath.FromSlash(rel))
 		fi, err := os.Lstat(p)
 		if errors.Is(err, fs.ErrNotExist) {
@@ -598,6 +608,18 @@ type Candidate struct {
 // inspection with a violation (there is no partial commit of the permitted
 // part), a snapshot equal to HEAD, and a HEAD that moved since the inspection.
 func (c *Clone) Commit(ctx context.Context, ins *Inspection, message string, at time.Time) (Candidate, error) {
+	cand, err := c.Prepare(ctx, ins, message, at)
+	if err != nil {
+		return Candidate{}, err
+	}
+	return cand, c.Advance(ctx, cand)
+}
+
+// Prepare writes the commit of an inspected snapshot without moving the
+// branch, with the refusals of Commit. Equal snapshot, parent, message and
+// time give the same commit, so a candidate prepared again after a crash is
+// the same candidate.
+func (c *Clone) Prepare(ctx context.Context, ins *Inspection, message string, at time.Time) (Candidate, error) {
 	if len(ins.Violations) > 0 {
 		return Candidate{}, fmt.Errorf("refusing to commit a candidate with %d hard policy violation(s): %s", len(ins.Violations), strings.Join(ins.Violations, "; "))
 	}
@@ -619,13 +641,61 @@ func (c *Clone) Commit(ctx context.Context, ins *Inspection, message string, at 
 	if err != nil {
 		return Candidate{}, err
 	}
-	if _, err := c.git(ctx, nil, "update-ref", "refs/heads/"+Branch, commit, head); err != nil {
-		return Candidate{}, err
-	}
-	if _, err := c.git(ctx, nil, "read-tree", commit); err != nil {
-		return Candidate{}, err
-	}
 	return Candidate{Commit: commit, Tree: ins.Tree, Parent: head}, nil
+}
+
+// Advance moves the branch from the candidate's parent to the candidate and
+// the index with it. It is a compare-and-swap on the parent, and a no-op when
+// the branch already points at the candidate.
+func (c *Clone) Advance(ctx context.Context, cand Candidate) error {
+	head, err := c.Head(ctx)
+	if err != nil {
+		return err
+	}
+	if head != cand.Commit {
+		if _, err := c.git(ctx, nil, "update-ref", "refs/heads/"+Branch, cand.Commit, cand.Parent); err != nil {
+			return err
+		}
+	}
+	_, err = c.git(ctx, nil, "read-tree", cand.Commit)
+	return err
+}
+
+// Paths lists every file path of a commit's tree.
+func (c *Clone) Paths(ctx context.Context, commit string) ([]string, error) {
+	if !gitSHA(commit) {
+		return nil, fmt.Errorf("paths need a full commit id, got %q", commit)
+	}
+	out, err := c.git(ctx, nil, "ls-tree", "-r", "-z", "--name-only", commit)
+	if err != nil {
+		return nil, err
+	}
+	var paths []string
+	for _, p := range strings.Split(string(out), "\x00") {
+		if p != "" {
+			paths = append(paths, p)
+		}
+	}
+	return paths, nil
+}
+
+// Subject returns the first line of a commit message.
+func (c *Clone) Subject(ctx context.Context, commit string) (string, error) {
+	out, err := c.git(ctx, nil, "log", "-1", "--format=%s", commit, "--")
+	return strings.TrimSpace(string(out)), err
+}
+
+// Parent returns the first parent of a commit, or "" for a root commit.
+func (c *Clone) Parent(ctx context.Context, commit string) (string, error) {
+	out, err := c.git(ctx, nil, "rev-list", "--parents", "-n", "1", commit)
+	if err != nil {
+		return "", err
+	}
+	f := strings.Fields(string(out))
+	if len(f) < 2 {
+		return "", nil
+	}
+	return f[1], nil
 }
 
 func (c *Clone) commitTree(ctx context.Context, tree, parent, message string, at time.Time) (string, error) {
@@ -636,20 +706,135 @@ func (c *Clone) commitTree(ctx context.Context, tree, parent, message string, at
 	return strings.TrimSpace(string(out)), err
 }
 
+// Compare classifies every change between two commits of the clone, the way
+// Inspect classifies a snapshot against HEAD. The engine uses it for a step's
+// cumulative diff, from the commit the step started at to its current candidate.
+func (c *Clone) Compare(ctx context.Context, from, to string, r Rules) (*Inspection, error) {
+	if !gitSHA(from) || !gitSHA(to) {
+		return nil, fmt.Errorf("compare needs full commit ids, got %q and %q", from, to)
+	}
+	tree, err := c.TreeOf(ctx, to)
+	if err != nil {
+		return nil, err
+	}
+	ins := &Inspection{Head: from, Tree: tree, Changes: []Change{}, Violations: []string{}, OffTarget: []string{}, InstructionChanges: []string{}, Ignored: []string{}}
+	raw, err := c.git(ctx, nil, "diff-tree", "-r", "--raw", "-z", "--no-renames", from, to)
+	if err != nil {
+		return nil, err
+	}
+	fields := strings.Split(string(raw), "\x00")
+	for i := 0; i+1 < len(fields); i += 2 {
+		meta := strings.Fields(strings.TrimPrefix(fields[i], ":"))
+		if len(meta) != 5 {
+			return nil, fmt.Errorf("unexpected diff-tree record %q", fields[i])
+		}
+		ch := Change{Path: fields[i+1], OldMode: meta[0], NewMode: meta[1], Status: meta[4]}
+		if ch.NewMode == "120000" {
+			b, err := c.git(ctx, nil, "cat-file", "blob", meta[3])
+			if err != nil {
+				return nil, err
+			}
+			ch.SymlinkTarget = string(b)
+		}
+		ins.Changes = append(ins.Changes, ch)
+		c.classify(ch, r, ins)
+	}
+	sort.Strings(ins.OffTarget)
+	return ins, nil
+}
+
+// Diff returns the unified diff between two commits of the clone. Attributes
+// are read from the empty tree, and external diff programs and text conversion
+// are off, so a candidate's .gitattributes can neither run a program nor mark
+// a text file binary to hide its content from the review packet.
+func (c *Clone) Diff(ctx context.Context, from, to string) ([]byte, error) {
+	if !gitSHA(from) || !gitSHA(to) {
+		return nil, fmt.Errorf("diff needs full commit ids, got %q and %q", from, to)
+	}
+	empty, err := c.git(ctx, nil, "hash-object", "-t", "tree", "--stdin")
+	if err != nil {
+		return nil, err
+	}
+	return c.git(ctx, nil, "--attr-source="+strings.TrimSpace(string(empty)), "diff", "--no-color", "--no-ext-diff", "--no-textconv",
+		"--no-renames", "--full-index", from, to, "--")
+}
+
+// FileAt returns the content of path in commit, or ok=false when the commit
+// has no regular file there.
+func (c *Clone) FileAt(ctx context.Context, commit, path string) (data []byte, ok bool, err error) {
+	if !gitSHA(commit) {
+		return nil, false, fmt.Errorf("file lookup needs a full commit id, got %q", commit)
+	}
+	out, err := c.git(ctx, nil, "ls-tree", "-z", commit, "--", path)
+	if err != nil {
+		return nil, false, err
+	}
+	rec := strings.TrimSuffix(string(out), "\x00")
+	meta, name, found := strings.Cut(rec, "\t")
+	f := strings.Fields(meta)
+	if !found || name != path || len(f) != 3 || f[1] != "blob" || (f[0] != "100644" && f[0] != "100755") {
+		return nil, false, nil
+	}
+	blobs, err := c.readBlobs(ctx, []string{f[2]})
+	if err != nil {
+		return nil, false, err
+	}
+	return blobs[f[2]], true, nil
+}
+
 // SaveRejected keeps a rejected snapshot for analysis under
 // refs/niten/rejected/<name> without moving HEAD or touching the worktree.
+// The ref is never moved: saving an equal snapshot under the same name again
+// succeeds, a different one fails.
 func (c *Clone) SaveRejected(ctx context.Context, ins *Inspection, name string, at time.Time) (string, error) {
-	if name == "" || strings.ContainsAny(name, "/ \t\n:~^?*[\\") {
-		return "", fmt.Errorf("invalid rejected snapshot name %q", name)
-	}
-	commit, err := c.commitTree(ctx, ins.Tree, ins.Head, "niten: rejected snapshot "+name, at)
+	commit, err := c.Snapshot(ctx, ins, name, at)
 	if err != nil {
 		return "", err
 	}
-	if _, err := c.git(ctx, nil, "update-ref", "refs/niten/rejected/"+name, commit, strings.Repeat("0", 40)); err != nil {
-		return "", err
+	return commit, c.KeepRejected(ctx, name, commit)
+}
+
+// Snapshot writes the commit of an inspected snapshot for a rejected result
+// without any ref: equal inputs give the same commit. KeepRejected then makes
+// it reachable, so the commit can be recorded before anything changes.
+func (c *Clone) Snapshot(ctx context.Context, ins *Inspection, name string, at time.Time) (string, error) {
+	if !validRejectedName(name) {
+		return "", fmt.Errorf("invalid rejected snapshot name %q", name)
 	}
-	return commit, nil
+	if ins.Tree == "" || ins.Head == "" {
+		return "", errors.New("the inspection has no snapshot")
+	}
+	return c.commitTree(ctx, ins.Tree, ins.Head, "niten: rejected snapshot "+name, at)
+}
+
+// KeepRejected points refs/niten/rejected/<name> at commit. It is a
+// compare-and-swap on the ref's absence and a no-op when the ref already
+// points at commit; it never moves an existing ref.
+func (c *Clone) KeepRejected(ctx context.Context, name, commit string) error {
+	if !validRejectedName(name) || !gitSHA(commit) {
+		return fmt.Errorf("invalid rejected snapshot %q at %q", name, commit)
+	}
+	ref := "refs/niten/rejected/" + name
+	if _, err := c.git(ctx, nil, "update-ref", ref, commit, strings.Repeat("0", 40)); err != nil {
+		if cur, rerr := c.Rejected(ctx, name); rerr == nil && cur == commit {
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
+// Rejected returns the commit refs/niten/rejected/<name> points at, or "".
+func (c *Clone) Rejected(ctx context.Context, name string) (string, error) {
+	if !validRejectedName(name) {
+		return "", fmt.Errorf("invalid rejected snapshot name %q", name)
+	}
+	out, err := c.git(ctx, nil, "for-each-ref", "--format=%(objectname)", "refs/niten/rejected/"+name)
+	return strings.TrimSpace(string(out)), err
+}
+
+func validRejectedName(name string) bool {
+	return name != "" && !strings.ContainsAny(name, "/ \t\n:~^?*[\\")
 }
 
 // Restore makes the worktree exactly HEAD again: tracked files are reset and

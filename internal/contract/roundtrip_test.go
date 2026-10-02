@@ -22,6 +22,9 @@ func TestRoundTrip(t *testing.T) {
 		RecordAttestation:          &Attestation{},
 		RecordStepGate:             &StepContinue{},
 		RecordHandoff:              &HandoffRecord{},
+		DocExecutorTurn:            &ExecutorTurn{},
+		DocReviewerTurn:            &ReviewerTurn{},
+		DocAnswers:                 &Answers{},
 	}
 	for _, name := range Schemas() {
 		ptr, ok := targets[name]

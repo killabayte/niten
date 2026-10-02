@@ -24,8 +24,8 @@
  "started_at": "2026-09-30T12:00:00Z",
  "finished_at": "2026-09-30T12:00:41Z",
  "exit_code": 0,
- "stdout_ref": "checks/go-test/stdout",
- "stderr_ref": "checks/go-test/stderr",
+ "stdout_ref": "checks/go-test/stdout", "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+ "stderr_ref": "checks/go-test/stderr", "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
  "assertions": [
   {
    "name": "required output",

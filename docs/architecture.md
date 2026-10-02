@@ -495,6 +495,7 @@ compare-and-swap of the original bytes.
 | `internal/pathglob` | `**` path patterns for protected and instruction paths |
 | `internal/attempt` | The durable attempt protocol and crash recovery (P2) |
 | `internal/procinfo` | Kernel process identity: start time, parent, process group |
+| `internal/holders` | Processes holding a directory tree, failing closed (P2) |
 
 Message schemas and embedded prompts live next to the package that uses them and
 are embedded via `go:embed`. The engine starts at most one worker per role.

@@ -1,9 +1,10 @@
 // Command niten executes approved Shogun plans with an executor model and an
 // independent reviewer model. This build implements the P0a deliverables
 // (version/help, the offline doctor, the domain contracts and the verifier
-// sandbox backend) and the P1 import: `niten prepare`. Commands that belong to
-// later stages are present so that the interface is visible, and refuse to run
-// until they are implemented.
+// sandbox backend), the P1 import `niten prepare`, and the P3 sequential
+// engine: `niten run`, `niten status` and `niten resume`. Commands that belong
+// to later stages are present so that the interface is visible, and refuse to
+// run until they are implemented.
 package main
 
 import (
@@ -27,7 +28,7 @@ var version = "0.0.0-dev"
 
 // plannedStage names the roadmap stage that delivers each unimplemented command.
 var plannedStage = map[string]string{
-	"run": "P3", "status": "P3", "resume": "P3", "verify": "P5", "export": "P5",
+	"verify": "P5", "export": "P5",
 }
 
 func main() { os.Exit(int(run(os.Args[1:], os.Stdout, os.Stderr))) }
@@ -48,6 +49,12 @@ func run(args []string, stdout, stderr io.Writer) contract.ExitCode {
 		return doctor(args[1:], stdout, stderr)
 	case "prepare":
 		return prepareCmd(args[1:], stdout, stderr)
+	case "run":
+		return runCmd(args[1:], stdout, stderr)
+	case "resume":
+		return resumeCmd(args[1:], stdout, stderr)
+	case "status":
+		return statusCmd(args[1:], stdout, stderr)
 	default:
 		if stage, ok := plannedStage[cmd]; ok {
 			fmt.Fprintf(stderr, "niten %s: not implemented in this build; planned for roadmap stage %s (docs/roadmap.md)\n", cmd, stage)
@@ -64,12 +71,15 @@ func usage(w io.Writer) {
 
 Commands available in this build:
   prepare PLAN.md    import an approved Shogun plan into a prepared run (no model is called)
+  run RUN_ID         execute a prepared run: executor, coordinator checks, independent review
+  resume RUN_ID      continue a paused or waiting run; --answers, --max-invocations, --max-time
+  status RUN_ID      print the run's state (no lock, no model)
   version            print the build version
   doctor             check the local environment without calling any model
   help               show this text
 
 Commands defined by the design and not implemented yet (exit 2):
-  run, status, resume, verify, export
+  verify, export
 
 Exit codes: 0 ok, 1 rejected result or failed gate, 2 format/configuration/protocol
 error, 3 needs input, 4 paused, 5 implemented with pending external criteria, 130 SIGINT.

@@ -4,7 +4,7 @@ Status: implemented offline, 2026-10-01. This records what the P2 packages do, s
 [architecture](architecture.md) and the code stay aligned. Nothing here calls a model:
 the adapters are exercised with fake CLIs, and `niten doctor --live` stays refused until
 the live probes are separately authorized. The engine that drives these pieces (`run`,
-`status`, `resume`) is P3.
+`status`, `resume`) is P3, see [engine](engine.md).
 
 ## Packages
 
@@ -156,7 +156,7 @@ configured `strip_env` names, and returns only the removed names for the record.
 One attempt writes, in order: the prompt artifact; `attempt.intent` (role, argv and its
 digest, prompt digest, environment names, removed names, stream paths); the stream files
 and the process; `attempt.started` with the identity, before waiting; the outcome and
-result artifacts; `attempt.finished` with both digests. A store failure before the start
+result artifacts; `attempt.finished` with both digests and the digests of the two stream files. A store failure before the start
 means the model is never started.
 
 `Recover` resolves every attempt of the replayed journal and records its answer, so it
@@ -170,7 +170,7 @@ is not repeated; an interrupted recovery reuses its own identical artifact:
 | started, no outcome, recorded process alive with its recorded start time | the group is stopped, then as below |
 | started, members of a dead leader's group remain | `outcome_unknown`, processes reported, never signalled; the run is blocked |
 | started or intent, the attempt's directory is held by any process, or the holders cannot be listed | `outcome_unknown`, blocked until nothing holds it |
-| started, no outcome, nothing holds the directory, complete result in the saved stream | `recovered` without a new model call; the result notes that the exit status is unknown |
+| started, no outcome, nothing holds the directory, complete result in the saved stream | `recovered` without a new model call; the result notes that the exit status is unknown, and the event records the digests of the result and both streams |
 | started, no outcome, incomplete or empty stream | `outcome_unknown` |
 | intent only, stream files exist | `outcome_unknown`: the prompt is delivered only after `attempt.started`, so the stream is never a result |
 | intent only, stream files never created | `not_started` |

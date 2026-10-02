@@ -1,0 +1,152 @@
+{
+ "reviewed_commit": "0123456789abcdef0123456789abcdef01234567",
+ "review": {
+  "verdict": "revise",
+  "coverage": {
+   "criterion_ids_checked": [
+    "R-001.C1",
+    "R-001.C2"
+   ],
+   "paths_reviewed": [
+    "main.go",
+    "main_test.go",
+    "go.sum"
+   ],
+   "off_target_dispositions": [
+    {
+     "path": "go.sum",
+     "disposition": "accept",
+     "reason": "required by the added dependency"
+    }
+   ]
+  },
+  "finding_dispositions": [
+   {
+    "finding_id": "F-001",
+    "state": "open"
+   }
+  ],
+  "summary": "One major defect in argument handling; otherwise the step matches the plan."
+ },
+ "findings": [
+  {
+   "finding_id": "F-001",
+   "severity": "major",
+   "criterion_ids": [
+    "R-001.C1"
+   ],
+   "location": {
+    "path": "main.go",
+    "line_start": 12,
+    "line_end": 18
+   },
+   "defect_scenario": "Running with --version and an extra argument prints the version and continues instead of exiting.",
+   "expected_fix": "Return after printing the version regardless of remaining arguments.",
+   "evidence_refs": [
+    "reviews/r1/repro.txt"
+   ]
+  }
+ ],
+ "check_requests": [
+  {
+   "proposal": {
+    "id": "go-vet",
+    "method": "command",
+    "argv": [
+     "go",
+     "vet",
+     "./..."
+    ],
+    "cwd": ".",
+    "timeout": "5m",
+    "expected": {
+     "exit_code": 0
+    },
+    "criterion_ids": [
+     "R-001.C1"
+    ],
+    "verification_ids": [
+     "S-001/V-001"
+    ]
+   },
+   "reason": "The diff adds a printf with a mismatched verb count.",
+   "criterion_ids": [
+    "R-001.C1"
+   ]
+  }
+ ],
+ "test_assessments": [
+  {
+   "path": "main_test.go",
+   "assessment": "preserves",
+   "reason": "only a new case was added"
+  }
+ ],
+ "questions": [],
+ "candidate": {
+  "steps": [
+   "S-001"
+  ],
+  "description": "Add the --version flag and its test.",
+  "changed_paths_claimed": [
+   "main.go",
+   "main_test.go",
+   "go.sum"
+  ],
+  "off_target_justifications": [
+   {
+    "path": "go.sum",
+    "reason": "checksum for the test dependency added by S-001"
+   }
+  ],
+  "proposed_checks": [
+   {
+    "id": "go-test",
+    "method": "test",
+    "argv": [
+     "go",
+     "test",
+     "./..."
+    ],
+    "cwd": ".",
+    "timeout": "10m",
+    "expected": {
+     "exit_code": 0
+    },
+    "criterion_ids": [
+     "R-001.C1"
+    ],
+    "verification_ids": [
+     "S-001/V-001"
+    ]
+   },
+   {
+    "id": "review-flag-doc",
+    "method": "inspect",
+    "expected": {},
+    "criterion_ids": [
+     "R-001.C2"
+    ],
+    "verification_ids": [
+     "S-001/V-002"
+    ]
+   }
+  ],
+  "questions": [],
+  "handoff": {
+   "implementation_notes": [
+    "version string comes from the RELEASE file at build time"
+   ],
+   "remaining_work": [],
+   "risks": [
+    "RELEASE file missing in CI would print unknown"
+   ],
+   "decision_refs": [
+    "D-001"
+   ],
+   "evidence_refs": [
+    "checks/go-test"
+   ]
+  }
+ }
+}

@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "reviewer_turn.schema.json",
+  "type": "object", "additionalProperties": false,
+  "required": ["reviewed_commit", "review", "findings", "check_requests", "test_assessments", "questions"],
+  "properties": {
+    "reviewed_commit": {"$ref": "common.schema.json#/$defs/sha"},
+    "review": {"$ref": "review_result.schema.json"},
+    "findings": {"type": "array", "items": {"$ref": "finding.schema.json"}},
+    "check_requests": {"type": "array", "items": {"$ref": "check_request.schema.json"}},
+    "test_assessments": {
+      "type": "array",
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["path", "assessment", "reason"],
+        "properties": {
+          "path": {"$ref": "common.schema.json#/$defs/nonempty"},
+          "assessment": {"type": "string", "enum": ["preserves", "weakens"]},
+          "reason": {"$ref": "common.schema.json#/$defs/nonempty"}
+        }
+      }
+    },
+    "questions": {"type": "array", "items": {"$ref": "question.schema.json"}}
+  }
+}

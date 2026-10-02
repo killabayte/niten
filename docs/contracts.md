@@ -23,9 +23,13 @@ the choice is recorded here so the documents and the code stay aligned.
 | `attestation` | user, stored by coordinator | Human evidence for a pre-assigned criterion at an exact candidate SHA |
 | `step_continue` | user | The `--gate-per-step` answer bound to gate, run, digests, step and SHA |
 | `handoff_record` | coordinator | The executor handoff with `attempt_id` and `verified=false` |
+| `executor_turn` | executor | One executor invocation's output: `candidate`, `responses`, blocking `questions` |
+| `reviewer_turn` | reviewer | One reviewer invocation's output: `reviewed_commit`, `review`, `findings`, `check_requests`, `test_assessments`, `questions` |
+| `answers` | user | The `resume --answers` file: `step_continue`, attestation inputs, question answers |
 | `common` | shared `$defs` | IDs, SHAs, digests, timestamps, refs |
 
 The API is `ValidateEnvelope`, `ValidatePayload(kind, …)`, `ValidateRecord(name, …)`,
+`ValidateDocument(name, …)`,
 `ValidateValue(name, v)`, `Schemas()` and `Raw(name)`. Validation errors carry JSON
 pointers to the failing fields. Enumerations for roles, message kinds, run and step
 states, exit codes, execution owners, verification methods, severities, verdicts and
@@ -55,15 +59,24 @@ architecture: 0, 1, 2, 3, 4, 5 and 130.
 - Finding IDs match `F-NNN`; a location is `{path, line_start?, line_end?}`.
 - Off-target vocabulary is split: the reviewer's verdict is `accept` or `reject`,
   the coordinator's disposition is `pending`, `accepted` or `rejected`.
-- `check_evidence` nests its key under `key{…}`; `finished_at` and `exit_code` are
+- `check_evidence` binds its streams by digest, `stdout_sha256` and `stderr_sha256` next
+  to the refs (P3 review finding, fixed 2026-10-01), and nests its key under `key{…}`; `finished_at` and `exit_code` are
   nullable; `status: passed` requires `sources_unchanged: true`, an integer exit
   code, a non-null `finished_at` and every assertion with `passed: true`. A record
   that claims `passed` while one assertion failed is rejected at validation
   (review finding, fixed 2026-09-30).
 - `attestation` is the stored record: the coordinator fields `submitted_at` and
-  `source: "resume_answers"` are required. A separate user-input schema does not
-  exist yet and can be derived when `resume --answers` is implemented.
+  `source: "resume_answers"` are required.
 - All records carry `schema_version: 1`.
+- A CLI invocation returns one structured document, a turn: `executor_turn` or
+  `reviewer_turn` (P3). A turn is a transport container; the coordinator splits it into
+  envelopes of the message kinds it references, and sets every envelope field.
+  `reviewed_commit` is the reviewer's claim of what it reviewed, checked against the
+  candidate the attempt was bound to. `test_assessments` (`preserves` or `weakens`) answer
+  the test changes the coordinator flags. `Bundle` inlines whole-file references
+  (`schema_<name>` in `$defs`) so a turn schema is self-contained for the CLIs.
+- The user-input attestation is `answers.attestations[]`: the stored record without
+  `submitted_at` and `source`, which the coordinator adds.
 
 ## Dependencies
 
