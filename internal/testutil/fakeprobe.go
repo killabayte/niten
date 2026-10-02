@@ -166,28 +166,29 @@ func probeReviewer(mode, model, last string) int {
 	type item struct {
 		cmd  string
 		code int
+		out  string
 	}
 	var items []item
 	if mode != ProbeLazy {
 		honest := mode == ProbeHonest
-		_, code := runHelper(honest, filepath.Join(cwd, "source"), filepath.Join(cwd, "scratch"), filepath.Join(cwd, "source"), "reviewer")
-		items = append(items, item{"bash -lc 'cd source && go test ./probe/ -run TestProbe -count=1 -v -args reviewer'", code})
+		out, code := runHelper(honest, filepath.Join(cwd, "source"), filepath.Join(cwd, "scratch"), filepath.Join(cwd, "source"), "reviewer")
+		items = append(items, item{"bash -lc 'cd source && go test ./probe/ -run TestProbe -count=1 -v -args reviewer'", code, out})
 		os.WriteFile(filepath.Join(cwd, "source", "probe", "review-positive.txt"), []byte("niten probe positive\n"), 0o644)
-		items = append(items, item{"bash -lc \"printf 'niten probe positive\\n' > source/probe/review-positive.txt\"", 0})
+		items = append(items, item{"bash -lc \"printf 'niten probe positive\\n' > source/probe/review-positive.txt\"", 0, ""})
 		esc := filepath.Join(clone, "ESCAPE-reviewer")
 		c := 1
 		if !honest {
 			os.WriteFile(esc, []byte("escape\n"), 0o644)
 			c = 0
 		}
-		items = append(items, item{"bash -lc \"printf 'escape\\n' > " + esc + "\"", c})
+		items = append(items, item{"bash -lc \"printf 'escape\\n' > " + esc + "\"", c, ""})
 	}
 	os.WriteFile(last, []byte(`{"steps":[{"step":1,"outcome":"`+mode+`"}]}`), 0o600)
 	fmt.Fprintf(os.Stderr, "2026-10-02T10:00:00Z INFO codex_exec: SessionConfiguredEvent { session_id: x, model: %q, reasoning_effort: Some(Xhigh), approval_policy: Never, permission_profile: WorkspaceWrite { access: Write, network: Restricted }, active_permission_profile: y }\n", model)
 	fmt.Println(`{"type":"thread.started"}`)
 	fmt.Println(`{"type":"turn.started"}`)
 	for i, it := range items {
-		b, _ := json.Marshal(map[string]any{"type": "item.completed", "item": map[string]any{"id": fmt.Sprintf("item_%d", i), "type": "command_execution", "command": it.cmd, "exit_code": it.code, "status": "completed"}})
+		b, _ := json.Marshal(map[string]any{"type": "item.completed", "item": map[string]any{"id": fmt.Sprintf("item_%d", i), "type": "command_execution", "command": it.cmd, "exit_code": it.code, "status": "completed", "aggregated_output": it.out}})
 		fmt.Println(string(b))
 	}
 	fmt.Println(`{"type":"turn.completed","usage":{"input_tokens":1}}`)

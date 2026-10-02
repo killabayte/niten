@@ -46,7 +46,9 @@ the live probes are separately authorized. The engine that drives these pieces (
   worktree. Every later command runs with an explicit git dir and work tree,
   `--no-replace-objects`, `--no-lazy-fetch` and hooks disabled, and with the user's
   global and system configuration, system attributes and the user's attribute and
-  exclude files ignored. The only configuration is the clone's own, so attributes a
+  exclude files ignored. Background git writes (gc, maintenance, commit-graph,
+  reverse indexes) are disabled, so the metadata fingerprint changes only from the
+  coordinator's own commits. The only configuration is the clone's own, so attributes a
   candidate writes can name no filter, diff or merge program that git would run.
 - `Inspect` snapshots the whole worktree through a private index in the git directory
   (the real index is not touched) and classifies every change against HEAD. Hard

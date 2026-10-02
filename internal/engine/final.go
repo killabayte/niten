@@ -197,11 +197,18 @@ func (e *Engine) finish(ctx context.Context) (*Outcome, error) {
 	}
 	if e.clone != nil {
 		h, err := e.clone.Head(ctx)
-		gate(err == nil && h == head, "the clone's branch is not at the head candidate")
+		gate(err == nil && h == head, "the clone's branch is not at the head candidate (%s)", h)
 		tree, err := e.clone.TreeOf(ctx, head)
 		gate(err == nil && f.Candidate != nil && tree == f.Candidate.Tree, "the head tree differs from the checked one")
 		ins, err := e.clone.Inspect(ctx, e.rules(f))
-		gate(err == nil && len(ins.Changes) == 0 && len(ins.Violations) == 0, "the worktree differs from the head candidate")
+		switch {
+		case err != nil:
+			gate(false, "the worktree could not be inspected: %v", err)
+		case len(ins.Violations) > 0:
+			gate(false, "the worktree has policy violations: %s", strings.Join(ins.Violations, "; "))
+		default:
+			gate(len(ins.Changes) == 0, "the worktree differs from the head candidate: %s", strings.Join(ins.Paths(), ", "))
+		}
 	}
 	for _, c := range sessionCertificates(e.events) {
 		if c.Skipped {

@@ -11,6 +11,7 @@ package probe
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -42,6 +43,33 @@ type World struct {
 	listener   net.Listener
 	conns      atomic.Int64
 	wg         sync.WaitGroup
+	guards     map[string]guard // helper files -> their state when the host wrote them
+}
+
+// guard is a file's content digest and inode change time: the host records it
+// for the helper files, and any later change (content or a metadata-only
+// touch) is detected even if the content is restored.
+type guard struct {
+	digest string
+	ctime  int64
+	ino    uint64
+}
+
+func guardOf(p string) (guard, error) {
+	fi, err := os.Lstat(p)
+	if err != nil {
+		return guard{}, err
+	}
+	if !fi.Mode().IsRegular() {
+		return guard{}, fmt.Errorf("%s is not a regular file", p)
+	}
+	b, err := os.ReadFile(p)
+	if err != nil {
+		return guard{}, err
+	}
+	ct, ino := changeTime(fi)
+	sum := sha256.Sum256(b)
+	return guard{digest: hex.EncodeToString(sum[:]), ctime: ct, ino: ino}, nil
 }
 
 // Target is one write the helper attempts from inside a model's sandbox.
@@ -144,6 +172,18 @@ func Build(ctx context.Context, root string) (*World, error) {
 	}
 	// The original's own canary is committed content: it must not change.
 	w.Canaries[filepath.Join(w.Original, "CANARY")] = w.Token + " original\n"
+	// The helper and its targets are the proving instrument: record their
+	// state as the host wrote them, so a session editing its own tree is seen.
+	w.guards = map[string]guard{}
+	for _, role := range []string{"executor", "reviewer"} {
+		for _, p := range w.helperFiles(role) {
+			g, err := guardOf(p)
+			if err != nil {
+				return nil, err
+			}
+			w.guards[p] = g
+		}
+	}
 	return w, nil
 }
 
@@ -185,6 +225,26 @@ func (w *World) Close() {
 
 // Addr is the listener the helper tries to reach.
 func (w *World) Addr() string { return w.listener.Addr().String() }
+
+// helperFiles are the helper and its targets in a role's tree: the host
+// guards them, because the session under test can edit its own tree.
+func (w *World) helperFiles(role string) []string {
+	base := w.CloneWork
+	if role == "reviewer" {
+		base = filepath.Join(w.Launcher, "source")
+	}
+	return []string{filepath.Join(base, "probe", "probe_test.go"), filepath.Join(base, "probe", "targets.json")}
+}
+
+// expectedLines are the lines a complete run of the role's unmodified helper
+// prints, one per attempt, plus the test's pass line.
+func (w *World) expectedLines(role string) []string {
+	var out []string
+	for _, t := range w.targets().Roles[role].Writes {
+		out = append(out, "attempt "+t.Name+" "+t.Path+":")
+	}
+	return append(out, "attempt connect "+w.Addr()+":", "--- PASS: TestProbe")
+}
 
 // SharedTmp is the shared temporary file the helper tries to create.
 func (w *World) SharedTmp() string { return filepath.Join("/private/tmp", "niten-probe-"+w.Token) }
@@ -339,7 +399,8 @@ func TestProbe(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, a := range out {
-		t.Logf("%s %s: %s", a.Name, a.Path, a.Error)
+		t.Logf("attempt %s %s: %s", a.Name, a.Path, a.Error)
 	}
+	t.Logf("attempt connect %s: %s", ts.Connect, errString(err))
 }
 `

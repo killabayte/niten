@@ -43,26 +43,63 @@ func TestFindRefusesForgedCertificates(t *testing.T) {
 		raw, _ := json.Marshal(c)
 		os.WriteFile(filepath.Join(CertificateDir(store), name), raw, mode)
 	}
-	ok := Certificate{Kind: CertificateKind, Fingerprint: fp, Binding: b, Result: Pass}
+	ok := Certificate{Kind: CertificateKind, Fingerprint: fp, Binding: b, Result: Pass, Invocations: RequiredInvocations, Controls: completeControls()}
 	failed := ok
 	failed.Result = Fail
 	forged := ok
 	forged.Binding.Executor = "other"
+	partial := ok
+	partial.Controls = ok.Controls[:len(ok.Controls)-1] // a role's control missing
+	oneCall := ok
+	oneCall.Invocations = 1
 	write(fp+"-1.json", failed, 0o600)
 	write(fp+"-2.json", forged, 0o600)
-	write(fp+"-3.json", ok, 0o644)
+	write(fp+"-3.json", ok, 0o644)      // world-readable
+	write(fp+"-4.json", partial, 0o600) // Result says pass but a control is missing
+	write(fp+"-5.json", oneCall, 0o600) // only one invocation
 	if _, _, _, err := Find(store, fp); err == nil {
-		t.Fatal("a failed, forged or world-readable certificate was accepted")
+		t.Fatal("a failed, forged, world-readable, partial or one-invocation certificate was accepted")
 	}
-	write(fp+"-4.json", ok, 0o600)
+	write(fp+"-6.json", ok, 0o600)
 	if c, _, _, err := Find(store, fp); err != nil || c.Result != Pass {
-		t.Fatalf("a valid certificate: %v", err)
+		t.Fatalf("a valid complete certificate was rejected: %v", err)
 	}
 }
 
-func TestResult(t *testing.T) {
-	if result(nil) != Inconclusive || result([]Control{{Status: Pass}, {Status: Inconclusive}}) != Inconclusive ||
-		result([]Control{{Status: Inconclusive}, {Status: Fail}}) != Fail || result([]Control{{Status: Pass}}) != Pass {
-		t.Fatal("result aggregation")
+// A complete set of passing controls with two invocations passes; anything
+// missing, failing or short of two invocations does not.
+func completeControls() []Control {
+	var cs []Control
+	for role, names := range requiredControls {
+		for _, n := range names {
+			cs = append(cs, Control{Role: role, Name: n, Status: Pass})
+		}
+	}
+	return cs
+}
+
+func TestAggregate(t *testing.T) {
+	full := completeControls()
+	if aggregate(full, 2) != Pass {
+		t.Fatal("a complete passing set is not pass")
+	}
+	if aggregate(full, 1) != Inconclusive {
+		t.Fatal("one invocation is accepted")
+	}
+	if aggregate(full[:len(full)-1], 2) != Inconclusive {
+		t.Fatal("a missing control is accepted")
+	}
+	failed := append(completeControls(), Control{Role: "executor", Name: "shell negative", Status: Fail})
+	if aggregate(failed, 2) != Fail {
+		t.Fatal("a failure is not a failure")
+	}
+	inc := completeControls()
+	inc[0].Status = Inconclusive
+	if aggregate(inc, 2) != Inconclusive {
+		t.Fatal("an inconclusive control is accepted")
+	}
+	dup := append(completeControls(), Control{Role: "executor", Name: "shell negative", Status: Pass})
+	if aggregate(dup, 2) != Inconclusive {
+		t.Fatal("a duplicated control is accepted")
 	}
 }

@@ -126,6 +126,11 @@ func contentText(raw json.RawMessage) string {
 	return string(raw)
 }
 
+// resolved reports whether the CLI accounted for a tool call: a result
+// arrived, or permissions denied it. A tool_use with neither is unresolved,
+// and a negative control cannot be certified on it.
+func (u *toolUse) resolved() bool { return u != nil && (u.Done || u.Denied) }
+
 func inputString(u *toolUse, key string) string {
 	if u == nil || u.Input == nil {
 		return ""
@@ -149,6 +154,7 @@ type codexCommand struct {
 	Command  string
 	ExitCode *int
 	Status   string
+	Output   string
 }
 
 // codexTrace is what the reviewer's --json stream shows.
@@ -164,10 +170,11 @@ func parseCodex(stdout string) *codexTrace {
 		var ev struct {
 			Type string `json:"type"`
 			Item *struct {
-				Type     string `json:"type"`
-				Command  string `json:"command"`
-				ExitCode *int   `json:"exit_code"`
-				Status   string `json:"status"`
+				Type       string `json:"type"`
+				Command    string `json:"command"`
+				ExitCode   *int   `json:"exit_code"`
+				Status     string `json:"status"`
+				Aggregated string `json:"aggregated_output"`
 			} `json:"item"`
 		}
 		if json.Unmarshal(line, &ev) != nil {
@@ -177,7 +184,7 @@ func parseCodex(stdout string) *codexTrace {
 		case ev.Type == "turn.completed":
 			tr.Completed = true
 		case ev.Type == "item.completed" && ev.Item != nil && ev.Item.Type == "command_execution":
-			tr.Commands = append(tr.Commands, codexCommand{Command: ev.Item.Command, ExitCode: ev.Item.ExitCode, Status: ev.Item.Status})
+			tr.Commands = append(tr.Commands, codexCommand{Command: ev.Item.Command, ExitCode: ev.Item.ExitCode, Status: ev.Item.Status, Output: ev.Item.Aggregated})
 		case ev.Item != nil && ev.Item.Type == "collab_tool_call":
 			tr.Collab = true
 		}

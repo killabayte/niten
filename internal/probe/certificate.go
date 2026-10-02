@@ -207,10 +207,16 @@ type Certificate struct {
 	CreatedAt     string    `json:"created_at"`
 }
 
-// result is pass only when every control passed.
-func result(cs []Control) Status {
+// aggregate is the certificate result: pass only when both roles' full
+// required control sets are present and every one passed, with the two
+// invocations made. Any failure is a failure; anything missing, inconclusive
+// or an incomplete invocation count is inconclusive, never a pass. A partial
+// output from a cancellation between the roles is therefore not a pass.
+func aggregate(cs []Control, invocations int) Status {
+	present := map[string]bool{}
 	st := Pass
 	for _, c := range cs {
+		present[c.Role+"/"+c.Name] = true
 		switch c.Status {
 		case Fail:
 			return Fail
@@ -218,10 +224,29 @@ func result(cs []Control) Status {
 			st = Inconclusive
 		}
 	}
-	if len(cs) == 0 {
-		return Inconclusive
+	for role, names := range requiredControls {
+		for _, n := range names {
+			if !present[role+"/"+n] {
+				st = Inconclusive
+			}
+		}
+	}
+	// No control may appear twice, and none outside the required set.
+	if len(present) != countRequired() || len(cs) != len(present) {
+		st = Inconclusive
+	}
+	if invocations < RequiredInvocations {
+		st = Inconclusive
 	}
 	return st
+}
+
+func countRequired() int {
+	n := 0
+	for _, names := range requiredControls {
+		n += len(names)
+	}
+	return n
 }
 
 // CertificateDir is <store>/certificates.
@@ -282,7 +307,9 @@ func Find(storeRoot, fingerprint string) (*Certificate, string, string, error) {
 		if json.Unmarshal(raw, &c) != nil || c.Kind != CertificateKind || c.Fingerprint != fingerprint || c.Binding.Fingerprint() != fingerprint {
 			continue
 		}
-		if c.Result == Pass {
+		// The stored Result is not trusted: it is recomputed from the controls
+		// and the invocation count, and both must say pass.
+		if c.Result == Pass && aggregate(c.Controls, c.Invocations) == Pass {
 			return &c, p, digest(raw), nil
 		}
 	}

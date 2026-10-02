@@ -151,7 +151,13 @@ func isolatedEnv(extra ...string) []string {
 
 // isolatedFlags precede every git command on the clone.
 var isolatedFlags = []string{"--no-replace-objects", "--no-lazy-fetch", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
-	"-c", "core.attributesFile=" + os.DevNull, "-c", "core.excludesFile=" + os.DevNull}
+	"-c", "core.attributesFile=" + os.DevNull, "-c", "core.excludesFile=" + os.DevNull,
+	// No background writes to the git directory. The metadata fingerprint is
+	// sensitive to any file under it, so a commit-graph, a repacked ref or a
+	// maintenance run between a recorded fingerprint and a later check would
+	// read as tampering. gc.auto is also set in the persisted config.
+	"-c", "gc.auto=0", "-c", "maintenance.auto=false", "-c", "core.commitGraph=false",
+	"-c", "fetch.writeCommitGraph=false", "-c", "gc.writeCommitGraph=false", "-c", "pack.writeReverseIndex=false"}
 
 // git runs a git command on the clone with the hardened, isolated environment plus env.
 func (c *Clone) git(ctx context.Context, env []string, args ...string) ([]byte, error) {
