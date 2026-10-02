@@ -27,7 +27,9 @@ type denyWatch struct {
 	done     chan struct{}
 }
 
-const sentinelWait = 20 * time.Second
+// sentinelWait bounds the wait for a sentinel; under load the stream can take
+// seconds to attach and to deliver.
+const sentinelWait = 60 * time.Second
 
 func startDenyWatch(ctx context.Context, dir, name string) (*denyWatch, error) {
 	sentinel := filepath.Join(dir, "sentinel-"+name)
@@ -72,28 +74,43 @@ func startDenyWatch(ctx context.Context, dir, name string) (*denyWatch, error) {
 }
 
 // mark causes a denial of a sentinel path under a minimal profile and waits
-// until the stream delivers it.
+// until the stream delivers it. A stream that has not attached yet misses a
+// denial, so a fresh sentinel is caused every second until one arrives: the
+// first to arrive proves the stream is live, and, the kernel's records being
+// delivered in order, that every earlier denial has arrived too.
 func (w *denyWatch) mark(ctx context.Context, name string) error {
-	p := filepath.Join(w.sentinel, name)
 	profile := fmt.Sprintf(`(version 1)(allow default)(deny file-write* (subpath %q))`, w.sentinel)
-	_ = exec.CommandContext(ctx, "/usr/bin/sandbox-exec", "-p", profile, "/usr/bin/touch", p).Run()
 	deadline := time.Now().Add(sentinelWait)
-	for time.Now().Before(deadline) {
-		w.mu.Lock()
-		for _, r := range w.recs {
-			if r.Target == p {
-				w.mu.Unlock()
+	var caused []string
+	for i := 0; time.Now().Before(deadline); i++ {
+		p := filepath.Join(w.sentinel, fmt.Sprintf("%s-%d", name, i))
+		caused = append(caused, p)
+		_ = exec.CommandContext(ctx, "/usr/bin/sandbox-exec", "-p", profile, "/usr/bin/touch", p).Run()
+		for until := time.Now().Add(time.Second); time.Now().Before(until); {
+			if w.seenAny(caused) {
 				return nil
 			}
-		}
-		w.mu.Unlock()
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(100 * time.Millisecond):
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(50 * time.Millisecond):
+			}
 		}
 	}
-	return errors.New("the kernel sandbox log is not observable: the sentinel denial " + name + " never arrived")
+	return errors.New("the kernel sandbox log is not observable: no " + name + " sentinel denial arrived")
+}
+
+func (w *denyWatch) seenAny(paths []string) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for _, r := range w.recs {
+		for _, p := range paths {
+			if r.Target == p {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // stop closes the window and returns every denial seen in it, sentinels excluded.
