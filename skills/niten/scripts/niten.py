@@ -47,6 +47,7 @@ MAX_REVIEWS = 3          # unapproved reviews of one step before the user must d
 MAX_STOP_BLOCKS = 3      # Stop blocks in a row without progress before the turn may end
 MIN_EXPLANATION = 25     # characters of the executor's reason for an important action
 LOG_TAIL = 4000          # characters of stdout/stderr kept per logged command
+HUMAN_MAX = 200_000      # characters of a question, an answer or a user message kept whole
 
 # ---------------------------------------------------------------- classification
 
@@ -722,7 +723,8 @@ exit_code is "running in background" or "interrupted" did not finish: it proves 
 about the outcome unless a later entry shows it.
 
 The log also holds the user's own messages and answers ("kind": "user_message" or
-"question"): a deviation from the plan counts as decided only if the user decided it
+"question"), kept whole (an entry with "truncated": true lost its middle and proves only
+what remains): a deviation from the plan counts as decided only if the user decided it
 there. The executor's evidence file may answer earlier findings; treat its arguments as
 claims, and never lower a finding's severity on a stated rationale alone.
 
@@ -1508,6 +1510,17 @@ def cmd_hook_pretooluse(args):
         explained(tool_input, label, where(st))
 
 
+def whole(text):
+    """What the user was shown or said, kept whole (secrets masked): it can be the
+    evidence of their decision. Only beyond HUMAN_MAX is the middle cut, and the cut
+    is marked so nobody mistakes the rest for the full record."""
+    text = redact(text or "")
+    if len(text) <= HUMAN_MAX:
+        return text, False
+    half = HUMAN_MAX // 2
+    return f"{text[:half]}\n[... {len(text) - 2 * half} characters cut by Niten ...]\n{text[-half:]}", True
+
+
 def tail(text):
     text = redact(text or "")
     return text if len(text) <= LOG_TAIL else "…" + text[-LOG_TAIL:]
@@ -1534,8 +1547,10 @@ def cmd_hook_posttooluse(args):
     resp = data.get("tool_response")
     failed = data.get("hook_event_name") == "PostToolUseFailure"
     if tool == "AskUserQuestion":
-        log_entry(d, st, {"kind": "question", "questions": redact(json.dumps(tool_input, ensure_ascii=False))[:LOG_TAIL],
-                          "answers": tail(json.dumps(resp, ensure_ascii=False) if resp is not None else data.get("error", ""))})
+        questions, cut_q = whole(json.dumps(tool_input, ensure_ascii=False))
+        answers, cut_a = whole(json.dumps(resp, ensure_ascii=False) if resp is not None else str(data.get("error", "")))
+        log_entry(d, st, {"kind": "question", "questions": questions, "answers": answers,
+                          "truncated": cut_q or cut_a})
         return
     if tool != "Bash":
         return
@@ -1576,7 +1591,8 @@ def cmd_hook_userprompt(args):
         return
     text = data.get("prompt", data.get("prompt_text", ""))
     if text:
-        log_entry(d, st, {"kind": "user_message", "text": tail(text)})
+        message, cut = whole(text)
+        log_entry(d, st, {"kind": "user_message", "text": message, "truncated": cut})
     if not st.get("paused"):
         return
     reason = st["paused"]["reason"]
