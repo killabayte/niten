@@ -1431,10 +1431,16 @@ def cmd_hook_pretooluse(args):
         if command and START_OVERRIDE.search(command):
             explained(tool_input, "a Niten override", "(no session yet)")
         return
-    if command and (HOOK_CALL.search(command) or any(k in command for k in key_mentions())
-                    or (NITEN_CODE.search(command) and INTERPRETER.search(command) and not NITEN_CALL.match(command))):
-        decision("deny", "Niten: the hooks and their signing key belong to Claude Code, not to the session. "
-                         "Use niten.py's own commands.")
+    if command and HOOK_CALL.search(command):
+        decision("deny", "Niten: the hooks (niten.py hook-*) are run by Claude Code itself, never by the session.")
+        return
+    if command and any(k in command for k in key_mentions()):
+        decision("deny", "Niten: the key that signs the command log is not readable in a session.")
+        return
+    if command and NITEN_CODE.search(command) and INTERPRETER.search(command) and not NITEN_CALL.match(command):
+        decision("deny", f"Niten: run niten.py as a command of its own: `python3 {SCRIPT} <command> ...`, with "
+                         f"nothing else in the same call (no &&, ;, |, redirection, cd or other interpreter before "
+                         f"or after it). Run other commands in separate calls.")
         return
     if command and not NITEN_CALL.match(command) and reaches_claude_dir(command):
         decision("deny", "Niten: Claude's own directory (~/.claude) is out of reach in a session, and so are "

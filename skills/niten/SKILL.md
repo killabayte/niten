@@ -12,8 +12,9 @@ plan does not give you. You work in the user's normal environment (their git, do
 cloud CLIs, network); permission prompts are how the user approves anything
 outward-facing — never try to get around them.
 
-Script: `python3 ${CLAUDE_SKILL_DIR}/scripts/niten.py <command>`. Session state lives
-next to the plan, in `<plan>.niten/`. Arguments given to the skill: `$ARGUMENTS` — a
+Script: `python3 ${CLAUDE_SKILL_DIR}/scripts/niten.py <command>`, always as a Bash call of
+its own (no `&&`, `;`, `|`, `cd` or redirection with it; run other commands separately).
+Session state lives next to the plan, in `<plan>.niten/`. Arguments given to the skill: `$ARGUMENTS` — a
 plan path or a ticket key; if empty, ask which plan.
 
 ## Hard rules
