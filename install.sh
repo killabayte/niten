@@ -55,7 +55,11 @@ for event in events:
     strip(event)
 if mode == "add":
     for event, (matcher, sub) in events.items():
-        group = {"hooks": [{"type": "command", "command": 'python3 "%s" %s' % (script, sub), "timeout": 10}]}
+        # A hook never blocks Claude Code by failing: if the skill is gone (the
+        # repository checked out elsewhere, uninstalled) or python cannot run it, the
+        # hook exits 0 and decides nothing. Decisions are JSON on stdout only.
+        command = '[ -f "%s" ] && python3 "%s" %s || true' % (script, script, sub)
+        group = {"hooks": [{"type": "command", "command": command, "timeout": 10}]}
         if matcher:
             group = {"matcher": matcher, **group}
         hooks.setdefault(event, []).append(group)

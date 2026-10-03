@@ -102,8 +102,16 @@ SECRETS = [
     (re.compile(r"(?i)(--?" + SECRET_KEY + r"(\s+|=))(\"[^\"]*\"|'[^']*'|\S+)"), r"\1[REDACTED]"),
     (re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b"), "[REDACTED]"),
     (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", re.S), "[REDACTED]"),
-    (re.compile(r"[A-Za-z0-9+/=_-]{120,}"), "[REDACTED]"),
 ]
+
+# A long run of base64 characters is a token (a registry password, an encoded key)
+# unless it reads as a path: with slashes and none of base64's + and = it is left alone.
+LONG_RUN = re.compile(r"[A-Za-z0-9+/=_-]{120,}")
+
+
+def _long_run(m):
+    run = m.group(0)
+    return run if "/" in run and not ("+" in run or "=" in run) else "[REDACTED]"
 
 
 def aws_writes(command):
@@ -143,7 +151,7 @@ def important(command):
 def redact(text):
     for pattern, replacement in SECRETS:
         text = pattern.sub(replacement, text)
-    return text
+    return LONG_RUN.sub(_long_run, text)
 
 
 # ---------------------------------------------------------------- the signed log
@@ -709,7 +717,9 @@ executor: each entry is a command the executor actually ran, with its exit code 
 tail of its output (secrets masked). The evidence file is the executor's own account,
 mapping each verification to proof. Trust the log over the account: a claim the log
 does not support is not proven. For external operations (registries, cloud APIs) the log
-is the proof; say in the criterion's evidence which log entry proves it.
+is the proof; say in the criterion's evidence which log entry proves it. An entry whose
+exit_code is "running in background" or "interrupted" did not finish: it proves nothing
+about the outcome unless a later entry shows it.
 
 The log also holds the user's own messages and answers ("kind": "user_message" or
 "question"): a deviation from the plan counts as decided only if the user decided it
@@ -1529,14 +1539,26 @@ def cmd_hook_posttooluse(args):
         interrupted = resp.get("interrupted")
     else:
         out, err, code, interrupted = str(resp or ""), "", None, None
+    background = (resp.get("backgroundTaskId") or resp.get("background_task_id") if isinstance(resp, dict) else None)
     if failed:
-        err = (err + "\n" if err else "") + str(data.get("error") or "")
-        code = code if code not in (None, 0) else "failed"
+        error = str(data.get("error") or "")
+        err = (err + "\n" if err else "") + error
+        m = re.match(r"\s*Exit code (\d+)", error)
+        code = code if code not in (None, 0) else (int(m.group(1)) if m else "failed")
+    elif interrupted:
+        code = "interrupted"  # it did not finish; no exit status
+    elif background or tool_input.get("run_in_background"):
+        code = "running in background"  # started, not finished: its outcome is a later event
+    elif code is None:
+        code = 0  # a finished command; Claude Code reports a non-zero exit through PostToolUseFailure
     command = tool_input.get("command", "")
     if re.search(r"get-login-password|print-access-token|get-token|\btoken\b", command) and "|" not in command:
         out = "[output withheld: credential]"
-    log_entry(d, st, {"kind": "command", "command": redact(command), "description": tool_input.get("description", ""),
-                      "exit_code": code, "interrupted": interrupted, "stdout": tail(out), "stderr": tail(err)})
+    entry = {"kind": "command", "command": redact(command), "description": tool_input.get("description", ""),
+             "exit_code": code, "interrupted": interrupted, "stdout": tail(out), "stderr": tail(err)}
+    if background:
+        entry["background_task"] = str(background)
+    log_entry(d, st, entry)
 
 
 def cmd_hook_userprompt(args):
