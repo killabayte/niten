@@ -639,6 +639,15 @@ class HookTest(Base):
                          "deny")
         self.assertIsNone(self.bash(f"python3 {SCRIPT} hook-stop", session="another"))  # no session: inert
 
+    def test_each_refusal_says_what_to_do_instead(self):
+        reason = lambda cmd: self.bash(cmd, WHY)["permissionDecisionReason"]  # noqa: E731
+        self.assertIn("run by Claude Code itself", reason(f"python3 {SCRIPT} hook-stop < x.json"))
+        self.assertIn("not readable", reason("cat ~/.claude/niten/hook.key"))
+        for cmd in (f"git -C app status && python3 {SCRIPT} finish", f"cd app && python3 {SCRIPT} status",
+                    f"python3 {SCRIPT} status | tail -1"):
+            self.assertIn("run niten.py as a command of its own", reason(cmd), cmd)
+        self.assertIsNone(self.bash(f"python3 {SCRIPT} status"))
+
     def test_overrides_are_asked_before_a_session_exists(self):
         command = f"python3 {shlex.quote(SCRIPT)} start --plan {shlex.quote(self.plan)} --unapproved"
         self.assertEqual(self.bash(command, WHY, session="new-session")["permissionDecision"], "ask")
