@@ -788,6 +788,68 @@ class DirtyTreeTest(Base):
         self.assertIn("moved since the final review", r.stderr)
 
 
+class GitViewTest(Base):
+    """The fingerprint is the files' bytes, not what git shows (review round 4)."""
+
+    def change_after_final(self, setup=None):
+        root = os.path.join(self.ws, "app")
+        if setup:
+            setup(root)
+        self.commit("app", "source.txt", "reviewed contents\n")
+        self.approve_all()
+        return root
+
+    def test_a_git_failure_stops_finish_and_delivery(self):
+        root = self.change_after_final()
+        with open(os.path.join(root, "source.txt"), "w") as f:
+            f.write("unreviewed contents\n")
+        with open(os.path.join(root, ".git", "index"), "wb") as f:
+            f.write(b"corrupted index fixture")
+        r = self.run_niten("finish")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("nothing was decided", r.stderr)
+        # A push sends commits, and HEAD is still the reviewed commit: it may go to the user.
+        self.assertEqual(self.bash("git -C app push origin HEAD", WHY)["permissionDecision"], "ask")
+        os.rename(os.path.join(root, ".git", "HEAD"), os.path.join(root, ".git", "HEAD.moved"))
+        out = self.bash("git -C app push origin HEAD", WHY)  # the commits cannot be read: no push
+        self.assertEqual(out["permissionDecision"], "deny")
+
+    def test_textconv_cannot_hide_a_change(self):
+        def textconv(root):
+            self.commit("app", ".gitattributes", "source.txt diff=reviewfixture\n")
+            git(root, "config", "diff.reviewfixture.textconv", "/usr/bin/true")
+        root = self.change_after_final(textconv)
+        with open(os.path.join(root, "source.txt"), "w") as f:
+            f.write("unreviewed contents\n")
+        r = self.run_niten("finish")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("differs from what the final review approved", r.stderr)
+
+    def test_a_staged_change_with_an_unchanged_tree_is_seen(self):
+        root = self.change_after_final()
+        with open(os.path.join(root, "source.txt"), "w") as f:
+            f.write("staged but not in the tree\n")
+        git(root, "add", "source.txt")
+        with open(os.path.join(root, "source.txt"), "w") as f:
+            f.write("reviewed contents\n")
+        r = self.run_niten("finish")
+        self.assertNotEqual(r.returncode, 0)
+
+    def test_a_changed_git_configuration_stops_the_review(self):
+        self.start()
+        git(os.path.join(self.ws, "app"), "config", "diff.hide.textconv", "/usr/bin/true")
+        self.evidence("S-001")
+        r = self.run_niten("review", "S-001")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("git configuration of app changed", r.stderr)
+
+    def test_global_git_configuration_is_put_to_the_user(self):
+        self.start()
+        out = self.bash("git config --global diff.hide.textconv /usr/bin/true", WHY)
+        self.assertEqual(out["permissionDecision"], "ask")
+        self.assertIsNone(self.bash("git config user.name"))
+
+
 class ClaudeDirTest(Base):
     """Claude's own directory, with the log's key, is out of a session's reach."""
 

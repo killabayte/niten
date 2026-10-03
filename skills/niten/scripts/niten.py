@@ -61,6 +61,7 @@ DELIVERY = [
 # Niten session each one needs the user's approval with an explanation, whatever the
 # permission settings would otherwise allow.
 IMPORTANT = [
+    ("a change to git's user or system configuration", r"\bgit\b[^|;&]*\bconfig\b[^|;&]*--(global|system)\b"),
     ("git push or a history rewrite", r"\bgit\b[^|;&]*\b(push|reset\s+--hard|clean\s+-\w*f|branch\s+-D|tag\s+-d|filter-branch|filter-repo)\b"),
     ("a registry push, login or image removal", r"\bdocker\b[^|;&]*\b(push|login|rmi|system\s+prune|image\s+(rm|prune))\b|\bdocker\s+buildx\b[^|;&]*(--push\b|\bimagetools\s+create\b)"),
     ("an infrastructure change", r"\b(terraform|tofu|terragrunt)\b[^|;&]*\b(apply|destroy|import|taint|untaint|force-unlock|state\s+(rm|mv|push|replace-provider))\b"),
@@ -201,9 +202,29 @@ def die(msg, code=2):
     sys.exit(code)
 
 
+# Git as Niten reads it: no file-system monitor or untracked cache answering for the
+# working tree, no external diff or user-wide attributes changing what a diff shows.
+GIT_SAFE = ["-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false", "-c", "diff.external=",
+            "-c", "core.attributesFile=" + os.devnull]
+
+
+class GitError(Exception):
+    pass
+
+
 def git(path, *args):
-    r = subprocess.run(["git", "-C", path, *args], capture_output=True, text=True)
+    """A git call whose output is only shown to someone; empty on failure."""
+    r = subprocess.run(["git", "-C", path, *GIT_SAFE, *args], capture_output=True, text=True)
     return r.stdout.strip() if r.returncode == 0 else ""
+
+
+def git_strict(path, *args):
+    """A git call a decision rests on: its failure stops the decision."""
+    r = subprocess.run(["git", "-C", path, *GIT_SAFE, *args], capture_output=True)
+    if r.returncode != 0:
+        raise GitError(f"git {' '.join(args)} failed in {path}: "
+                       + r.stderr.decode("utf-8", "replace").strip()[-300:])
+    return r.stdout
 
 
 def load_json(path, default=None):
@@ -356,14 +377,17 @@ def st_dir(st):
 
 
 def heads(st):
-    return {name: git(r["path"], "rev-parse", "HEAD") for name, r in st["repos"].items()}
+    return {name: git_strict(r["path"], "rev-parse", "HEAD").decode().strip() for name, r in st["repos"].items()}
+
+
+def zsplit(raw):
+    return [p for p in raw.decode("utf-8", "surrogateescape").split("\0") if p]
 
 
 def status_paths(path):
     """Paths with uncommitted changes (tracked or untracked), from `git status -z`."""
-    r = subprocess.run(["git", "-C", path, "status", "--porcelain", "-z", "--untracked-files=all"],
-                       capture_output=True)
-    fields, out, i = r.stdout.decode("utf-8", "surrogateescape").split("\0"), [], 0
+    raw = git_strict(path, "status", "--porcelain", "-z", "--untracked-files=all")
+    fields, out, i = raw.decode("utf-8", "surrogateescape").split("\0"), [], 0
     while i < len(fields):
         entry = fields[i]
         if len(entry) > 3:
@@ -384,9 +408,32 @@ def content_hash(path):
         return "absent"
 
 
+def file_digest(path):
+    """A file as it is on disk: its bytes, a link's target, or its absence."""
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return "absent"
+    if os.path.islink(path):
+        return "link:" + os.readlink(path)
+    if os.path.isdir(path):
+        return "directory"
+    return f"{oct(info.st_mode & 0o777)}:{content_hash(path)}"
+
+
 def own_paths(st, r):
     """The session's own files inside a repository (a plan kept there)."""
     return [os.path.relpath(p, r["path"]) for p in sidecars(st["plan"]) + [st_dir(st)] if within(p, r["path"])]
+
+
+def git_meta(path):
+    """The repository's own configuration that decides what git shows: config,
+    per-worktree config, info/exclude and info/attributes, byte for byte."""
+    common = os.path.join(path, git_strict(path, "rev-parse", "--git-common-dir").decode().strip())
+    gitdir = os.path.join(path, git_strict(path, "rev-parse", "--git-dir").decode().strip())
+    files = [os.path.join(common, "config"), os.path.join(gitdir, "config.worktree"),
+             os.path.join(common, "info", "exclude"), os.path.join(common, "info", "attributes")]
+    return {os.path.relpath(f, path): content_hash(f) for f in files}
 
 
 def preexisting_state(path):
@@ -406,17 +453,18 @@ def new_changes(st, r):
 
 
 def tree_fingerprint(st, r):
-    """The content of a repository's working tree beyond its HEAD: tracked changes
-    (staged or not) and every untracked file, the session's own files left out."""
-    excludes = [":(exclude)" + o for o in own_paths(st, r)]
-    diff = subprocess.run(["git", "-C", r["path"], "diff", "HEAD", "--binary", "--", "."] + excludes,
-                          capture_output=True).stdout
-    h = hashlib.sha256(diff)
-    tracked = set(subprocess.run(["git", "-C", r["path"], "diff", "HEAD", "--name-only", "-z"],
-                                 capture_output=True).stdout.decode("utf-8", "surrogateescape").split("\0"))
-    for p in sorted(status_paths(r["path"])):
-        if p not in tracked and not any(p.startswith(o) for o in own_paths(st, r)):
-            h.update(p.encode("utf-8", "surrogateescape") + b"\0" + content_hash(os.path.join(r["path"], p)).encode())
+    """The working tree byte for byte, whatever git would show of it: the index (by
+    blob id), every tracked and untracked file read from disk, and the repository's
+    git configuration. The session's own files are left out. Diff drivers, filters
+    and textconv cannot hide a change, and a failing git call stops the check."""
+    own = own_paths(st, r)
+    h = hashlib.sha256(git_strict(r["path"], "ls-files", "-s", "-z"))
+    files = zsplit(git_strict(r["path"], "ls-files", "-z", "--cached", "--others", "--exclude-per-directory=.gitignore"))
+    for p in sorted(set(files)):
+        if not any(p == o or p.startswith(o.rstrip("/") + "/") for o in own):
+            h.update(p.encode("utf-8", "surrogateescape") + b"\0" + file_digest(os.path.join(r["path"], p)).encode()
+                     + b"\n")
+    h.update(json.dumps(git_meta(r["path"]), sort_keys=True).encode())
     return h.hexdigest()
 
 
@@ -578,11 +626,13 @@ def repos_block(st, since, final):
                 f"on {git(r['path'], 'rev-parse', '--abbrev-ref', 'HEAD')}\n"
                 f"  present before the session, not part of the change:\n{indent(r['preexisting'], '(nothing)')}")
         if final:
-            part += (f"  the whole change: `git -C {r['path']} diff {r['base']}`\n"
-                     + indent(git(r["path"], "diff", "--stat", r["base"]), "(no changes)"))
+            part += (f"  the whole change: `git -C {r['path']} diff --no-textconv --no-ext-diff {r['base']}`\n"
+                     + indent(git(r["path"], "diff", "--no-textconv", "--no-ext-diff", "--stat", r["base"]),
+                              "(no changes)"))
         else:
-            part += (f"  THIS step's changes: `git -C {r['path']} diff {start}`\n"
-                     + indent(git(r["path"], "diff", "--stat", start), "(no changes in this repository)"))
+            part += (f"  THIS step's changes: `git -C {r['path']} diff --no-textconv --no-ext-diff {start}`\n"
+                     + indent(git(r["path"], "diff", "--no-textconv", "--no-ext-diff", "--stat", start),
+                              "(no changes in this repository)"))
             if start != r["base"]:
                 part += (f"  earlier steps, already approved (not this step's scope): "
                          f"`git -C {r['path']} log --oneline {r['base']}..{start}`\n")
@@ -604,7 +654,8 @@ def ledger_text(ledger):
 REVIEW_RULES = """\
 You are the independent reviewer in a pair session; another model (the executor) did
 the work. You may read any file and run read-only commands (git log/diff/show/status,
-grep, cat, ls). You cannot write files or use the network.
+grep, cat, ls). You cannot write files or use the network. Read diffs with
+`git diff --no-textconv --no-ext-diff`, so that no configured converter hides content.
 
 Two kinds of evidence exist. The command log is recorded by the harness, not by the
 executor: each entry is a command the executor actually ran, with its exit code and the
@@ -676,6 +727,11 @@ def review_step(d, st, sid, final, user_approved):
     if failed >= MAX_REVIEWS and not user_approved:
         die(f"{failed} reviews without approval. Stop and ask the user how to proceed; if they want another "
             f"review, run it with --user-approved \"<their decision>\" (they confirm it in a permission prompt)")
+    for name, r in st["repos"].items():
+        changed = [f for f, h in git_meta(r["path"]).items() if h != r.get("git_meta", {}).get(f)]
+        if changed:
+            die(f"the git configuration of {name} changed during the session ({', '.join(changed)}); it decides "
+                f"what git shows, so stop and ask the user")
     for name, r in st["repos"].items():
         fresh = new_changes(st, r)
         if fresh:
@@ -820,7 +876,8 @@ def cmd_start(args):
         if not p:
             die(f"repository {name}: not found; pass --repo {name}=PATH (or set NITEN_WORKSPACE)")
         repos[name] = {"path": os.path.realpath(p), "alias": alias,
-                       "base": git(p, "rev-parse", "HEAD"), "branch": git(p, "rev-parse", "--abbrev-ref", "HEAD"),
+                       "base": git_strict(p, "rev-parse", "HEAD").decode().strip(),
+                       "branch": git(p, "rev-parse", "--abbrev-ref", "HEAD"), "git_meta": git_meta(p),
                        "preexisting": git(p, "status", "--porcelain"),
                        "preexisting_content": preexisting_state(p)}
     d = os.path.splitext(plan)[0] + ".niten"
@@ -1009,7 +1066,11 @@ def progress(d, st):
     except OSError:
         log = 0
     reviews = sum(len(s["reviews"]) for s in st["steps"]) + len(st["final"]["reviews"])
-    return hashlib.sha256(json.dumps([reviews, log, heads(st), trees(st)], sort_keys=True).encode()).hexdigest()
+    try:
+        repos = [heads(st), trees(st)]
+    except GitError:
+        repos = "git fails"  # no progress can be seen while git fails
+    return hashlib.sha256(json.dumps([reviews, log, repos], sort_keys=True).encode()).hexdigest()
 
 
 def cmd_hook_stop(args):
@@ -1215,7 +1276,12 @@ def cmd_hook_pretooluse(args):
             decision("deny", f"Niten session ({d}): delivery (push or pull request) waits for the final review. "
                              f"Approve every step, then run `python3 {SCRIPT} final`.")
             return
-        moved = [n for n, h in heads(st).items() if h != final.get("heads", {}).get(n)]
+        try:
+            moved = [n for n, h in heads(st).items() if h != final.get("heads", {}).get(n)]
+        except GitError as e:
+            decision("deny", f"Niten: the repositories cannot be checked against the final review ({e}); "
+                             f"delivery waits until git works again.")
+            return
         if moved:
             decision("deny", f"Niten: {', '.join(moved)} changed after the final review; run "
                              f"`python3 {SCRIPT} final` again before delivering.")
@@ -1346,7 +1412,10 @@ def main():
         except Exception as e:  # noqa: BLE001
             print("niten hook error: " + str(e), file=sys.stderr)
         sys.exit(0)
-    args.fn(args)
+    try:
+        args.fn(args)
+    except GitError as e:
+        die(f"{e}; nothing was decided")
 
 
 if __name__ == "__main__":

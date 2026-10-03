@@ -27,7 +27,11 @@ with two models; Niten carries it out with the same two models in fixed roles.
   Claude fixes and asks again. A failed, malformed or stale review never counts as
   approval, and a verdict is discarded if the repositories moved while the reviewer
   worked: their commits, or the content of their working trees, including files that were
-  already modified before the session. A final review checks the whole change against every criterion of the plan
+  already modified before the session. The working tree is compared byte for byte (the
+  index by blob id, every tracked and untracked file read from disk, and the repository's
+  own git configuration), so no diff driver, filter or textconv can hide a change, and a
+  git call that fails stops the decision instead of looking like "no change". A change to
+  a repository's git configuration during the session stops the reviews until you decide. A final review checks the whole change against every criterion of the plan
   before anything is delivered; what nobody could verify, in a step or at the end, goes to
   you to check and confirm.
 - **You are in the loop.** Claude asks when it needs a login, a permission, a decision the
@@ -51,7 +55,8 @@ Code session that started a Niten session and do nothing anywhere else.
 | `PostToolUse`, `PostToolUseFailure` | Every Bash command, failed ones too, is logged with its exit code and output, and so are your answers to Claude's questions, as the reviewer's evidence. Each entry is signed; a review refuses a log with an entry the hooks did not write. |
 | `UserPromptSubmit` | Your messages are logged too, so a deviation from the plan counts as decided only if you decided it; a pause to wait for you ends when you answer. |
 
-Important actions: git pushes and history rewrites; image pushes, registry logins and
+Important actions: git pushes and history rewrites; changes to git's user or system
+configuration; image pushes, registry logins and
 image removal; any `aws` operation that is not describe, list or get; Terraform, `kubectl`
 and Helm changes; pull requests, releases and repository changes through `gh`; writes to
 web APIs with `curl`/`wget`; recursive forced deletes; package publication;

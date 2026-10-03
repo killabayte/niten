@@ -103,8 +103,9 @@ plan path or a ticket key; if empty, ask which plan.
    finish, then read its output; do not change the repositories while it runs (commits,
    or the content of any file, including ones that were already modified before the
    session), or its verdict is **DISCARDED** and you review again. Do not change a file
-   that had uncommitted changes before the session without asking the user: a review
-   refuses until that is settled. The reviewer sees only this step's
+   that had uncommitted changes before the session, or a repository's git configuration
+   (`git config`, `.git/info`), without asking the user: a review refuses until that is
+   settled. The reviewer sees only this step's
    changes (since the previous step's approval), the step's log entries and your
    evidence; it must judge every criterion of the step and settle every open finding
    by its id. A criterion it cannot verify passes the step but returns at the final
