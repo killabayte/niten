@@ -49,13 +49,13 @@ Code session that started a Niten session and do nothing anywhere else.
 | Hook | Rule |
 |---|---|
 | `Stop` | Claude cannot end its turn while the current step, or the final review, is not approved, unless it is waiting for your answer or a review is running. After three blocks in a row without any progress the turn ends with a message to you, so a broken reviewer cannot trap the session in a loop. |
-| `PreToolUse` | No `git push` or pull request before the final review approved exactly the commits being delivered; `finish` refuses unless the commits and the working trees are what the final review approved. |
+| `PreToolUse` | No `git push` or pull request before the final review approved exactly the commits being delivered. A push must be a plain `git [-C <repo>] push <remote> <ref>…` whose every ref resolves to the approved commit of a plan's repository (`--all`, `--mirror`, `--tags`, deletions, patterns and anything that hides what is pushed are refused); `finish` refuses unless the commits and the working trees are what the final review approved. |
 | `PreToolUse` | Every important action is put to you, with Claude's explanation of what it does and why the current step needs it, even where your permission settings would allow it. A command without an explanation is refused. |
 | `PreToolUse` | The session's state, command log and reviews, the approved plan and its receipts, and Claude's settings cannot be edited by Claude; Claude cannot run the hooks itself, and Claude's own directory `~/.claude` (with the key that signs the log) is out of reach: no shell command may name it, glob over hidden names or sweep the home directory, and the file tools cannot read Niten's files there. |
 | `PostToolUse`, `PostToolUseFailure` | Every Bash command, failed ones too, is logged with its exit code and output, and so are your answers to Claude's questions, as the reviewer's evidence. Each entry is signed; a review refuses a log with an entry the hooks did not write. |
 | `UserPromptSubmit` | Your messages are logged too, so a deviation from the plan counts as decided only if you decided it; a pause to wait for you ends when you answer. |
 
-Important actions: git pushes and history rewrites; changes to git's user or system
+Important actions: git pushes (of the approved commits) and history rewrites; changes to git's user or system
 configuration; image pushes, registry logins and
 image removal; any `aws` operation that is not describe, list or get; Terraform, `kubectl`
 and Helm changes; pull requests, releases and repository changes through `gh`; writes to

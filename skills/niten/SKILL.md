@@ -129,7 +129,9 @@ plan path or a ticket key; if empty, ask which plan.
    prompt.
 3. After approval, ask the user how to deliver: push the work branch(es) and open pull
    request(s) (their Git host and conventions), or leave the branches local. Do what
-   they choose; each push goes through a permission prompt.
+   they choose; each push goes through a permission prompt. Push plainly, one repository
+   at a time: `git -C <repo> push [-u] <remote> HEAD` or a branch name; every ref you push
+   must be the commit the final review approved.
 4. `niten.py finish` (it refuses if the commits differ from what the final review
    approved). Report: steps with their review counts, what changed where, what
    external operations were done (with digests/IDs), what is left to the user.

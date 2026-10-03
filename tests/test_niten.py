@@ -365,12 +365,12 @@ class ReviewTest(Base):
         self.assertIn("R-002.C1", out)
         self.assertEqual(self.state_json()["final"]["status"], "needs_user")
         self.assertIsNone(self.hook("stop"))  # the turn ends so the user can check
-        self.assertEqual(self.bash("git push", WHY)["permissionDecision"], "deny")
+        self.assertEqual(self.bash("git -C app push origin HEAD", WHY)["permissionDecision"], "deny")
         out = self.bash(f"python3 {SCRIPT} confirm 'checked the digest in the registry console'", WHY)
         self.assertEqual(out["permissionDecision"], "ask")
         self.ok("confirm", "checked the digest in the registry console")
         self.assertEqual(self.state_json()["final"]["status"], "approved")
-        self.assertEqual(self.bash("git push", WHY)["permissionDecision"], "ask")
+        self.assertEqual(self.bash("git -C app push origin HEAD", WHY)["permissionDecision"], "ask")
 
     def test_a_forged_log_entry_stops_the_review(self):
         self.hook("posttooluse", tool_name="Bash", tool_input={"command": "make test"},
@@ -563,6 +563,9 @@ class HookTest(Base):
         self.assertIsNone(self.hook("stop"))
         self.commit("app", "late.txt")
         out = self.bash("git -C app push origin HEAD", WHY)
+        self.assertEqual(out["permissionDecision"], "deny")
+        self.assertIn("not the commit the final review approved", out["permissionDecisionReason"])
+        out = self.bash("gh pr create --title t --body b", WHY)
         self.assertEqual(out["permissionDecision"], "deny")
         self.assertIn("changed after the final review", out["permissionDecisionReason"])
 
@@ -786,6 +789,60 @@ class DirtyTreeTest(Base):
         r = self.run_niten("confirm", "checked")
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("moved since the final review", r.stderr)
+
+
+class PushTest(Base):
+    """A push may send only the commits the final review approved (review round 5)."""
+
+    def setUp(self):
+        super().setUp()
+        self.root = os.path.join(self.ws, "app")
+        self.branch = git(self.root, "symbolic-ref", "--short", "HEAD")
+        git(self.root, "checkout", "-qb", "unreviewed")
+        self.unreviewed = self.commit("app", "unreviewed.txt", "not part of the reviewed branch\n")
+        git(self.root, "checkout", "-q", self.branch)
+        git(self.root, "tag", "old-tag", self.unreviewed)
+        other = os.path.join(self.ws, "other")  # a repository the plan does not name
+        os.makedirs(other)
+        git(other, "init", "-q")
+        git(other, "commit", "-q", "--allow-empty", "-m", "x")
+        self.approve_all()
+        self.approved = self.state_json()["final"]["heads"]["app"]
+
+    def decide(self, command):
+        out = self.bash(command, WHY)
+        return out["permissionDecision"] if out else None
+
+    def test_pushes_of_other_refs_are_refused(self):
+        for cmd in ("git -C app push origin unreviewed", "git -C app push --all origin", "git -C app push --mirror origin",
+                    "git -C app push --tags origin", "git -C app push --follow-tags origin HEAD",
+                    f"git -C app push origin {self.unreviewed}:refs/heads/x", "git -C app push origin HEAD unreviewed",
+                    "git -C app push origin old-tag", "git -C app push origin :main", "git -C app push origin 'refs/heads/*'",
+                    "git -C app push --delete origin main", "git -C app push --prune origin HEAD",
+                    "git -C app push --recurse-submodules=on-demand origin HEAD",
+                    "git -C app -c push.default=matching push", "GIT_DIR=x git -C app push origin HEAD",
+                    "git -C app push origin $(git -C app rev-parse unreviewed)", "(cd app && git push origin unreviewed)",
+                    "git push origin HEAD", "git -C other push origin HEAD", "git -C app push origin nosuchref",
+                    "cd app && git push origin unreviewed"):
+            self.assertEqual(self.decide(cmd), "deny", cmd)
+
+    def test_pushes_of_the_approved_commit_go_to_the_user(self):
+        for cmd in ("git -C app push origin HEAD", f"git -C app push -u origin {self.branch}",
+                    f"git -C app push --force-with-lease origin HEAD:refs/heads/{self.branch}",
+                    "cd app && git push origin HEAD", "git -C app push", "git -C app push origin HEAD 2>&1",
+                    f"git -C app push origin {self.approved}:refs/heads/feature", "git -C app push -fu origin HEAD"):
+            self.assertEqual(self.decide(cmd), "ask", cmd)
+
+    def test_default_pushes_follow_the_push_configuration(self):
+        git(self.root, "config", "push.default", "matching")
+        self.assertEqual(self.decide("git -C app push"), "deny")
+        git(self.root, "config", "--unset", "push.default")
+        git(self.root, "config", "remote.origin.push", "refs/heads/*:refs/heads/*")
+        self.assertEqual(self.decide("git -C app push origin"), "deny")
+
+    def test_commands_that_only_mention_push_are_not_delivery(self):
+        self.assertIsNone(self.bash("git -C app log --grep push"))
+        self.assertIsNone(self.bash("grep -rn 'git push' docs"))
 
 
 class GitViewTest(Base):

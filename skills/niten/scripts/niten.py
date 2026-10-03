@@ -62,7 +62,7 @@ DELIVERY = [
 # permission settings would otherwise allow.
 IMPORTANT = [
     ("a change to git's user or system configuration", r"\bgit\b[^|;&]*\bconfig\b[^|;&]*--(global|system)\b"),
-    ("git push or a history rewrite", r"\bgit\b[^|;&]*\b(push|reset\s+--hard|clean\s+-\w*f|branch\s+-D|tag\s+-d|filter-branch|filter-repo)\b"),
+    ("a git history rewrite", r"\bgit\b[^|;&]*\b(reset\s+--hard|clean\s+-\w*f|branch\s+-D|tag\s+-d|filter-branch|filter-repo)\b"),
     ("a registry push, login or image removal", r"\bdocker\b[^|;&]*\b(push|login|rmi|system\s+prune|image\s+(rm|prune))\b|\bdocker\s+buildx\b[^|;&]*(--push\b|\bimagetools\s+create\b)"),
     ("an infrastructure change", r"\b(terraform|tofu|terragrunt)\b[^|;&]*\b(apply|destroy|import|taint|untaint|force-unlock|state\s+(rm|mv|push|replace-provider))\b"),
     ("a cluster change", r"\bkubectl\b[^|;&]*\b(apply|create|delete|edit|patch|replace|scale|annotate|label|set|rollout|cordon|uncordon|drain|taint|exec|cp|port-forward)\b"),
@@ -1168,6 +1168,142 @@ def outside_workspace(path, data, st):
     return not any(within(path, r) for r in roots)
 
 
+# ---------------------------------------------------------------- what a push sends
+
+GIT_GLOBAL_OK = {"--no-pager", "-P", "--no-optional-locks", "--no-replace-objects"}
+PUSH_FLAGS = {"-u", "--set-upstream", "-f", "--force", "--force-if-includes", "--no-force-with-lease", "-q",
+              "--quiet", "-v", "--verbose", "--porcelain", "-n", "--dry-run", "--atomic", "--no-verify", "--verify",
+              "--progress", "--no-progress", "--thin", "--no-thin", "-4", "-6", "--ipv4", "--ipv6"}
+PUSH_VALUED = {"-o", "--push-option"}
+PUSH_SHORT = set("ufqvn46")
+REDIRECTS = {">", ">>", "<", ">&", "<&", "&>", "&>>", ">|", "<>"}
+
+
+class Unclear(Exception):
+    """A command line whose effect cannot be read off it."""
+
+
+def shell_segments(command):
+    """The simple commands of a command line, split at ; && || | & and newlines.
+    Substitutions, subshells and groups make it unclear; redirections are dropped."""
+    if re.search(r"\$\(|`|<\(|>\(", command):
+        raise Unclear("a command substitution")
+    lex = shlex.shlex(command, posix=True, punctuation_chars=True)
+    lex.whitespace_split = True
+    try:
+        tokens = list(lex)
+    except ValueError as e:
+        raise Unclear(str(e))
+    segments, cur, skip = [], [], False
+    for t in tokens:
+        if skip:
+            skip = False
+        elif t in (";", "&&", "||", "|", "&", ";;"):
+            if cur:
+                segments.append(cur)
+            cur = []
+        elif t in ("(", ")", "{", "}"):
+            raise Unclear("a subshell or a group")
+        elif t in REDIRECTS:
+            if cur and cur[-1].isdigit():
+                cur.pop()
+            skip = True
+        else:
+            cur.append(t)
+    if cur:
+        segments.append(cur)
+    return segments
+
+
+def git_pushes(command, cwd):
+    """(directory, arguments) of every `git push` in a command line, following cd and
+    git -C. Anything that could change what git pushes makes the line unclear."""
+    out = []
+    for seg in shell_segments(command):
+        if seg[0] == "cd":
+            cwd = os.path.normpath(os.path.join(cwd, os.path.expanduser(seg[1] if len(seg) > 1 else HOME)))
+            continue
+        if seg[0] in ("pushd", "popd", "builtin", "command", "env", "exec", "eval", "xargs", "sudo"):
+            if any(os.path.basename(t) == "git" for t in seg) and "push" in seg:
+                raise Unclear(f"git push run through {seg[0]}")
+            continue
+        i = 0
+        while i < len(seg) and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", seg[i]):
+            i += 1
+        if i >= len(seg) or os.path.basename(seg[i]) != "git":
+            continue
+        j, repo, bad = i + 1, cwd, None
+        while j < len(seg) and seg[j].startswith("-"):
+            opt = seg[j]
+            if opt == "-C" and j + 1 < len(seg):
+                repo = os.path.normpath(os.path.join(repo, os.path.expanduser(seg[j + 1])))
+                j += 2
+                continue
+            if opt not in GIT_GLOBAL_OK:
+                bad = bad or opt
+                if opt in ("-c", "--git-dir", "--work-tree", "--namespace", "--exec-path", "--super-prefix"):
+                    j += 1
+            j += 1
+        if j < len(seg) and seg[j] == "push":
+            if i > 0:
+                raise Unclear("environment variables set for git push")
+            if bad:
+                raise Unclear(f"the git option {bad} before push")
+            out.append((repo, seg[j + 1:]))
+    return out
+
+
+def push_problem(repo_dir, args, st):
+    """Why a git push could send anything but the commits the final review
+    approved, or None."""
+    top = os.path.realpath(git_strict(repo_dir, "rev-parse", "--show-toplevel").decode().strip())
+    name = next((n for n, r in st["repos"].items() if os.path.realpath(r["path"]) == top), None)
+    if not name:
+        return f"it pushes {top}, which is not one of the plan's repositories"
+    approved = st["final"].get("heads", {}).get(name, "")
+    positionals, k = [], 0
+    while k < len(args):
+        a = args[k]
+        if a == "--":
+            positionals += args[k + 1:]
+            break
+        if a.startswith("--recurse-submodules"):
+            if a.split("=", 1)[-1] not in ("no", "check"):
+                return f"{a} pushes submodule commits"
+        elif a.startswith("--force-with-lease") or a.startswith("--push-option="):
+            pass
+        elif a in PUSH_VALUED:
+            k += 1
+        elif a in PUSH_FLAGS or (re.fullmatch(r"-[A-Za-z0-9]+", a) and set(a[1:]) <= PUSH_SHORT):
+            pass
+        elif a.startswith("-"):
+            return f"the push option {a} is not allowed in a Niten session"
+        else:
+            positionals.append(a)
+        k += 1
+    refspecs = positionals[1:]
+    if not refspecs:
+        default = git(top, "config", "--get", "push.default") or "simple"
+        if default not in ("simple", "current", "upstream", "tracking"):
+            return f"push.default={default} pushes more than the current branch"
+        if git(top, "config", "--get-regexp", r"^remote\..*\.push$"):
+            return "a configured remote push refspec decides what is pushed"
+        refspecs = ["HEAD"]
+    for spec in refspecs:
+        src = spec.lstrip("+").split(":", 1)[0]
+        if not src:
+            return f"{spec} deletes a remote ref"
+        if any(c in src for c in "*?["):
+            return f"{spec} is a pattern"
+        try:
+            sha = git_strict(top, "rev-parse", "--verify", "--quiet", src + "^{commit}").decode().strip()
+        except GitError:
+            return f"{src} does not resolve to a commit"
+        if sha != approved:
+            return f"{spec} pushes {sha[:12]}, not the commit the final review approved ({approved[:12]})"
+    return None
+
+
 READ_TOOLS = {"Read": "file_path", "Grep": "path", "Glob": "path", "NotebookRead": "notebook_path"}
 HOOK_CALL = re.compile(r"\bniten\.py\b[^|;&]*\bhook-|\bhook-(stop|pretooluse|posttooluse|userprompt)\b")
 NITEN_CODE = re.compile(r"niten\.py|skills/niten/scripts|\bimport\s+niten\b|\bfrom\s+niten\s+import\b|"
@@ -1269,15 +1405,32 @@ def cmd_hook_pretooluse(args):
         decision("deny", "Niten: this command would change the session's record, the approved plan or Claude's "
                          "settings. The state changes only through niten.py; ask the user if something is wrong.")
         return
-    delivery = any(p.search(command) for p in DELIVERY)
+    mentions_push = bool(DELIVERY[0].search(command))
+    other_delivery = any(p.search(command) for p in DELIVERY[1:])
+    pushes, unclear = [], None
+    if mentions_push:
+        try:
+            pushes = git_pushes(command, data.get("cwd") or os.getcwd())
+        except Unclear as e:
+            unclear = str(e)
+    delivery = bool(pushes) or other_delivery or unclear is not None
     if delivery:
         final = st["final"]
         if final["status"] != "approved":
             decision("deny", f"Niten session ({d}): delivery (push or pull request) waits for the final review. "
                              f"Approve every step, then run `python3 {SCRIPT} final`.")
             return
+        if unclear:
+            decision("deny", f"Niten: in a session a push is a plain `git [-C <repo>] push <remote> <ref>`, so that "
+                             f"what it sends can be checked ({unclear}).")
+            return
         try:
-            moved = [n for n, h in heads(st).items() if h != final.get("heads", {}).get(n)]
+            for repo_dir, args in pushes:
+                problem = push_problem(repo_dir, args, st)
+                if problem:
+                    decision("deny", f"Niten: {problem}. Only the commits the final review approved may be pushed.")
+                    return
+            moved = [n for n, h in heads(st).items() if h != final.get("heads", {}).get(n)] if other_delivery else []
         except GitError as e:
             decision("deny", f"Niten: the repositories cannot be checked against the final review ({e}); "
                              f"delivery waits until git works again.")
@@ -1286,7 +1439,7 @@ def cmd_hook_pretooluse(args):
             decision("deny", f"Niten: {', '.join(moved)} changed after the final review; run "
                              f"`python3 {SCRIPT} final` again before delivering.")
             return
-    label = important(command) or ("delivery" if delivery else None)
+    label = important(command) or ("a git push" if pushes else None) or ("delivery" if delivery else None)
     if label:
         explained(tool_input, label, where(st))
 
