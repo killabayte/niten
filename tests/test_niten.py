@@ -1012,6 +1012,38 @@ class GitViewTest(Base):
         r = self.run_niten("review", "S-001")
         self.assertIn("git configuration of app changed", r.stderr)
 
+    def test_worktree_configuration_is_optional_and_watched(self):
+        root = os.path.join(self.ws, "app")
+        git(root, "config", "extensions.worktreeConfig", "true")
+        self.assertFalse(os.path.exists(os.path.join(root, ".git", "config.worktree")))
+        self.start()  # no per-worktree file yet: an empty configuration, not an error
+        git(root, "config", "--worktree", "core.sshCommand", "/usr/bin/ssh -o BatchMode=no")
+        self.evidence("S-001")
+        r = self.run_niten("review", "S-001")
+        self.assertIn("git configuration of app changed", r.stderr)
+
+    def test_an_unreadable_worktree_configuration_stops_the_check(self):
+        root = os.path.join(self.ws, "app")
+        git(root, "config", "extensions.worktreeConfig", "true")
+        os.makedirs(os.path.join(root, ".git", "config.worktree"))  # present but not a readable file
+        r = self.run_niten("start", "--plan", self.plan)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertFalse(os.path.exists(os.path.join(self.state, "state.json")))
+
+    def test_a_changed_conditional_include_stops_the_review(self):
+        root = os.path.join(self.ws, "app")
+        branch = git(root, "symbolic-ref", "--short", "HEAD")
+        inc = os.path.join(self.tmp, "conditional.cfg")
+        with open(inc, "w") as f:
+            f.write("[core]\n\tsshCommand = /usr/bin/ssh -o BatchMode=yes\n")
+        git(root, "config", f"includeIf.onbranch:{branch}.path", inc)
+        self.start()
+        with open(inc, "w") as f:
+            f.write("[core]\n\tsshCommand = /usr/bin/ssh -o BatchMode=no\n")
+        self.evidence("S-001")
+        r = self.run_niten("review", "S-001")
+        self.assertIn("git configuration of app changed", r.stderr)
+
     def test_global_git_configuration_is_put_to_the_user(self):
         self.start()
         out = self.bash("git config --global diff.hide.textconv /usr/bin/true", WHY)

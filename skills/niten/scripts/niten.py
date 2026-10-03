@@ -451,7 +451,11 @@ def config_meta(path):
     scopes = ["--local"]
     if git(path, "config", "--local", "--bool", "--get", "extensions.worktreeConfig") == "true":
         scopes.append("--worktree")
+    gitdir = os.path.join(path, git_strict(path, "rev-parse", "--git-dir").decode().strip())
     for scope in scopes:
+        if scope == "--worktree" and not os.path.exists(os.path.join(gitdir, "config.worktree")):
+            meta["config " + scope] = "absent"  # optional: no per-worktree settings yet
+            continue
         fields = git_strict(path, "config", scope, "--includes", "--show-origin", "--list", "-z").decode(
             "utf-8", "surrogateescape").split("\0")
         kept = [f"{origin}\0{entry}" for origin, entry in zip(fields[0::2], fields[1::2])
