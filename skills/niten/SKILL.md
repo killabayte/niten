@@ -45,7 +45,8 @@ plan path or a ticket key; if empty, ask which plan.
    `niten.py pause "<what you need>"`; the pause ends by itself when the user answers.
    When the user must check or approve something, bring it to them: put the content
    itself (the text, the diff, the exact values) in the question, and never ask them to
-   open a file or a path. Their answer is logged and is the evidence.
+   open a file or a path. Their answer is logged, with the question, and is the
+   evidence. Content longer than a few screens goes in parts, one question each.
 5. **Stay in the plan's scope.** Do exactly the step's actions: no side refactors, no
    extra improvements. If the plan is wrong or impossible, stop and ask the user — do
    not silently deviate. A changed plan stops all reviews.

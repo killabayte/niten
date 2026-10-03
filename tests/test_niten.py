@@ -734,6 +734,31 @@ class HookTest(Base):
         self.assertEqual(entries[1]["exit_code"], "interrupted")
         self.assertEqual(entries[2]["exit_code"], "running in background")
 
+    def test_what_the_user_approves_is_logged_whole(self):
+        lines = [f"Line {i:03}: ordinary reviewable documentation for the current change." for i in range(180)]
+        lines[90] = "REQUIRED_MIDDLE_DETAIL: retention is 30 days, not 365 days."
+        question = "Do you approve the following text for R-001.C1?\n" + "\n".join(lines)
+        self.assertGreater(len(question), 10000)
+        self.hook("posttooluse", tool_name="AskUserQuestion",
+                  tool_input={"questions": [{"question": question, "header": "Acceptance", "multiSelect": False,
+                                             "options": [{"label": "Approve", "description": "ok"},
+                                                         {"label": "Revise", "description": "no"}]}]},
+                  tool_response={"answers": {question: "Approve"}})
+        self.hook("userprompt", prompt="Keep the retention at 30 days. " + "x" * 9000 + " END_OF_MESSAGE")
+        self.hook("posttooluse", tool_name="AskUserQuestion", tool_input={"questions": [{"question": "word " * 50000}]},
+                  tool_response={"answers": {"q": "Approve"}})
+        with open(os.path.join(self.state, "commands.jsonl")) as f:
+            entries = [json.loads(l) for l in f]
+        self.assertIn("REQUIRED_MIDDLE_DETAIL", entries[0]["questions"])
+        self.assertIn("REQUIRED_MIDDLE_DETAIL", entries[0]["answers"])
+        self.assertFalse(entries[0]["truncated"])
+        self.assertIn("Keep the retention", entries[1]["text"])
+        self.assertIn("END_OF_MESSAGE", entries[1]["text"])
+        self.assertTrue(entries[2]["truncated"])
+        self.assertIn("characters cut by Niten", entries[2]["questions"])
+        self.evidence("S-001")
+        self.ok("review", "S-001")  # the signatures still hold for long entries
+
     def test_hooks_never_fail_on_bad_input(self):
         for kind in ("stop", "pretooluse", "posttooluse", "userprompt"):  # PostToolUseFailure shares posttooluse
             r = self.run_niten("hook-" + kind, stdin="not json")
