@@ -1,106 +1,122 @@
-# Niten
+# niten
 
-**Niten — Two Skies.** A Go framework for executing approved
-[Shogun](https://github.com/killabayte/shogun) plans with two models:
+[![ci](https://github.com/killabayte/niten/actions/workflows/ci.yml/badge.svg)](https://github.com/killabayte/niten/actions/workflows/ci.yml)
 
-- **Claude Opus 5.5 / xhigh**, via Claude Code, is the primary executor.
-- **GPT-6 Astra / xhigh**, via Codex CLI, is the independent reviewer.
+Niten executes an approved [Shogun](https://github.com/killabayte/shogun) plan as a **pair
+session** in Claude Code. Claude implements each step in your normal environment, Codex
+reviews every step and the final change independently, and you are asked whenever access,
+a decision or missing information is needed.
 
-Niten manages the processes, working copies, checks, exchange of findings
-and recovery after a stop. Opus writes the code; Astra reviews immutable
-snapshots in its own disposable copy. v0.1 runs the pair sequentially; parallel
-execution remains a later design goal, informed by the first pilot.
+It is a Claude Code skill (`/niten`) with a small script and two hooks. Shogun plans the
+work with two models; Niten carries it out with the same two models in fixed roles.
 
-The result is a local branch with the implementation and a report that ties the
-plan's requirements, checks and final review to a specific version of the code.
-Niten sets `done` once every acceptance condition is met. If the work cannot be
-finished, the changes, the evidence and the specific reason for stopping remain.
-`implemented` separately marks finished code with external criteria still
-pending; the user confirms them through attestations. `export` delivers the
-result into a new local ref of the source repo.
+## How it works
 
-## Status
+- **Claude is the executor.** It follows the plan step by step: code changes, commands,
+  operations outside the repository (registries, cloud CLIs, infrastructure tools). It
+  works with your tools and your network, and Claude Code's permission prompts are how you
+  approve anything outward-facing.
+- **Codex is the reviewer.** After each step, `niten.py review` runs `codex exec` in a
+  read-only sandbox with the step, the repositories' diffs against their base commits and
+  the step's evidence. Codex returns a structured verdict: each acceptance criterion as
+  met, not met or not verifiable, and findings with severity and the exact fix. A step
+  passes only on `approve` with no blocker or major finding and no unmet criterion;
+  otherwise Claude fixes the findings and asks again. A final review checks the whole
+  change against the plan before anything is delivered.
+- **You are in the loop.** Claude asks when it needs a login, a permission, a decision the
+  plan leaves open or information it cannot find. It does not guess around a gap. After
+  three unapproved reviews of one step, or a disagreement on substance, it asks you too.
+- **Evidence, not claims.** For every step Claude records the exact commands, exit codes and
+  outputs (digests, IDs) in an evidence file. The reviewer cannot use the network, so
+  external operations are judged from that record.
 
-Offline P0a, P1, P2 and P3, 1 October 2026. `niten prepare` imports an approved Shogun
-plan into a prepared run: it verifies the plan triplet, checks the source repository
-against the approved base and freezes the execution contract, without calling a model.
-`niten run`, `niten resume` and `niten status` drive a prepared run through the
-sequential loop. For every step that is executor turn, coordinator checks in the
-verifier sandbox, independent review and bounded repairs. Then come a final check and
-review of the whole change, and an execution receipt. Optional step gates, questions and
-attestations go through `resume --answers`.
+## What is enforced
 
-The engine is tested offline on scripted model CLIs and the real verifier sandbox. No
-live model has been called; the first live run is the separately authorized pilot.
-`niten doctor --live` certifies the executor and reviewer profiles with one call of each
-CLI, and runs refuse to start without a passing certificate. The harness is tested
-offline; the live probe needs a separately authorized budget and has not run.
-`niten version`, `niten help` and an offline `niten doctor` also work. `verify` and
-`export` are present but refuse to run with exit code 2. `prepare` needs a Shogun build
-with the S0 manifest sidecar (`shogun verify --require-manifest`).
+Two hooks make the key rules hold whatever the model does. They act only in the Claude
+Code session that started a Niten session and do nothing anywhere else.
 
-These documents have not gone through a separate Shogun run and are not a plan with its
-approval receipt.
+| Hook | Rule |
+|---|---|
+| `Stop` | Claude cannot end its turn while the current step, or the final review, is not approved, unless the session is paused to wait for you. |
+| `PreToolUse` (Bash) | No `git push` and no pull request before the final review approved the change. |
 
-```text
-go build ./... && go test ./...      # offline; the sandbox tests need macOS
-go run ./cmd/niten doctor            # checks the verifier sandbox, never calls a model
-go run ./cmd/niten prepare PLAN.md --repo repo-1=/path/to/checkout
-go run ./cmd/niten doctor --live     # one claude and one codex call; needs an authorized budget
-go run ./cmd/niten run RUN_ID        # calls the configured claude and codex CLIs
-go run ./cmd/niten status RUN_ID
+Everything else (scope, evidence, asking instead of guessing) is the skill's instruction
+to the model, backed by the reviewer, which rejects out-of-scope or unproven work.
+
+## Requirements
+
+- [Claude Code](https://docs.anthropic.com/en/docs/claude-code) and the
+  [Codex CLI](https://github.com/openai/codex), both logged in.
+- Python 3.9 or later and git.
+- A Shogun plan: `<plan>.md` with its `<plan>.approval.json` (and, from newer Shogun,
+  `<plan>.manifest.json`, which tells Niten where the repositories are).
+
+## Install
+
+```
+git clone https://github.com/killabayte/niten.git && cd niten
+./install.sh
 ```
 
-## Documents
+The skill is linked into `~/.claude/skills/niten`, so `git pull` updates it. The hooks are
+added to `~/.claude/settings.json` after a backup; running the installer again changes
+nothing. `./install.sh uninstall` removes both. `CLAUDE_CONFIG_DIR` is honoured. Start a
+new Claude Code session afterwards.
 
-1. [Architecture](docs/architecture.md): roles, parallelism, states, the
-   completion criterion, recovery and the layout of the Go application.
-2. [Shogun contract](docs/shogun-contract.md): importing the existing format,
-   integrity, the source repository version and verifiability of criteria.
-3. [Roadmap](docs/roadmap.md): small stages with acceptance conditions.
-4. [Source research](docs/research.md): what we take from Shogun, revmux
-   and ralphex, with links to the studied commits.
-5. [Example configuration](examples/niten.toml): proposed values for v0.1.
-6. [P0 profiles](docs/p0-profile.md): concrete argv, the settings template and the early probe.
-7. [Design review decisions](docs/reviews/2026-09-30-design-review.md): accepted
-   decisions and corrections, verified against the local CLIs.
-8. [Manifest sidecar change](docs/shogun-manifest-sidecar.md): the scoped Shogun
-   publication prerequisite for portable Niten input.
-9. [Practical review decisions](docs/reviews/2026-09-30-practical-review.md): local
-   plan inventory, verifier isolation and the revised release sequence.
-10. [Contracts](docs/contracts.md): the implemented message and record schemas and
-    the shape decisions they fix.
-11. [Import](docs/import.md): what `niten prepare` checks, the renderer grammar, reason
-    codes and the prepared run layout.
-12. [Runner](docs/runner.md): the P2 store, clone, verifier, supervisor, adapters and
-    crash recovery.
-13. [Engine](docs/engine.md): the P3 loop, journal, trust rules, checks, packets,
-    limits, gates, the final gate and the receipt.
-14. [Live probe](docs/live-probe.md): `doctor --live`, its controls, budget, binding and
-    certificate.
+## Use
 
-## First version
+In Claude Code, from the directory that holds the plan's repositories:
 
-The framework starts as a Go CLI with internal packages; a public SDK is deferred.
-v0.1 executes one clean Git repository with an executor/reviewer repair loop,
-persisted progress and an optional `--gate-per-step` for human supervision.
-Additional read-only context repositories require the separate P0b profile gate.
-Model invocations use the existing Claude Code and Codex CLI logins. The store
-and working copies live outside the source repository.
+```
+/niten path/to/plan.md
+```
 
-The four archived Shogun plans inspected locally all have linear dependencies;
-this sample does not justify a speedup claim for parallel execution. The bounded
-pilot comes immediately after the sequential P3 slice. P4 parallel scheduling is
-outside v0.1 and is selected only after that pilot. Detailed boundaries and later
-capabilities are described in the architecture.
+or just ask Claude to execute a plan or a ticket that has one. Claude checks the plan's
+approval, prepares a work branch per repository with your confirmation, starts the
+session and goes step by step. At the end it asks how to deliver (push and pull request,
+or local branches only).
 
-## The boundary of the promise
+## The script
 
-It cannot be guaranteed that two models will solve any plan or find any defect.
-What can be built is a verifiable protocol: never declare success without the
-required evidence, bound the spend and preserve the work on a stop. That is the
-core contract of Niten.
+`skills/niten/scripts/niten.py` keeps the session state and runs the reviewer; Claude
+calls it, you rarely need to.
+
+| Command | What it does |
+|---|---|
+| `start --plan P [--repo NAME=PATH]` | Records each repository's base commit and pre-existing changes, registers the session for this Claude Code session |
+| `status` | Steps, their review counts, what is next |
+| `review S-NNN` | Codex reviews the current step |
+| `final` | Codex reviews the whole change, after every step is approved |
+| `pause "reason"` / `resume` | Wait for you without the Stop hook blocking |
+| `attach --state DIR` | Continue a session in a new Claude Code session |
+| `finish [--abort]` | End the session |
+
+Repositories are found by `--repo` (by name or `repo-N` alias), then the plan's manifest,
+then `$NITEN_WORKSPACE/<name>`, then `<cwd>/<name>`.
+
+State lives next to the plan in `<plan>.niten/`: `state.json`, `evidence/<step>.md`, and
+`reviews/` with every reviewer prompt and verdict.
+
+Settings (environment): `NITEN_REVIEW_MODEL` (default `gpt-6-astra`), `NITEN_REVIEW_EFFORT`
+(`high`), `NITEN_REVIEW_TIMEOUT` (seconds, `1800`), `NITEN_CODEX` (default: Shogun's
+`codex_command`, then `codex` on PATH), `NITEN_WORKSPACE`.
+
+## Tests
+
+```
+python3 -m unittest discover -s tests
+```
+
+The tests use temporary repositories and a scripted Codex; no model is called.
+
+## History
+
+Niten started as a Go engine that ran plans inside a sealed sandbox with certified CLI
+profiles (tag `go-engine-v0.1`). Sealing the agents off from the network, credentials and
+other repositories made it unable to carry real work end to end, so it was replaced by
+this skill: the same executor and reviewer, in your environment, with you approving
+access instead of the sandbox refusing it.
 
 ## License
 
-MIT. No third-party project sources were copied during the design stage.
+MIT
