@@ -6,6 +6,17 @@ reviewer is Codex (`codex exec`, read-only sandbox), called by `review` and
 `final`. State lives next to the plan in `<plan>.niten/`; active sessions are
 registered in ~/.claude/niten/active.json, bound to the Claude Code session id,
 so the hooks can find them.
+
+Hooks (registered by install.sh), all inert outside an active session:
+  Stop              blocks ending a turn while the current step or the final
+                    review is unapproved, unless the session waits for the user
+  PreToolUse        delivery only after the final review of the exact commits;
+                    important actions go to the user with the executor's reason;
+                    the session state, the plan and Claude's settings are not
+                    edited by hand
+  PostToolUse(Failure)  records every Bash command with its exit code and output,
+                    and the user's answers to the executor's questions
+  UserPromptSubmit  records the user's messages and ends a pause when they answer
 """
 
 import argparse
@@ -19,21 +30,31 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
 
 HOME = os.path.expanduser("~")
-REGISTRY = os.path.join(HOME, ".claude", "niten", "active.json")
-CONFIG = os.path.join(HOME, ".claude", "niten", "config.json")
+NITEN_HOME = os.path.join(HOME, ".claude", "niten")
+REGISTRY = os.path.join(NITEN_HOME, "active.json")
+CONFIG = os.path.join(NITEN_HOME, "config.json")
 HERE = os.path.dirname(os.path.abspath(__file__))
+SCRIPT = os.path.join(HERE, "niten.py")
 SCHEMA = os.path.join(HERE, "verdict.schema.json")
+
+MAX_REVIEWS = 3          # unapproved reviews of one step before the user must decide
+MAX_STOP_BLOCKS = 3      # Stop blocks in a row without progress before the turn may end
+MIN_EXPLANATION = 25     # characters of the executor's reason for an important action
+LOG_TAIL = 4000          # characters of stdout/stderr kept per logged command
+
+# ---------------------------------------------------------------- classification
 
 DELIVERY = [
     re.compile(r"\bgit\b[^|;&]*\bpush\b"),
     re.compile(r"\bgh\s+pr\s+(create|merge)\b"),
     re.compile(r"\bbb\s+pr\b"),
-    re.compile(r"pullrequests"),
+    re.compile(r"\b(curl|wget|http)\b[^|;&]*pullrequests"),
 ]
 
-# Commands with an effect outside the working tree, or one that cannot be undone. In a
+# Actions with an effect outside the working tree, or one that cannot be undone. In a
 # Niten session each one needs the user's approval with an explanation, whatever the
 # permission settings would otherwise allow.
 IMPORTANT = [
@@ -48,13 +69,26 @@ IMPORTANT = [
     ("a package publication", r"\b(npm|yarn|pnpm)\s+publish\b|\btwine\s+upload\b|\bgradlew?\b[^|;&]*\bpublish\w*\b"),
     ("a command on another machine", r"(^|[\s;&|(])(ssh|scp|rsync)\s"),
     ("a command as root", r"(^|[\s;&|(])sudo\s"),
+    ("a Niten override", r"\bniten\.py\b[^|;&]*(--abort|--restart|--unapproved|--user-approved|\bconfirm\b)"),
 ]
 
 # aws operations that only read; every other aws operation changes something.
 AWS_READ = re.compile(r"^(describe|list|get|wait|help|ls)\b|^(describe-|list-|get-|batch-get-|search-|lookup-|validate-|filter-|test-)")
 AWS_VALUED = {"--profile", "--region", "--output", "--endpoint-url", "--query", "--color", "--ca-bundle",
               "--cli-read-timeout", "--cli-connect-timeout", "--cli-binary-format"}
-MIN_EXPLANATION = 25
+
+# MCP tools whose names say they change something in another system.
+MCP_WRITE = re.compile(r"(create|update|delete|remove|send|post|add|edit|move|transition|merge|close|comment|"
+                       r"publish|upload|write|assign|schedule|archive|invite|share|rename|set_|_set|replace)", re.I)
+FILE_TOOLS = {"Write": "file_path", "Edit": "file_path", "MultiEdit": "file_path", "NotebookEdit": "notebook_path"}
+
+SECRETS = [
+    re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{8,}"),
+    re.compile(r"\b(AKIA|ASIA)[A-Z0-9]{16}\b"),
+    re.compile(r"(?i)\b(password|passwd|secret|token|api[_-]?key|authorization)\b[\"']?(\s*[:=]\s*|\s+)[\"']?[^\"'\s,}]+"),
+    re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b"),
+    re.compile(r"[A-Za-z0-9+/=_-]{120,}"),
+]
 
 
 def aws_writes(command):
@@ -91,6 +125,15 @@ def important(command):
     return None
 
 
+def redact(text):
+    for p in SECRETS:
+        text = p.sub("[REDACTED]", text)
+    return text
+
+
+# ---------------------------------------------------------------- basics
+
+
 def now():
     return dt.datetime.now().astimezone().isoformat(timespec="seconds")
 
@@ -122,6 +165,19 @@ def save_json(path, data):
     os.replace(tmp, path)
 
 
+def sha256_file(path):
+    try:
+        with open(path, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
+    except OSError:
+        return ""
+
+
+def within(path, root):
+    path, root = os.path.realpath(path), os.path.realpath(root)
+    return path == root or path.startswith(root.rstrip(os.sep) + os.sep)
+
+
 # ---------------------------------------------------------------- registry
 
 
@@ -143,11 +199,6 @@ def unregister(state_dir):
     save_json(REGISTRY, [e for e in registry() if e["state_dir"] != state_dir])
 
 
-def within(path, root):
-    path, root = os.path.realpath(path), os.path.realpath(root)
-    return path == root or path.startswith(root.rstrip(os.sep) + os.sep)
-
-
 def find_active(cwd, sid=None):
     """The active niten session of a Claude session: by its session id when both
     sides have one, otherwise the session whose cwd or repositories contain cwd."""
@@ -163,8 +214,7 @@ def find_active(cwd, sid=None):
         st = load_json(os.path.join(e["state_dir"], "state.json"))
         if not st:
             continue
-        roots = [e["cwd"]] + [r["path"] for r in st["repos"].values()]
-        for root in roots:
+        for root in [e["cwd"]] + [r["path"] for r in st["repos"].values()]:
             if within(cwd, root) and len(root) > best_len:
                 best, best_len = e["state_dir"], len(root)
     return best
@@ -190,7 +240,7 @@ def save_state(d, st):
     save_json(os.path.join(d, "state.json"), st)
 
 
-# ---------------------------------------------------------------- plan
+# ---------------------------------------------------------------- plan and repositories
 
 
 STEP_RE = re.compile(r"^### (S-\d+)\s*[—-]\s*(.+?)\s*$", re.M)
@@ -221,6 +271,11 @@ def plan_repos(text):
     return names, aliases
 
 
+def sidecars(plan):
+    stem = os.path.splitext(plan)[0]
+    return [plan, stem + ".approval.json", stem + ".manifest.json"]
+
+
 def step_of(st, sid):
     for s in st["steps"]:
         if s["id"] == sid:
@@ -235,6 +290,23 @@ def current_step(st):
     return None
 
 
+def st_dir(st):
+    return os.path.splitext(st["plan"])[0] + ".niten"
+
+
+def heads(st):
+    return {name: git(r["path"], "rev-parse", "HEAD") for name, r in st["repos"].items()}
+
+
+def new_changes(st, r):
+    """Uncommitted entries that were not there when the session started, other than
+    the session's own files (a plan kept inside the repository)."""
+    before = set((r["preexisting"] or "").splitlines())
+    own = [os.path.relpath(p, r["path"]) for p in sidecars(st["plan"]) + [st_dir(st)] if within(p, r["path"])]
+    return [l for l in git(r["path"], "status", "--porcelain").splitlines()
+            if l not in before and not any(l[3:].strip('"').startswith(o) for o in own)]
+
+
 # ---------------------------------------------------------------- codex
 
 
@@ -244,8 +316,8 @@ def codex_bin():
     cfg = os.path.join(HOME, ".config", "shogun", "config.toml")
     try:
         m = re.search(r'^codex_command\s*=\s*"([^"]+)"', open(cfg).read(), re.M)
-        if m and os.access(m.group(1), os.X_OK):
-            return m.group(1)
+        if m and os.access(os.path.expanduser(m.group(1)), os.X_OK):
+            return os.path.expanduser(m.group(1))
     except OSError:
         pass
     p = shutil.which("codex")
@@ -257,136 +329,250 @@ def codex_bin():
     die("codex not found; set NITEN_CODEX")
 
 
+def valid_verdict(v):
+    def strs(d, keys):
+        return isinstance(d, dict) and all(isinstance(d.get(k), str) for k in keys)
+    return (isinstance(v, dict) and v.get("verdict") in ("approve", "request_changes")
+            and isinstance(v.get("summary"), str)
+            and isinstance(v.get("criteria"), list) and isinstance(v.get("findings"), list)
+            and all(strs(c, ("id", "evidence")) and c.get("status") in ("met", "not_met", "cannot_verify")
+                    for c in v["criteria"])
+            and all(strs(f, ("location", "problem", "fix")) and f.get("severity") in ("blocker", "major", "minor")
+                    for f in v["findings"])
+            and isinstance(v.get("previous_findings"), list)
+            and all(strs(p, ("finding", "note")) and p.get("status") in ("addressed", "not_addressed", "withdrawn")
+                    for p in v["previous_findings"])
+            and isinstance(v.get("declined"), list) and all(isinstance(x, str) for x in v["declined"]))
+
+
 def run_codex(prompt, root, out_path):
+    """One reviewer call: read-only sandbox, no user config, MCP servers, plugins or
+    sub-agents (MCP tools are not bound by the sandbox), schema-checked output."""
     model = os.environ.get("NITEN_REVIEW_MODEL", "gpt-6-astra")
     effort = os.environ.get("NITEN_REVIEW_EFFORT", "high")
     timeout = int(os.environ.get("NITEN_REVIEW_TIMEOUT", "1800"))
-    argv = [codex_bin(), "exec", "--output-schema", SCHEMA, "-o", out_path,
+    argv = [codex_bin(), "exec", "--json", "--output-schema", SCHEMA, "-o", out_path,
             "-m", model, "-c", "model_reasoning_effort=" + effort, "-c", 'approval_policy="never"',
-            "-s", "read-only", "--ephemeral", "--skip-git-repo-check", "-C", root,
+            "-s", "read-only", "--ephemeral", "--skip-git-repo-check", "--ignore-user-config", "--ignore-rules", "-C", root,
+            "-c", "mcp_servers={}", "-c", "plugins={}", "-c", "agents.enabled=false",
             "-c", 'web_search="disabled"', "-"]
     print(f"niten: reviewer {model}/{effort} working (timeout {timeout // 60} min)...", file=sys.stderr, flush=True)
+    started = time.time()
     try:
         r = subprocess.run(argv, input=prompt, capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
-        die("reviewer timed out; the step stays unapproved")
+        die("reviewer timed out; nothing was approved")
     if r.returncode != 0:
         tail = "\n".join((r.stderr or r.stdout).strip().splitlines()[-15:])
-        die(f"reviewer failed (exit {r.returncode}):\n{tail}")
+        die(f"reviewer failed (exit {r.returncode}); nothing was approved:\n{tail}")
+    usage = {}
+    for line in (r.stdout or "").splitlines():
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(ev, dict) and ev.get("type") == "turn.completed" and isinstance(ev.get("usage"), dict):
+            usage = ev["usage"]
     verdict = load_json(out_path)
-    if not isinstance(verdict, dict) or verdict.get("verdict") not in ("approve", "request_changes"):
-        die("reviewer returned no valid verdict in " + out_path)
-    return verdict, model, effort
+    if not valid_verdict(verdict):
+        die("reviewer returned no valid verdict in " + out_path + "; nothing was approved")
+    return verdict, {"model": model, "effort": effort, "seconds": round(time.time() - started), "usage": usage}
 
 
 def approved(v):
     bad = [f for f in v["findings"] if f["severity"] in ("blocker", "major")]
     unmet = [c for c in v["criteria"] if c["status"] == "not_met"]
-    return v["verdict"] == "approve" and not bad and not unmet
+    open_ = [p for p in v["previous_findings"] if p["status"] == "not_addressed"]
+    return v["verdict"] == "approve" and not bad and not unmet and not open_
 
 
-def repos_block(st):
-    lines = []
+def unverified(v):
+    return [c for c in v["criteria"] if c["status"] == "cannot_verify"]
+
+
+# ---------------------------------------------------------------- review
+
+
+def indent(text, empty):
+    return "".join(f"    {l}\n" for l in (text or empty).splitlines())
+
+
+def repos_block(st, since, final):
+    out = []
     for name, r in st["repos"].items():
-        head = git(r["path"], "rev-parse", "HEAD")
-        branch = git(r["path"], "rev-parse", "--abbrev-ref", "HEAD")
-        stat = git(r["path"], "diff", "--stat", r["base"]) or "(no changes against base)"
-        status = git(r["path"], "status", "--porcelain") or "(clean)"
+        start = since.get(name) or r["base"]
         alias = f" ({r['alias']})" if r.get("alias") else ""
-        lines.append(
-            f"- {name}{alias}: path {r['path']}\n"
-            f"  base {r['base']} (branch at start: {r['branch']}), now {head} on {branch}\n"
-            f"  already changed or untracked before the session (not part of the change):\n"
-            + "".join(f"    {l}\n" for l in (r["preexisting"] or "(none)").splitlines())
-            + f"  diff --stat against base:\n" + "".join(f"    {l}\n" for l in stat.splitlines())
-            + f"  git status now:\n" + "".join(f"    {l}\n" for l in status.splitlines())
-        )
-    return "\n".join(lines)
+        part = (f"- {name}{alias}: {r['path']}\n"
+                f"  session base {r['base']} (branch {r['branch']}), now {git(r['path'], 'rev-parse', 'HEAD')} "
+                f"on {git(r['path'], 'rev-parse', '--abbrev-ref', 'HEAD')}\n"
+                f"  present before the session, not part of the change:\n{indent(r['preexisting'], '(nothing)')}")
+        if final:
+            part += (f"  the whole change: `git -C {r['path']} diff {r['base']}`\n"
+                     + indent(git(r["path"], "diff", "--stat", r["base"]), "(no changes)"))
+        else:
+            part += (f"  THIS step's changes: `git -C {r['path']} diff {start}`\n"
+                     + indent(git(r["path"], "diff", "--stat", start), "(no changes in this repository)"))
+            if start != r["base"]:
+                part += (f"  earlier steps, already approved (not this step's scope): "
+                         f"`git -C {r['path']} log --oneline {r['base']}..{start}`\n")
+        out.append(part)
+    return "\n".join(out)
 
 
 def prior_findings(reviews):
-    if not reviews:
-        return "none"
-    last = load_json(reviews[-1]["file"], {})
-    fs = last.get("findings", [])
-    if not fs:
-        return "the previous review had no findings"
-    return "\n".join(f"- [{f['severity']}] {f['location']}: {f['problem']} (asked fix: {f['fix']})" for f in fs)
+    """Every finding raised so far in this scope, by round: the ledger a re-review
+    settles item by item."""
+    lines = []
+    for r in reviews:
+        v = load_json(r["file"], {}) or {}
+        for f in v.get("findings", []):
+            lines.append(f"- round {r['n']} [{f['severity']}] {f['location']}: {f['problem']} (asked fix: {f['fix']})")
+    return "\n".join(lines) if lines else "none"
 
 
 REVIEW_RULES = """\
 You are the independent reviewer in a pair session; another model (the executor) did
 the work. You may read any file and run read-only commands (git log/diff/show/status,
-grep, cat, ls). You cannot write files or use the network, so for external operations
-(registries, cloud APIs) judge the executor's recorded commands and outputs in the
-evidence file, and say in the criterion's evidence when you could not verify yourself.
+grep, cat, ls). You cannot write files or use the network.
+
+Two kinds of evidence exist. The command log is recorded by the harness, not by the
+executor: each entry is a command the executor actually ran, with its exit code and the
+tail of its output (secrets masked). The evidence file is the executor's own account,
+mapping each verification to proof. Trust the log over the account: a claim the log
+does not support is not proven. For external operations (registries, cloud APIs) the log
+is the proof; say in the criterion's evidence which log entry proves it, or that you
+could not verify it.
+
+The log also holds the user's own messages and answers ("kind": "user_message" or
+"question"): a deviation from the plan counts as decided only if the user decided it
+there. The executor's evidence file may answer earlier findings; treat its arguments as
+claims, and never lower a finding's severity on a stated rationale alone.
 
 Check:
-1. Every acceptance criterion and verification of the step is met and proven by the
-   diff, the files or the recorded evidence. A claim without proof is not met.
-2. Nothing outside the step's scope changed: no side refactors, no unrelated files, no
-   edits to the plan. Changes listed as already present before the session do not count.
-3. No secrets or credentials in the diff or in the evidence.
-4. Findings of the previous review, if any, are resolved.
+1. Every acceptance criterion and verification in scope is met and proven by the diff,
+   the files or the command log.
+2. Nothing outside the scope changed: no side refactors, no unrelated files, no edits to
+   the plan. Changes present before the session do not count.
+3. No secrets or credentials in the diff, the evidence or the log.
+4. Earlier findings: settle each one in `previous_findings` as addressed, not_addressed
+   or withdrawn (only on new evidence), with a short note. On a re-review report new
+   problems only if they are real and in scope; prefer one strong finding over several
+   weak ones, and do not reopen settled points.
 
 Approve only if all of this holds. Otherwise request changes. Each finding names the
 file or command, the problem and the exact fix. Severity: blocker (wrong or unsafe),
-major (a criterion not met or not proven), minor (does not block). Return the JSON
-object the schema requires; list every criterion id of the step in `criteria`.
+major (a criterion not met or not proven), minor (does not block). Use cannot_verify
+only when neither the files nor the log can prove a criterion; it goes to the user. In
+`declined`, list anything you chose not to judge, with the reason. Return the JSON object
+the schema requires; list every criterion id in scope in `criteria`.
 """
 
 
-def review_step(d, st, sid, final=False):
-    plan_path = st["plan"]
-    text = open(plan_path).read()
-    if not final:
-        step = step_of(st, sid)
-        ev = os.path.join(d, "evidence", sid + ".md")
-        if not os.path.exists(ev) or os.path.getsize(ev) == 0:
-            die(f"write the evidence first: {ev} (the commands you ran, their exit codes and the relevant output)")
+def log_summary(d, sid):
+    path = os.path.join(d, "commands.jsonl")
+    n = 0
+    try:
+        with open(path) as f:
+            for line in f:
+                try:
+                    if sid is None or json.loads(line).get("step") == sid:
+                        n += 1
+                except ValueError:
+                    pass
+    except OSError:
+        pass
+    which = "every entry" if sid is None else f'entries with "step": "{sid}"'
+    return f"Command log (recorded by the harness): {path} — {which}, {n} command(s)"
+
+
+def review_step(d, st, sid, final, user_approved):
+    plan = st["plan"]
+    if sha256_file(plan) != st["plan_sha256"]:
+        die("the plan changed since the session started; ask the user (a changed plan needs a new "
+            "Shogun approval and a new session)")
+    step = st["final"] if final else step_of(st, sid)
+    reviews = step["reviews"]
+    failed = sum(1 for r in reviews if not r["approved"])
+    if failed >= MAX_REVIEWS and not user_approved:
+        die(f"{failed} reviews without approval. Stop and ask the user how to proceed; if they want another "
+            f"review, run it with --user-approved \"<their decision>\" (they confirm it in a permission prompt)")
+    for name, r in st["repos"].items():
+        fresh = new_changes(st, r)
+        if fresh:
+            die(f"commit the {'change' if final else 'step'}'s changes in {name} before the review "
+                f"(uncommitted: {', '.join(fresh[:5])})")
+    ev = os.path.join(d, "evidence", ("final" if final else sid) + ".md")
+    if not os.path.exists(ev) or os.path.getsize(ev) == 0:
+        die(f"write the evidence first: {ev} (for each verification: which logged command proves it, and how)")
+    text = open(plan).read()
+    if final:
+        what = "the whole change (final review)"
+        scope = ("Review the complete change against the plan's goal, every requirement and its acceptance "
+                 "criteria, and the plan's end-to-end verification. Every step was approved separately; look "
+                 "for gaps between steps, missing criteria and anything outside the plan's scope.\n")
+        since = {}
+    else:
         section = next(s["text"] for s in plan_steps(text) if s["id"] == sid)
-        reviews = step["reviews"]
         what = f"step {sid} ({step['title']})"
         scope = f"The step, as the plan states it:\n\n{section}\n"
-        evidence = f"Evidence file of this step: {ev}"
-    else:
-        step = st["final"]
-        reviews = step["reviews"]
-        what = "the whole change (final review)"
-        scope = ("Review the complete change against the plan's goal, every requirement and its "
-                 "acceptance criteria, and the plan's end-to-end verification. Every step was "
-                 "approved separately; look for gaps between steps, missing criteria and "
-                 "anything outside the plan's scope.\n")
-        evs = sorted(glob.glob(os.path.join(d, "evidence", "*.md")))
-        evidence = "Evidence files: " + ", ".join(evs) if evs else "Evidence files: none"
+        since = step.get("start") or {}
     n = len(reviews) + 1
-    prompt = (
-        f"Review {what} of the plan at {plan_path}. Read the plan file for the requirements, "
-        f"criteria and context.\n\n{scope}\nRepositories:\n{repos_block(st)}\n{evidence}\n\n"
-        f"Findings of the previous review of this {('change' if final else 'step')}:\n{prior_findings(reviews)}\n\n"
-        + REVIEW_RULES
-    )
+    prompt = (f"Review {what} of the plan at {plan}. Read the plan file for the requirements, criteria and "
+              f"context.\n\n{scope}\nRepositories:\n{repos_block(st, since, final)}\n"
+              f"Executor's evidence: {ev}\n{log_summary(d, None if final else sid)}\n\n"
+              f"Findings of the previous review:\n{prior_findings(reviews)}\n\n" + REVIEW_RULES)
     name = ("final" if final else sid) + f"-r{n}"
     os.makedirs(os.path.join(d, "reviews"), exist_ok=True)
     with open(os.path.join(d, "reviews", name + ".prompt.md"), "w") as f:
         f.write(prompt)
     out = os.path.join(d, "reviews", name + ".json")
-    root = os.path.commonpath([r["path"] for r in st["repos"].values()] + [os.path.dirname(plan_path)])
-    verdict, model, effort = run_codex(prompt, root, out)
-    ok = approved(verdict)
-    reviews.append({"n": n, "file": out, "verdict": verdict["verdict"], "approved": ok, "at": now(),
-                    "model": model, "effort": effort})
-    step["status"] = "approved" if ok else "changes_requested"
+    root = os.path.commonpath([r["path"] for r in st["repos"].values()] + [os.path.dirname(plan), d])
+    st["reviewing"] = {"pid": os.getpid(), "scope": name, "since": now()}
     save_state(d, st)
-    print(f"{what}: review {n} -> {'APPROVED' if ok else 'CHANGES REQUESTED'}")
+    try:
+        verdict, meta = run_codex(prompt, root, out)
+    finally:
+        st = load_state(d)
+        st["reviewing"] = None
+        save_state(d, st)
+        step = st["final"] if final else step_of(st, sid)
+        reviews = step["reviews"]
+    ok = approved(verdict)
+    needs_user = ok and final and bool(unverified(verdict))
+    at_heads = heads(st)
+    reviews.append({"n": n, "file": out, "verdict": verdict["verdict"], "approved": ok, "at": now(),
+                    "heads": at_heads, "user_approved": user_approved or None, **meta})
+    step["status"] = "needs_user" if needs_user else ("approved" if ok else "changes_requested")
+    if needs_user:
+        ok = False
+    if ok and not final:
+        nxt = current_step(st)
+        if nxt:
+            nxt["start"] = at_heads
+    if ok and final:
+        step["heads"] = at_heads
+    save_state(d, st)
+    result = "NEEDS THE USER'S CHECK" if needs_user else ("APPROVED" if ok else "CHANGES REQUESTED")
+    print(f"{what}: review {n} -> {result}")
     print("summary: " + verdict["summary"])
     for c in verdict["criteria"]:
         print(f"  criterion {c['id']}: {c['status']} — {c['evidence']}")
+    for p in verdict["previous_findings"]:
+        print(f"  earlier finding {p['status']}: {p['finding']} — {p['note']}")
     for f in verdict["findings"]:
         print(f"  [{f['severity']}] {f['location']}: {f['problem']}\n      fix: {f['fix']}")
-    if verdict["verdict"] == "approve" and not ok:
-        print("  (the reviewer said approve, but a blocker/major finding or an unmet criterion keeps it open)")
-    print("review file: " + out)
+    for x in verdict["declined"]:
+        print("  not judged: " + x)
+    if needs_user:
+        print("NEEDS THE USER: the reviewer approved, but nobody could verify: "
+              + "; ".join(f"{c['id']} ({c['evidence']})" for c in unverified(verdict))
+              + f". Ask the user to check these; when they confirm, run `python3 {SCRIPT} confirm \"<what they "
+              + "checked>\"` (they approve it in a permission prompt).")
+    elif verdict["verdict"] == "approve" and not ok:
+        print("  (the reviewer said approve, but a blocker/major finding, an unmet criterion or an unaddressed "
+              "earlier finding keeps it open)")
+    tokens = meta["usage"]
+    print(f"review file: {out} ({meta['seconds']}s" + (f", tokens {tokens}" if tokens else "") + ")")
 
 
 # ---------------------------------------------------------------- commands
@@ -398,12 +584,21 @@ def cmd_start(args):
     steps = plan_steps(text)
     if not steps:
         die("no steps (### S-NNN — title) in " + plan)
+    receipt = sidecars(plan)[1]
+    if not args.unapproved:
+        if not os.path.exists(receipt):
+            die(f"no approval receipt {receipt}: the plan is not approved; ask the user (only they can allow "
+                f"--unapproved)")
+        if shutil.which("shogun"):
+            v = subprocess.run(["shogun", "verify", plan], capture_output=True, text=True)
+            if v.returncode != 0:
+                die("shogun verify failed: " + (v.stdout + v.stderr).strip()[-500:])
     names, aliases = plan_repos(text)
     paths = {}
     for spec in args.repo or []:
         k, _, v = spec.partition("=")
         paths[k] = os.path.realpath(os.path.expanduser(v))
-    manifest = load_json(os.path.splitext(plan)[0] + ".manifest.json", {}) or {}
+    manifest = load_json(sidecars(plan)[2], {}) or {}
     roots = {r.get("id"): r.get("root") for r in manifest.get("repos", []) if r.get("root")}
     cwd = os.path.realpath(args.cwd or os.getcwd())
     repos = {}
@@ -416,25 +611,34 @@ def cmd_start(args):
         p = next((c for c in candidates if c and os.path.isdir(c) and git(c, "rev-parse", "--git-dir")), None)
         if not p:
             die(f"repository {name}: not found; pass --repo {name}=PATH (or set NITEN_WORKSPACE)")
-        repos[name] = {"path": os.path.realpath(p), "alias": aliases.get(name, ""),
+        repos[name] = {"path": os.path.realpath(p), "alias": alias,
                        "base": git(p, "rev-parse", "HEAD"), "branch": git(p, "rev-parse", "--abbrev-ref", "HEAD"),
                        "preexisting": git(p, "status", "--porcelain")}
-    d = os.path.join(os.path.dirname(plan), os.path.splitext(os.path.basename(plan))[0] + ".niten")
-    if os.path.exists(os.path.join(d, "state.json")) and not args.restart:
-        die(f"a session already exists in {d}; continue it, or pass --restart to begin again")
-    st = {"plan": plan, "plan_sha256": hashlib.sha256(text.encode()).hexdigest(), "started": now(),
-          "cwd": cwd, "repos": repos, "paused": None,
-          "steps": [{"id": s["id"], "title": s["title"], "status": "pending", "reviews": []} for s in steps],
+    d = os.path.splitext(plan)[0] + ".niten"
+    if os.path.exists(os.path.join(d, "state.json")):
+        if not args.restart:
+            die(f"a session already exists in {d}; continue it (attach), or ask the user about --restart")
+        archive = d + "." + time.strftime("%Y%m%d%H%M%S")
+        os.rename(d, archive)
+        unregister(d)
+        print("previous session archived: " + archive)
+    st = {"plan": plan, "plan_sha256": sha256_file(plan), "approval_sha256": sha256_file(receipt),
+          "unapproved": bool(args.unapproved), "started": now(), "cwd": cwd, "repos": repos, "paused": None,
+          "steps": [{"id": s["id"], "title": s["title"], "status": "pending", "reviews": [], "start": None}
+                    for s in steps],
           "final": {"status": "pending", "reviews": []}}
+    st["steps"][0]["start"] = {n: r["base"] for n, r in repos.items()}
     os.makedirs(os.path.join(d, "evidence"), exist_ok=True)
     save_state(d, st)
-    register(st["cwd"], d)
+    register(cwd, d)
     print("niten session started: " + d)
     for name, r in repos.items():
-        print(f"  {name}: {r['path']} at {r['base'][:12]} on {r['branch']}" + (" (has pre-existing changes)" if r["preexisting"] else ""))
+        print(f"  {name}: {r['path']} at {r['base'][:12]} on {r['branch']}"
+              + (" (has pre-existing changes)" if r["preexisting"] else ""))
     for s in st["steps"]:
         print(f"  {s['id']}: {s['title']}")
-    print("evidence goes to " + os.path.join(d, "evidence", "<step>.md"))
+    print("evidence goes to " + os.path.join(d, "evidence", "<step>.md") + "; commands are logged to "
+          + os.path.join(d, "commands.jsonl"))
 
 
 def cmd_status(args):
@@ -442,25 +646,37 @@ def cmd_status(args):
     st = load_state(d)
     print("session: " + d)
     print("plan: " + st["plan"])
-    with open(st["plan"]) as f:
-        if hashlib.sha256(f.read().encode()).hexdigest() != st["plan_sha256"]:
-            print("WARNING: the plan file changed since the session started")
+    if sha256_file(st["plan"]) != st["plan_sha256"]:
+        print("WARNING: the plan file changed since the session started; reviews are refused")
     if st["paused"]:
         print(f"PAUSED since {st['paused']['since']}: {st['paused']['reason']}")
+    if st.get("reviewing"):
+        print(f"REVIEWING {st['reviewing']['scope']} since {st['reviewing']['since']}")
     for s in st["steps"]:
         print(f"  {s['id']} [{s['status']}] {s['title']} ({len(s['reviews'])} review(s))")
     print(f"  final [{st['final']['status']}] ({len(st['final']['reviews'])} review(s))")
     cur = current_step(st)
-    print("next: " + (f"{cur['id']}" if cur else ("final review" if st["final"]["status"] != "approved" else "delivery")))
+    if cur:
+        print("next: " + cur["id"])
+    elif st["final"]["status"] == "needs_user":
+        print("next: the user checks what the reviewer could not verify, then confirm")
+    elif st["final"]["status"] != "approved":
+        print("next: final review")
+    else:
+        moved = {n: h for n, h in heads(st).items() if h != st["final"].get("heads", {}).get(n)}
+        print("next: delivery" if not moved else "WARNING: commits changed after the final review: "
+              + ", ".join(moved) + "; run the final review again")
 
 
 def cmd_review(args):
     d = state_dir_arg(args)
     st = load_state(d)
     cur = current_step(st)
-    if cur and cur["id"] != args.step:
+    if not cur:
+        die("every step is approved; run final")
+    if cur["id"] != args.step:
         die(f"{cur['id']} is the current step; steps are reviewed in order")
-    review_step(d, st, args.step)
+    review_step(d, st, args.step, False, args.user_approved)
 
 
 def cmd_final(args):
@@ -469,7 +685,23 @@ def cmd_final(args):
     cur = current_step(st)
     if cur:
         die(f"{cur['id']} is not approved yet; the final review comes after every step")
-    review_step(d, st, None, final=True)
+    review_step(d, st, None, True, args.user_approved)
+
+
+def cmd_confirm(args):
+    """The user checked what the final reviewer could not verify."""
+    d = state_dir_arg(args)
+    st = load_state(d)
+    final = st["final"]
+    if final["status"] != "needs_user":
+        die("nothing waits for the user's check")
+    if [n for n, h in heads(st).items() if h != final["reviews"][-1]["heads"].get(n)]:
+        die("commits changed since the final review; run final again")
+    final["status"] = "approved"
+    final["heads"] = final["reviews"][-1]["heads"]
+    final["user_check"] = {"what": args.what, "at": now()}
+    save_state(d, st)
+    print("final review completed by the user's check: " + args.what)
 
 
 def cmd_pause(args):
@@ -477,7 +709,7 @@ def cmd_pause(args):
     st = load_state(d)
     st["paused"] = {"reason": args.reason, "since": now()}
     save_state(d, st)
-    print("paused: " + args.reason)
+    print("paused until the user answers: " + args.reason)
 
 
 def cmd_resume(args):
@@ -510,7 +742,7 @@ def cmd_finish(args):
     d = state_dir_arg(args)
     st = load_state(d)
     if st["final"]["status"] != "approved" and not args.abort:
-        die("the final review has not approved the change; pass --abort to end the session anyway")
+        die("the final review has not approved the change; ask the user before --abort")
     st["finished"] = {"at": now(), "aborted": bool(args.abort)}
     save_state(d, st)
     unregister(d)
@@ -530,28 +762,64 @@ def hook_input():
     return data if isinstance(data, dict) and data.get("session_id") else {}
 
 
+def active(data):
+    d = find_active(data.get("cwd") or os.getcwd(), data.get("session_id", ""))
+    st = load_json(os.path.join(d, "state.json")) if d else None
+    return (d, st) if st and not st.get("finished") else (None, None)
+
+
+def where(st):
+    cur = current_step(st)
+    return f"{cur['id']} ({cur['title']})" if cur else "final stage"
+
+
+def alive(pid):
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def progress(d, st):
+    """What changes when the session moves: reviews, the log, the commits."""
+    try:
+        log = os.path.getsize(os.path.join(d, "commands.jsonl"))
+    except OSError:
+        log = 0
+    reviews = sum(len(s["reviews"]) for s in st["steps"]) + len(st["final"]["reviews"])
+    return hashlib.sha256(json.dumps([reviews, log, heads(st)], sort_keys=True).encode()).hexdigest()
+
+
 def cmd_hook_stop(args):
     data = hook_input()
-    if not data:
-        return
-    d = find_active(data.get("cwd") or os.getcwd(), data.get("session_id", ""))
-    if not d:
-        return
-    st = load_json(os.path.join(d, "state.json"))
+    d, st = active(data) if data else (None, None)
     if not st or st.get("paused"):
         return
+    if st.get("reviewing") and alive(st["reviewing"].get("pid")):
+        return  # the review runs in the background and wakes the executor when it ends
     cur = current_step(st)
-    script = os.path.join(HERE, "niten.py")
+    if not cur and st["final"]["status"] in ("approved", "needs_user"):
+        return
+    fp = progress(d, st)
+    blocks = st.get("stop_blocks") or {}
+    count = blocks.get("count", 0) + 1 if blocks.get("progress") == fp else 1
+    st["stop_blocks"] = {"progress": fp, "count": count}
+    save_state(d, st)
+    if count > MAX_STOP_BLOCKS:
+        st["stop_blocks"] = None
+        save_state(d, st)
+        print(json.dumps({"systemMessage": (f"Niten: the turn ends without progress at {where(st)}, which is not "
+                                            f"approved. It needs your attention: answer, or say how to go on.")}))
+        return
     if cur:
         reason = (f"Niten session ({d}): step {cur['id']} is {cur['status']}, not approved by the reviewer. "
-                  f"Finish the step, write its evidence and run `python3 {script} review {cur['id']}`, "
+                  f"Finish the step, commit, write its evidence and run `python3 {SCRIPT} review {cur['id']}`, "
                   f"then fix any findings. If you need the user (access, a decision, missing information), "
-                  f"run `python3 {script} pause \"<what you need>\"` and ask.")
-    elif st["final"]["status"] != "approved":
-        reason = (f"Niten session ({d}): every step is approved; run the final review "
-                  f"`python3 {script} final` before you stop.")
+                  f"run `python3 {SCRIPT} pause \"<what you need>\"` and ask them.")
     else:
-        return
+        reason = (f"Niten session ({d}): every step is approved; run the end-to-end verification and the final "
+                  f"review `python3 {SCRIPT} final` before you stop.")
     print(json.dumps({"decision": "block", "reason": reason}))
 
 
@@ -563,40 +831,187 @@ def decision(kind, reason):
     }}))
 
 
+def protected_paths(d, st):
+    """Files the executor must not change by hand: the session state (except its own
+    evidence), the plan and its receipts, Niten's registry and Claude's settings."""
+    paths = [d, NITEN_HOME] + sidecars(st["plan"])
+    for root in [HOME] + [r["path"] for r in st["repos"].values()]:
+        paths += [os.path.join(root, ".claude", name) for name in ("settings.json", "settings.local.json")]
+    return paths
+
+
+def is_protected(path, d, st):
+    if not path:
+        return False
+    path = os.path.realpath(os.path.expanduser(path))
+    if within(path, os.path.join(d, "evidence")) and path.endswith(".md"):
+        return False
+    return any(within(path, p) for p in protected_paths(d, st))
+
+
+WRITES = re.compile(r">|\btee\b|\bsed\s+-\w*i|\bperl\s+-\w*i|\b(mv|cp|rm|truncate|dd|touch|ln|install|chmod|"
+                    r"python3?|node|ruby)\b")
+NITEN_CALL = re.compile(r"^\s*python3?\s+\S*niten\.py\s+[^;&|<>`$]*$")
+
+
+def bash_touches_protected(command, d, st):
+    """A shell command that names a protected file and could write it. Plain calls of
+    niten.py are how the state changes."""
+    if NITEN_CALL.match(command):
+        return False
+    evidence = os.path.join(d, "evidence") + os.sep
+    rest = command.replace(evidence, "").replace(os.path.join(os.path.basename(d), "evidence") + os.sep, "")
+    names = [os.path.basename(d)]  # unique: <plan>.niten
+    for p in protected_paths(d, st):
+        names.append(p)
+        if within(p, HOME):
+            rel = os.path.relpath(p, HOME)
+            names += ["~/" + rel, "$HOME/" + rel, "${HOME}/" + rel]
+    return any(n and n in rest for n in names) and bool(WRITES.search(rest))
+
+
+SENSITIVE = [".aws", ".docker", ".ssh", ".kube", ".config", ".gnupg", ".netrc", ".npmrc", ".pypirc",
+             ".gitconfig", ".git-credentials", ".zshrc", ".bashrc", ".profile"]
+
+
+def outside_workspace(path, data, st):
+    path = os.path.realpath(os.path.expanduser(path))
+    if any(within(path, os.path.join(HOME, s)) for s in SENSITIVE):
+        return True
+    roots = [r["path"] for r in st["repos"].values()] + [st_dir(st)]
+    roots += ["/tmp", "/private/tmp", "/var/folders", "/private/var/folders", os.path.join(HOME, ".claude", "projects")]
+    for extra in (os.environ.get("TMPDIR"), data.get("scratchpad_dir")):
+        if extra:
+            roots.append(extra)
+    return not any(within(path, r) for r in roots)
+
+
 def cmd_hook_pretooluse(args):
-    """In a Niten session: delivery waits for the final review, and every important
-    command is put to the user with the executor's explanation of why the step needs
-    it, even where the permission settings would run it without asking."""
+    """In a Niten session: delivery only after the final review of the exact commits;
+    important actions go to the user with the executor's explanation, even where the
+    permission settings would allow them; protected files are not edited by hand."""
     data = hook_input()
-    if not data or data.get("tool_name") != "Bash":
-        return
-    tool_input = data.get("tool_input") or {}
-    command = tool_input.get("command", "")
-    delivery = any(p.search(command) for p in DELIVERY)
-    label = important(command)
-    if not delivery and not label:
-        return
-    d = find_active(data.get("cwd") or os.getcwd(), data.get("session_id", ""))
-    if not d:
-        return
-    st = load_json(os.path.join(d, "state.json"))
+    d, st = active(data) if data else (None, None)
     if not st:
         return
-    script = os.path.join(HERE, "niten.py")
-    if delivery and st["final"]["status"] != "approved":
-        decision("deny", f"Niten session ({d}): delivery (push or pull request) waits for the final review. "
-                         f"Approve every step, then run `python3 {script} final`.")
+    tool = data.get("tool_name", "")
+    tool_input = data.get("tool_input") or {}
+
+    if tool in FILE_TOOLS:
+        path = tool_input.get(FILE_TOOLS[tool], "")
+        if is_protected(path, d, st):
+            decision("deny", f"Niten: {path} is part of the session's record, the approved plan or Claude's "
+                             f"settings; it is not edited by hand. Use niten.py, or ask the user.")
+        elif path and outside_workspace(path, data, st):
+            decision("ask", f"Niten {where(st)}: {tool} of {path}, outside the plan's repositories.")
         return
-    label = label or "delivery"
+
+    if tool.startswith("mcp__"):
+        if MCP_WRITE.search(tool.split("__")[-1]):
+            summary = redact(json.dumps(tool_input, ensure_ascii=False))[:300]
+            decision("ask", f"Niten {where(st)}: {tool} changes another system — {summary}")
+        return
+
+    if tool != "Bash":
+        return
+    command = tool_input.get("command", "")
+    if bash_touches_protected(command, d, st):
+        decision("deny", "Niten: this command would change the session's record, the approved plan or Claude's "
+                         "settings. The state changes only through niten.py; ask the user if something is wrong.")
+        return
+    delivery = any(p.search(command) for p in DELIVERY)
+    if delivery:
+        final = st["final"]
+        if final["status"] != "approved":
+            decision("deny", f"Niten session ({d}): delivery (push or pull request) waits for the final review. "
+                             f"Approve every step, then run `python3 {SCRIPT} final`.")
+            return
+        moved = [n for n, h in heads(st).items() if h != final.get("heads", {}).get(n)]
+        if moved:
+            decision("deny", f"Niten: {', '.join(moved)} changed after the final review; run "
+                             f"`python3 {SCRIPT} final` again before delivering.")
+            return
+    label = important(command) or ("delivery" if delivery else None)
+    if not label:
+        return
     explanation = " ".join((tool_input.get("description") or "").split())
     if len(explanation) < MIN_EXPLANATION:
         decision("deny", f"Niten: this is {label}, so the user approves it. Run the same command again with a "
                          f"Bash `description` that tells the user, in one or two sentences, what it does and why "
                          f"the current plan step needs it.")
         return
+    decision("ask", f"Niten {where(st)}, {label}: {explanation}")
+
+
+def tail(text):
+    text = redact(text or "")
+    return text if len(text) <= LOG_TAIL else "…" + text[-LOG_TAIL:]
+
+
+def log_entry(d, st, entry):
     cur = current_step(st)
-    where = f"{cur['id']} ({cur['title']})" if cur else "final stage"
-    decision("ask", f"Niten {where}, {label}: {explanation}")
+    entry = {"at": now(), "step": cur["id"] if cur else "final", **entry}
+    with open(os.path.join(d, "commands.jsonl"), "a") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+def cmd_hook_posttooluse(args):
+    """Record what the session did, as the reviewer's evidence: every Bash command
+    with its exit code and output (also when it failed), and the user's answers to
+    the executor's questions."""
+    data = hook_input()
+    d, st = active(data) if data else (None, None)
+    if not st:
+        return
+    tool = data.get("tool_name")
+    tool_input = data.get("tool_input") or {}
+    resp = data.get("tool_response")
+    failed = data.get("hook_event_name") == "PostToolUseFailure"
+    if tool == "AskUserQuestion":
+        log_entry(d, st, {"kind": "question", "questions": redact(json.dumps(tool_input, ensure_ascii=False))[:LOG_TAIL],
+                          "answers": tail(json.dumps(resp, ensure_ascii=False) if resp is not None else data.get("error", ""))})
+        return
+    if tool != "Bash":
+        return
+    if isinstance(resp, dict):
+        out, err = resp.get("stdout", ""), resp.get("stderr", "")
+        code = resp.get("exit_code", resp.get("exitCode"))
+        interrupted = resp.get("interrupted")
+    else:
+        out, err, code, interrupted = str(resp or ""), "", None, None
+    if failed:
+        err = (err + "\n" if err else "") + str(data.get("error") or "")
+        code = code if code not in (None, 0) else "failed"
+    command = tool_input.get("command", "")
+    if re.search(r"get-login-password|print-access-token|get-token|\btoken\b", command) and "|" not in command:
+        out = "[output withheld: credential]"
+    log_entry(d, st, {"kind": "command", "command": redact(command), "description": tool_input.get("description", ""),
+                      "exit_code": code, "interrupted": interrupted, "stdout": tail(out), "stderr": tail(err)})
+
+
+def cmd_hook_userprompt(args):
+    """Record the user's message for the reviewer; a pause lasts until the user
+    answers, and their message resumes the session."""
+    data = hook_input()
+    d, st = active(data) if data else (None, None)
+    if not st:
+        return
+    text = data.get("prompt", data.get("prompt_text", ""))
+    if text:
+        log_entry(d, st, {"kind": "user_message", "text": tail(text)})
+    if not st.get("paused"):
+        return
+    reason = st["paused"]["reason"]
+    st["paused"] = None
+    save_state(d, st)
+    print(json.dumps({"hookSpecificOutput": {
+        "hookEventName": "UserPromptSubmit",
+        "additionalContext": (f"Niten: the user answered your question ({reason}); the session is active again, "
+                              f"at {where(st)}. Continue the plan with their answer."),
+    }}))
+
+
+# ---------------------------------------------------------------- main
 
 
 def main():
@@ -606,16 +1021,26 @@ def main():
     p.add_argument("--plan", required=True)
     p.add_argument("--repo", action="append", help="NAME=PATH or repo-N=PATH")
     p.add_argument("--cwd")
-    p.add_argument("--restart", action="store_true")
+    p.add_argument("--restart", action="store_true", help="archive an existing session and begin again")
+    p.add_argument("--unapproved", action="store_true", help="run a plan without an approval receipt")
     p.set_defaults(fn=cmd_start)
-    for name, fn in [("status", cmd_status), ("final", cmd_final), ("resume", cmd_resume)]:
+    for name, fn in [("status", cmd_status), ("resume", cmd_resume)]:
         p = sub.add_parser(name)
         p.add_argument("--state")
         p.set_defaults(fn=fn)
     p = sub.add_parser("review")
     p.add_argument("step")
     p.add_argument("--state")
+    p.add_argument("--user-approved", metavar="DECISION", help="another review after the limit, as the user decided")
     p.set_defaults(fn=cmd_review)
+    p = sub.add_parser("final")
+    p.add_argument("--state")
+    p.add_argument("--user-approved", metavar="DECISION", help="another review after the limit, as the user decided")
+    p.set_defaults(fn=cmd_final)
+    p = sub.add_parser("confirm")
+    p.add_argument("what", help="what the user checked")
+    p.add_argument("--state")
+    p.set_defaults(fn=cmd_confirm)
     p = sub.add_parser("pause")
     p.add_argument("reason")
     p.add_argument("--state")
@@ -627,8 +1052,9 @@ def main():
     p = sub.add_parser("attach")
     p.add_argument("--state", required=True)
     p.set_defaults(fn=cmd_attach)
-    sub.add_parser("hook-stop").set_defaults(fn=cmd_hook_stop)
-    sub.add_parser("hook-pretooluse").set_defaults(fn=cmd_hook_pretooluse)
+    for name, fn in [("hook-stop", cmd_hook_stop), ("hook-pretooluse", cmd_hook_pretooluse),
+                     ("hook-posttooluse", cmd_hook_posttooluse), ("hook-userprompt", cmd_hook_userprompt)]:
+        sub.add_parser(name).set_defaults(fn=fn)
     args = ap.parse_args()
     if args.cmd.startswith("hook-"):
         # A hook never fails the session: any error here means no decision.

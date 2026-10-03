@@ -1,7 +1,7 @@
 {
   "type": "object",
   "additionalProperties": false,
-  "required": ["verdict", "summary", "criteria", "findings"],
+  "required": ["verdict", "summary", "criteria", "previous_findings", "findings", "declined"],
   "properties": {
     "verdict": {"type": "string", "enum": ["approve", "request_changes"]},
     "summary": {"type": "string"},
@@ -18,6 +18,19 @@
         }
       }
     },
+    "previous_findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["finding", "status", "note"],
+        "properties": {
+          "finding": {"type": "string"},
+          "status": {"type": "string", "enum": ["addressed", "not_addressed", "withdrawn"]},
+          "note": {"type": "string"}
+        }
+      }
+    },
     "findings": {
       "type": "array",
       "items": {
@@ -31,6 +44,7 @@
           "fix": {"type": "string"}
         }
       }
-    }
+    },
+    "declined": {"type": "array", "items": {"type": "string"}}
   }
 }

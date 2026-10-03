@@ -7,55 +7,64 @@ session** in Claude Code. Claude implements each step in your normal environment
 reviews every step and the final change independently, and you are asked whenever access,
 a decision or missing information is needed.
 
-It is a Claude Code skill (`/niten`) with a small script and two hooks. Shogun plans the
-work with two models; Niten carries it out with the same two models in fixed roles.
+It is a Claude Code skill (`/niten`) with one script and four hooks. Shogun plans the work
+with two models; Niten carries it out with the same two models in fixed roles.
 
 ## How it works
 
 - **Claude is the executor.** It follows the plan step by step: code changes, commands,
-  operations outside the repository (registries, cloud CLIs, infrastructure tools). It
-  works with your tools and your network, and Claude Code's permission prompts are how you
-  approve anything outward-facing.
-- **Codex is the reviewer.** After each step, `niten.py review` runs `codex exec` in a
-  read-only sandbox with the step, the repositories' diffs against their base commits and
-  the step's evidence. Codex returns a structured verdict: each acceptance criterion as
-  met, not met or not verifiable, and findings with severity and the exact fix. A step
-  passes only on `approve` with no blocker or major finding and no unmet criterion;
-  otherwise Claude fixes the findings and asks again. A final review checks the whole
-  change against the plan before anything is delivered.
+  operations outside the repository (registries, cloud CLIs, infrastructure tools), with
+  your tools and your network.
+- **Codex is the reviewer.** After each step Claude commits and runs `niten.py review`,
+  which calls `codex exec` in a read-only sandbox, without your Codex configuration,
+  rules, MCP servers or plugins. Codex sees the plan's step, only this step's changes, the
+  commands that actually ran and Claude's evidence, and returns a structured verdict: each
+  acceptance criterion as met, not met or not verifiable, every earlier finding settled as
+  addressed, not addressed or withdrawn, new findings with a severity and the exact fix,
+  and what it chose not to judge. A step passes only on `approve` with no blocker or major
+  finding, no unmet criterion and no unaddressed earlier finding; otherwise Claude fixes
+  and asks again. A failed or malformed review never counts as approval. A final review
+  checks the whole change against the plan before anything is delivered; what nobody
+  could verify goes to you to check and confirm.
 - **You are in the loop.** Claude asks when it needs a login, a permission, a decision the
-  plan leaves open or information it cannot find. It does not guess around a gap. After
-  three unapproved reviews of one step, or a disagreement on substance, it asks you too.
-- **Evidence, not claims.** For every step Claude records the exact commands, exit codes and
-  outputs (digests, IDs) in an evidence file. The reviewer cannot use the network, so
-  external operations are judged from that record.
+  plan leaves open or information it cannot find. After three unapproved reviews of one
+  step it stops and asks you how to go on.
+- **Evidence is recorded, not claimed.** A hook logs every command Claude runs, with its
+  exit code and output (secrets masked). The reviewer trusts that log over Claude's
+  account, which matters for operations it cannot repeat without network access.
 
 ## What is enforced
 
-Two hooks make the key rules hold whatever the model does. They act only in the Claude
+The hooks make the key rules hold whatever the model does. They act only in the Claude
 Code session that started a Niten session and do nothing anywhere else.
 
 | Hook | Rule |
 |---|---|
-| `Stop` | Claude cannot end its turn while the current step, or the final review, is not approved, unless the session is paused to wait for you. |
-| `PreToolUse` (Bash) | No `git push` and no pull request before the final review approved the change. |
-| `PreToolUse` (Bash) | Every important command is put to you, with Claude's explanation of what it does and why the current step needs it, even where your permission settings would run it without asking. A call without an explanation is refused. |
+| `Stop` | Claude cannot end its turn while the current step, or the final review, is not approved, unless it is waiting for your answer or a review is running. After three blocks in a row without any progress the turn ends with a message to you, so a broken reviewer cannot trap the session in a loop. |
+| `PreToolUse` | No `git push` or pull request before the final review approved exactly the commits being delivered. |
+| `PreToolUse` | Every important action is put to you, with Claude's explanation of what it does and why the current step needs it, even where your permission settings would allow it. A command without an explanation is refused. |
+| `PreToolUse` | The session's state, command log and reviews, the approved plan and its receipts, and Claude's settings cannot be edited by Claude. |
+| `PostToolUse`, `PostToolUseFailure` | Every Bash command, failed ones too, is logged with its exit code and output, and so are your answers to Claude's questions, as the reviewer's evidence. |
+| `UserPromptSubmit` | Your messages are logged too, so a deviation from the plan counts as decided only if you decided it; a pause to wait for you ends when you answer. |
 
-Important commands: git pushes and history rewrites; image pushes, registry logins and
-image removal; any `aws` operation that is not describe, list or get; Terraform,
-`kubectl`, Helm changes; pull requests, releases and repository changes through `gh`;
-writes to web APIs with `curl`/`wget`; recursive forced deletes; package publication;
-`ssh`/`scp`/`rsync`; `sudo`. Read-only commands pass without an extra question. Add your
-own patterns (regular expressions) in `~/.claude/niten/config.json`:
+Important actions: git pushes and history rewrites; image pushes, registry logins and
+image removal; any `aws` operation that is not describe, list or get; Terraform, `kubectl`
+and Helm changes; pull requests, releases and repository changes through `gh`; writes to
+web APIs with `curl`/`wget`; recursive forced deletes; package publication;
+`ssh`/`scp`/`rsync`; `sudo`; Niten overrides (`--unapproved`, `--restart`, `--abort`,
+another review after the limit); MCP tools that change another system; file writes
+outside the plan's repositories. Read-only commands pass without an extra question. Add
+your own patterns in `~/.claude/niten/config.json`:
 
 ```json
 {"ask": ["\\bmake\\s+deploy\\b"]}
 ```
 
 Your own deny rules still win: a command they block cannot be approved through Niten.
-
-Everything else (scope, evidence, asking instead of guessing) is the skill's instruction
-to the model, backed by the reviewer, which rejects out-of-scope or unproven work.
+Everything else (scope, the quality of the evidence, asking instead of guessing) is the
+skill's instruction to the model, backed by the reviewer, which rejects out-of-scope or
+unproven work. Commands hidden in scripts are not classified; the reviewer sees them in
+the log.
 
 ## Requirements
 
@@ -85,7 +94,7 @@ In Claude Code, from the directory that holds the plan's repositories:
 /niten path/to/plan.md
 ```
 
-or just ask Claude to execute a plan or a ticket that has one. Claude checks the plan's
+or ask Claude to execute a plan or a ticket that has one. Claude checks the plan's
 approval, prepares a work branch per repository with your confirmation, starts the
 session and goes step by step. At the end it asks how to deliver (push and pull request,
 or local branches only).
@@ -97,10 +106,11 @@ calls it, you rarely need to.
 
 | Command | What it does |
 |---|---|
-| `start --plan P [--repo NAME=PATH]` | Records each repository's base commit and pre-existing changes, registers the session for this Claude Code session |
+| `start --plan P [--repo NAME=PATH] [--restart] [--unapproved]` | Checks the approval, records each repository's base commit and pre-existing changes, registers the session for this Claude Code session; `--restart` archives an earlier session |
 | `status` | Steps, their review counts, what is next |
-| `review S-NNN` | Codex reviews the current step |
-| `final` | Codex reviews the whole change, after every step is approved |
+| `review S-NNN [--user-approved DECISION]` | Codex reviews the current step's committed changes |
+| `final [--user-approved DECISION]` | Codex reviews the whole change, after every step is approved |
+| `confirm "WHAT"` | You checked what the final reviewer could not verify |
 | `pause "reason"` / `resume` | Wait for you without the Stop hook blocking |
 | `attach --state DIR` | Continue a session in a new Claude Code session |
 | `finish [--abort]` | End the session |
@@ -108,8 +118,9 @@ calls it, you rarely need to.
 Repositories are found by `--repo` (by name or `repo-N` alias), then the plan's manifest,
 then `$NITEN_WORKSPACE/<name>`, then `<cwd>/<name>`.
 
-State lives next to the plan in `<plan>.niten/`: `state.json`, `evidence/<step>.md`, and
-`reviews/` with every reviewer prompt and verdict.
+State lives next to the plan in `<plan>.niten/`: `state.json`, `commands.jsonl` (the
+command log), `evidence/<step>.md`, and `reviews/` with every reviewer prompt, verdict,
+duration and token usage.
 
 Settings (environment): `NITEN_REVIEW_MODEL` (default `gpt-6-astra`), `NITEN_REVIEW_EFFORT`
 (`high`), `NITEN_REVIEW_TIMEOUT` (seconds, `1800`), `NITEN_CODEX` (default: Shogun's
@@ -122,6 +133,18 @@ python3 -m unittest discover -s tests
 ```
 
 The tests use temporary repositories and a scripted Codex; no model is called.
+
+## Prior art
+
+Ideas were taken from projects that pair Claude Code with a second reviewer:
+[openai/codex-plugin-cc](https://github.com/openai/codex-plugin-cc) (a Stop-hook review
+gate, and the loop failures it ran into), [obra/superpowers](https://github.com/obra/superpowers)
+(plan execution with fresh verification evidence and scoped re-reviews),
+[claudex-loop](https://github.com/chaseai-yt/claudex-loop) (approvals bound to the plan's
+hash; the builder never grades its own work) and
+[codex-review](https://github.com/JustinTervala/codex-review) (a ledger of findings that
+re-reviews settle). Niten combines them with per-criterion verdicts, a harness-recorded
+command log and hook-enforced approvals for outward-facing actions.
 
 ## History
 

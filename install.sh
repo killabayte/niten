@@ -4,9 +4,10 @@
 #   ./install.sh            link skills/niten into ~/.claude/skills/niten and register the hooks
 #   ./install.sh uninstall  remove the link and the hooks
 #
-# The skill is linked, not copied, so pulling this repository updates it. The hooks go
-# into ~/.claude/settings.json (a backup is written before any change); they do nothing
-# unless a Niten session is active in the Claude Code session that triggers them.
+# The skill is linked, not copied, so pulling this repository updates it. The hooks
+# (Stop, PreToolUse, PostToolUse, PostToolUseFailure, UserPromptSubmit) go into
+# ~/.claude/settings.json; a backup is written before any change. They do nothing unless a Niten session is active
+# in the Claude Code session that triggers them.
 # CLAUDE_CONFIG_DIR is honoured in place of ~/.claude.
 set -eu
 
@@ -43,12 +44,21 @@ def strip(event):
     else:
         hooks.pop(event, None)
 
-strip("Stop")
-strip("PreToolUse")
+events = {  # event: (matcher, niten.py command)
+    "Stop": (None, "hook-stop"),
+    "PreToolUse": ("*", "hook-pretooluse"),
+    "PostToolUse": ("Bash|AskUserQuestion", "hook-posttooluse"),
+    "PostToolUseFailure": ("Bash|AskUserQuestion", "hook-posttooluse"),
+    "UserPromptSubmit": (None, "hook-userprompt"),
+}
+for event in events:
+    strip(event)
 if mode == "add":
-    run = 'python3 "%s" ' % script
-    hooks.setdefault("Stop", []).append({"hooks": [{"type": "command", "command": run + "hook-stop", "timeout": 10}]})
-    hooks.setdefault("PreToolUse", []).append({"matcher": "Bash", "hooks": [{"type": "command", "command": run + "hook-pretooluse", "timeout": 10}]})
+    for event, (matcher, sub) in events.items():
+        group = {"hooks": [{"type": "command", "command": 'python3 "%s" %s' % (script, sub), "timeout": 10}]}
+        if matcher:
+            group = {"matcher": matcher, **group}
+        hooks.setdefault(event, []).append(group)
 if not hooks:
     data.pop("hooks", None)
 if json.dumps(data, sort_keys=True) == before:
