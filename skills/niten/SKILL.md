@@ -43,6 +43,9 @@ plan path or a ticket key; if empty, ask which plan.
    login, a permission), a decision the plan leaves open, or information you cannot
    find: ask with AskUserQuestion. If you must end your turn to wait, first run
    `niten.py pause "<what you need>"`; the pause ends by itself when the user answers.
+   When the user must check or approve something, bring it to them: put the content
+   itself (the text, the diff, the exact values) in the question, and never ask them to
+   open a file or a path. Their answer is logged and is the evidence.
 5. **Stay in the plan's scope.** Do exactly the step's actions: no side refactors, no
    extra improvements. If the plan is wrong or impossible, stop and ask the user — do
    not silently deviate. A changed plan stops all reviews.
@@ -104,7 +107,8 @@ plan path or a ticket key; if empty, ask which plan.
    the ticket key and the step. A review refuses uncommitted new changes. Operation-only
    steps have nothing to commit.
 5. `niten.py review <step>`, as a **background** Bash command (`run_in_background`):
-   a review takes minutes, longer than a foreground command may run. Wait for it to
+   a review takes minutes, longer than a foreground command may run. Tell the user what
+   runs, e.g. "Codex is reviewing S-002 in the background". Wait for it to
    finish, then read its output; do not change the repositories while it runs (commits,
    or the content of any file, including ones that were already modified before the
    session), or its verdict is **DISCARDED** and you review again. Do not change a file
@@ -126,7 +130,9 @@ plan path or a ticket key; if empty, ask which plan.
 
 ### 3. Final review and delivery
 
-1. Run the plan's end-to-end verification and write `evidence/final.md`.
+1. Run the plan's end-to-end verification and write `evidence/final.md`. If a criterion
+   is the user's own check (they confirm, accept or read something), ask it now, with the
+   content in the question (rule 4), so their answer is in the log before the final review.
 2. `niten.py final` (in the background, like a step review); fix and repeat as for
    steps. If the reviewer approves but could not verify some criteria, the result is
    **NEEDS THE USER'S CHECK**: show the user exactly what to check; when they confirm,
