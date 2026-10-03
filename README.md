@@ -29,7 +29,9 @@ with two models; Niten carries it out with the same two models in fixed roles.
   worked: their commits, or the content of their working trees, including files that were
   already modified before the session. The working tree is compared byte for byte (the
   index by blob id, every tracked and untracked file read from disk, and the repository's
-  own git configuration), so no diff driver, filter or textconv can hide a change, and a
+  own git configuration as git reads it, with the files it includes and its hooks; only a
+  branch's upstream is left out, which `niten.py push -u` sets), so no diff driver, filter
+  or textconv can hide a change, and a
   git call that fails stops the decision instead of looking like "no change". A change to
   a repository's git configuration during the session stops the reviews until you decide. A final review checks the whole change against every criterion of the plan
   before anything is delivered; what nobody could verify, in a step or at the end, goes to
@@ -49,7 +51,7 @@ Code session that started a Niten session and do nothing anywhere else.
 | Hook | Rule |
 |---|---|
 | `Stop` | Claude cannot end its turn while the current step, or the final review, is not approved, unless it is waiting for your answer or a review is running. After three blocks in a row without any progress the turn ends with a message to you, so a broken reviewer cannot trap the session in a loop. |
-| `PreToolUse` | Delivery only after the final review approved exactly the commits being delivered. A raw `git push` (also `send-pack`, `subtree push`, or a push hidden in a multi-line or unclear command) is refused; pushes go through `niten.py push`, which sends one explicit refspec for the branch at the approved commit, with followed tags, mirror remotes and submodules switched off. Pull requests are refused before the final review or after a later change; `finish` refuses unless the commits and the working trees are what the final review approved. |
+| `PreToolUse` | Delivery only after the final review approved exactly the commits being delivered. A raw `git push` (also `send-pack`, `subtree push`, wherever git stands in a command, inside a string handed to a shell or `eval`, or in a multi-line or unclear command) is refused; pushes go through `niten.py push`, which sends the approved commit itself (not a branch name that could move) as one explicit refspec, with followed tags, mirror remotes and submodules switched off, and sets the upstream itself when asked. Pull requests are refused before the final review or after a later change; `finish` refuses unless the commits and the working trees are what the final review approved. |
 | `PreToolUse` | The session's shell cannot be changed for later commands: no exported or assigned `GIT_*`, Python or loader variables, no aliases or functions. |
 | `PreToolUse` | Every important action is put to you, with Claude's explanation of what it does and why the current step needs it, even where your permission settings would allow it. A command without an explanation is refused. |
 | `PreToolUse` | The session's state, command log and reviews, the approved plan and its receipts, and Claude's settings cannot be edited by Claude; Claude cannot run the hooks itself, and Claude's own directory `~/.claude` (with the key that signs the log) is out of reach: no shell command may name it, glob over hidden names or sweep the home directory, and the file tools cannot read Niten's files there. |

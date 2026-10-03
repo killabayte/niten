@@ -1,6 +1,8 @@
 """Offline tests of niten.py and install.sh: temporary HOME, git repositories and a
 scripted codex that writes a verdict. No model is called."""
 
+import argparse
+import importlib.util
 import json
 import os
 import shlex
@@ -10,6 +12,7 @@ import tempfile
 import textwrap
 import time
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPT = os.path.join(ROOT, "skills", "niten", "scripts", "niten.py")
@@ -826,7 +829,14 @@ class PushTest(Base):
                     "command git -C app push origin HEAD", "GIT_DIR=x git -C app push origin HEAD",
                     "git -C app push origin $(git -C app rev-parse unreviewed)", "(cd app && git push origin HEAD)",
                     "git -C app send-pack origin HEAD", "git -C app subtree push --prefix=x origin main",
-                    "git -c push.default=matching -C app push"):
+                    "git -c push.default=matching -C app push",
+                    "if true; then git -C app push origin HEAD; fi", "env -u UNRELATED_VAR git -C app push origin HEAD",
+                    "sudo -u bob git -C app push origin HEAD", "! git -C app push origin HEAD",
+                    "nice -n 5 git -C app push origin HEAD", "xargs -I{} git push origin {}",
+                    'bash -c "git -C app push origin HEAD"', "eval 'git -C app push origin HEAD'",
+                    "G=git; $G -C app push origin HEAD", "{ git -C app push origin HEAD; }",
+                    "for r in app; do git -C $r push origin HEAD; done", "while true; do git push; done",
+                    "git -Capp push origin HEAD", "ssh host 'cd r && git push'"):
             out = self.bash(cmd, WHY)
             self.assertEqual(out["permissionDecision"], "deny", cmd)
         self.assertEqual(self.remote_refs(), [])
@@ -838,6 +848,32 @@ class PushTest(Base):
         self.assertEqual(self.state_json()["final"]["deliveries"][0]["commit"], self.approved)
         self.ok("push", "repo-1", "origin", "--to", "feature")
         self.assertIn(f"refs/heads/feature {self.approved}", self.remote_refs())
+
+    def test_upstream_set_by_the_push_does_not_stop_finish(self):
+        out = self.ok("push", "app", "origin", "-u")
+        self.assertIn("now tracks it", out)
+        self.assertEqual(git(self.root, "config", f"branch.{self.branch}.remote"), "origin")
+        self.assertEqual(git(self.root, "config", f"branch.{self.branch}.merge"), f"refs/heads/{self.branch}")
+        self.ok("finish")
+
+    def test_the_approved_commit_is_sent_even_if_the_branch_moves_meanwhile(self):
+        with mock.patch.dict(os.environ, self.env(), clear=True):
+            spec = importlib.util.spec_from_file_location("niten_under_test", SCRIPT)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            real_run, moved = mod.subprocess.run, []
+
+            def run(argv, *args, **kwargs):  # move the branch just before git push starts
+                if argv[0] == mod.GIT_BIN and "push" in argv and not moved:
+                    moved.append(True)
+                    real_run([mod.GIT_BIN, "-C", self.root, "update-ref", "refs/heads/" + self.branch, self.unreviewed],
+                             check=True, capture_output=True, env=mod.git_env())
+                return real_run(argv, *args, **kwargs)
+            with mock.patch.object(mod.subprocess, "run", side_effect=run):
+                mod.cmd_push(argparse.Namespace(state=self.state, repo="app", remote="origin", branch=None, to=None,
+                                                set_upstream=False, force_with_lease=False))
+        self.assertTrue(moved)
+        self.assertEqual(self.remote_refs(), [f"refs/heads/{self.branch} {self.approved}"])
 
     def test_niten_push_refuses_anything_else(self):
         r = self.run_niten("push", "app", "origin", "--branch", "unreviewed")
@@ -932,6 +968,19 @@ class GitViewTest(Base):
         self.evidence("S-001")
         r = self.run_niten("review", "S-001")
         self.assertNotEqual(r.returncode, 0)
+        self.assertIn("git configuration of app changed", r.stderr)
+
+    def test_a_changed_included_configuration_stops_the_review(self):
+        root = os.path.join(self.ws, "app")
+        extra = os.path.join(self.ws, "extra.cfg")
+        with open(extra, "w") as f:
+            f.write("[core]\n\tpager = cat\n")
+        git(root, "config", "include.path", extra)
+        self.start()
+        with open(extra, "w") as f:
+            f.write("[diff \"hide\"]\n\ttextconv = /usr/bin/true\n")
+        self.evidence("S-001")
+        r = self.run_niten("review", "S-001")
         self.assertIn("git configuration of app changed", r.stderr)
 
     def test_global_git_configuration_is_put_to_the_user(self):

@@ -438,14 +438,38 @@ def own_paths(st, r):
     return [os.path.relpath(p, r["path"]) for p in sidecars(st["plan"]) + [st_dir(st)] if within(p, r["path"])]
 
 
+# Keys a delivery sets on purpose (the upstream of a branch); they change neither what
+# git shows nor what Niten pushes.
+UPSTREAM_KEY = re.compile(r"^branch\..+\.(remote|merge)$")
+
+
+def config_meta(path, f):
+    """A config file as git reads it, upstream keys left out, with every file it
+    includes."""
+    rel = os.path.relpath(f, path)
+    if not os.path.exists(f):
+        return {rel: "absent"}
+    entries = sorted(e for e in zsplit(git_strict(path, "config", "--file", f, "--list", "-z"))
+                     if not UPSTREAM_KEY.match(e.split("\n", 1)[0]))
+    meta = {rel: hashlib.sha256("\0".join(entries).encode("utf-8", "surrogateescape")).hexdigest()}
+    for e in entries:
+        key, _, value = e.partition("\n")
+        if key == "include.path" or (key.startswith("includeif.") and key.endswith(".path")):
+            inc = os.path.join(os.path.dirname(f), os.path.expanduser(value))
+            meta[f"{rel} includes {value}"] = content_hash(inc)
+    return meta
+
+
 def git_meta(path):
     """The repository's own configuration that decides what git shows: config,
     per-worktree config, info/exclude and info/attributes, byte for byte."""
     common = os.path.join(path, git_strict(path, "rev-parse", "--git-common-dir").decode().strip())
     gitdir = os.path.join(path, git_strict(path, "rev-parse", "--git-dir").decode().strip())
-    files = [os.path.join(common, "config"), os.path.join(gitdir, "config.worktree"),
-             os.path.join(common, "info", "exclude"), os.path.join(common, "info", "attributes")]
-    meta = {os.path.relpath(f, path): content_hash(f) for f in files}
+    meta = {}
+    for f in (os.path.join(common, "config"), os.path.join(gitdir, "config.worktree")):
+        meta.update(config_meta(path, f))
+    for f in (os.path.join(common, "info", "exclude"), os.path.join(common, "info", "attributes")):
+        meta[os.path.relpath(f, path)] = content_hash(f)
     hooks = os.path.join(path, git(path, "config", "--get", "core.hooksPath") or os.path.join(common, "hooks"))
     listing = hashlib.sha256()
     for root, dirs, names in os.walk(hooks):
@@ -1034,11 +1058,11 @@ def cmd_push(args):
     if re.fullmatch(r"[\w.-]+", args.remote):
         overrides += ["-c", f"remote.{args.remote}.mirror=false"]
     argv = [GIT_BIN, "-C", r["path"], *GIT_SAFE, *overrides, "push", "--no-follow-tags", "--no-recurse-submodules"]
-    if args.set_upstream:
-        argv.append("--set-upstream")
     if args.force_with_lease:
         argv.append("--force-with-lease")
-    argv += [args.remote, f"refs/heads/{branch}:refs/heads/{target}"]
+    # The source is the approved commit itself, not the branch name: whatever moves the
+    # branch after the check above, git sends this commit.
+    argv += [args.remote, f"{approved}:refs/heads/{target}"]
     print("niten: " + " ".join(shlex.quote(a) for a in argv[1:]), file=sys.stderr)
     res = subprocess.run(argv, env=git_env())
     final.setdefault("deliveries", []).append({"repo": name, "remote": args.remote, "branch": branch, "to": target,
@@ -1046,7 +1070,11 @@ def cmd_push(args):
     save_state(d, st)
     if res.returncode != 0:
         die(f"git push failed (exit {res.returncode})", res.returncode)
-    print(f"pushed {name} {branch} ({approved[:12]}) to {args.remote} as {target}")
+    if args.set_upstream:
+        git_strict(r["path"], "config", f"branch.{branch}.remote", args.remote)
+        git_strict(r["path"], "config", f"branch.{branch}.merge", f"refs/heads/{target}")
+    print(f"pushed {name} {approved[:12]} to {args.remote} as {target}"
+          + (f"; {branch} now tracks it" if args.set_upstream else ""))
 
 
 def cmd_pause(args):
@@ -1242,7 +1270,6 @@ def outside_workspace(path, data, st):
 # ---------------------------------------------------------------- pushes and the shell
 
 REDIRECTS = {">", ">>", "<", ">&", "<&", "&>", "&>>", ">|", "<>", "<<", "<<<"}
-RUNNERS = {"env", "command", "builtin", "exec", "nice", "nohup", "time", "xargs", "sudo", "doas", "caffeinate"}
 
 
 class Unclear(Exception):
@@ -1283,31 +1310,39 @@ def shell_segments(command):
     return segments
 
 
-def git_subcommand(seg):
-    """The git subcommand a simple command runs, through runners and VAR=value
-    prefixes, or None."""
-    i = 0
-    while i < len(seg) and (re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", seg[i]) or os.path.basename(seg[i]) in RUNNERS
-                            or (i > 0 and seg[i].startswith("-") and os.path.basename(seg[i - 1]) in RUNNERS)):
-        i += 1
-    if i >= len(seg) or os.path.basename(seg[i]) != "git":
-        return None
+# Programs that run a string as commands: a push inside the string is a push.
+SHELLS = {"sh", "bash", "zsh", "dash", "ksh", "fish", "eval", "source", ".", "ssh", "su", "xargs", "parallel",
+          "watch", "script", "osascript", "expect", "tmux", "screen"}
+PUSH_TEXT = re.compile(r"\bgit\b.*\b(push|send-pack)\b|\bgit\b.*\bsubtree\b.*\bpush\b", re.S)
+PUSH_WORDS = {"push", "send-pack"}
+
+
+def git_subcommand_at(seg, i):
+    """The git subcommand and its arguments, for the git at position i."""
     j = i + 1
     while j < len(seg) and seg[j].startswith("-"):
         j += 2 if seg[j] in ("-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path") else 1
-    return seg[j:] if j < len(seg) else []
+    return seg[j:]
 
 
 def raw_push(command):
-    """Whether a command line pushes with git itself (push, send-pack, subtree push),
-    or mentions a push in a way that cannot be read."""
+    """Whether a command line pushes with git itself (push, send-pack, subtree push)
+    wherever git stands in a command (after if/then, !, env -u VAR, sudo -u ...),
+    hands a push to a shell or eval as a string, runs a variable as a command next to
+    a push word, or mentions a push in a way that cannot be read."""
     try:
         segments = shell_segments(command)
     except Unclear:
-        return bool(DELIVERY[0].search(command))
+        return bool(PUSH_TEXT.search(command))
     for seg in segments:
-        sub = git_subcommand(seg)
-        if sub and (sub[0] in ("push", "send-pack") or (sub[0] == "subtree" and "push" in sub[1:])):
+        for i, t in enumerate(seg):
+            if os.path.basename(t) == "git":
+                sub = git_subcommand_at(seg, i)
+                if sub and (sub[0] in PUSH_WORDS or (sub[0] == "subtree" and "push" in sub[1:])):
+                    return True
+        if {os.path.basename(t) for t in seg} & SHELLS and any(PUSH_TEXT.search(t) for t in seg):
+            return True
+        if any(t.startswith("$") for t in seg) and (PUSH_WORDS & set(seg)):
             return True
     return False
 
