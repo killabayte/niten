@@ -711,6 +711,20 @@ class HookTest(Base):
         self.assertIn("to-stderr", entries[1]["stderr"])
         self.assertNotIn("Ab+/Ab+/", entries[2]["stdout"])
 
+    def test_unfinished_commands_are_not_logged_as_successes(self):
+        self.hook("posttooluse", tool_name="Bash", tool_input={"command": "make test", "run_in_background": True},
+                  tool_response={"stdout": "", "stderr": "", "interrupted": False, "backgroundTaskId": "task-7"})
+        self.hook("posttooluse", tool_name="Bash", tool_input={"command": "make test"},
+                  tool_response={"stdout": "partial output", "stderr": "", "interrupted": True})
+        self.hook("posttooluse", tool_name="Bash", tool_input={"command": "sleep 99", "run_in_background": True},
+                  tool_response={"stdout": "", "stderr": ""})
+        with open(os.path.join(self.state, "commands.jsonl")) as f:
+            entries = [json.loads(l) for l in f]
+        self.assertEqual(entries[0]["exit_code"], "running in background")
+        self.assertEqual(entries[0]["background_task"], "task-7")
+        self.assertEqual(entries[1]["exit_code"], "interrupted")
+        self.assertEqual(entries[2]["exit_code"], "running in background")
+
     def test_hooks_never_fail_on_bad_input(self):
         for kind in ("stop", "pretooluse", "posttooluse", "userprompt"):  # PostToolUseFailure shares posttooluse
             r = self.run_niten("hook-" + kind, stdin="not json")
