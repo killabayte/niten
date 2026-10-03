@@ -76,6 +76,7 @@ IMPORTANT = [
     ("a package publication", r"\b(npm|yarn|pnpm)\s+publish\b|\btwine\s+upload\b|\bgradlew?\b[^|;&]*\bpublish\w*\b"),
     ("a command on another machine", r"(^|[\s;&|(])(ssh|scp|rsync)\s"),
     ("a command as root", r"(^|[\s;&|(])sudo\s"),
+    ("a push of the reviewed commits", r"\bniten\.py\b[^|;&]*\bpush\b"),
     ("a Niten override", r"\bniten\.py\b[^|;&]*(--abort|--restart|--unapproved|--user-approved|\bconfirm\b)"),
 ]
 
@@ -208,19 +209,30 @@ GIT_SAFE = ["-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false", "-c
             "-c", "core.attributesFile=" + os.devnull]
 
 
+# The git Niten runs is found on a fixed PATH and runs without the shell's GIT_*
+# variables: a session's shell can change PATH or export GIT_DIR, Niten's view of the
+# repositories does not follow it.
+SAFE_PATH = "/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin"
+GIT_BIN = shutil.which("git", path=SAFE_PATH) or "git"
+
+
 class GitError(Exception):
     pass
 
 
+def git_env():
+    return {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+
+
 def git(path, *args):
     """A git call whose output is only shown to someone; empty on failure."""
-    r = subprocess.run(["git", "-C", path, *GIT_SAFE, *args], capture_output=True, text=True)
+    r = subprocess.run([GIT_BIN, "-C", path, *GIT_SAFE, *args], capture_output=True, text=True, env=git_env())
     return r.stdout.strip() if r.returncode == 0 else ""
 
 
 def git_strict(path, *args):
     """A git call a decision rests on: its failure stops the decision."""
-    r = subprocess.run(["git", "-C", path, *GIT_SAFE, *args], capture_output=True)
+    r = subprocess.run([GIT_BIN, "-C", path, *GIT_SAFE, *args], capture_output=True, env=git_env())
     if r.returncode != 0:
         raise GitError(f"git {' '.join(args)} failed in {path}: "
                        + r.stderr.decode("utf-8", "replace").strip()[-300:])
@@ -433,7 +445,16 @@ def git_meta(path):
     gitdir = os.path.join(path, git_strict(path, "rev-parse", "--git-dir").decode().strip())
     files = [os.path.join(common, "config"), os.path.join(gitdir, "config.worktree"),
              os.path.join(common, "info", "exclude"), os.path.join(common, "info", "attributes")]
-    return {os.path.relpath(f, path): content_hash(f) for f in files}
+    meta = {os.path.relpath(f, path): content_hash(f) for f in files}
+    hooks = os.path.join(path, git(path, "config", "--get", "core.hooksPath") or os.path.join(common, "hooks"))
+    listing = hashlib.sha256()
+    for root, dirs, names in os.walk(hooks):
+        dirs.sort()
+        for n in sorted(names):
+            f = os.path.join(root, n)
+            listing.update(os.path.relpath(f, hooks).encode() + b"\0" + file_digest(f).encode() + b"\n")
+    meta["hooks"] = listing.hexdigest()  # a hook git runs (pre-push, ...) is part of what it does
+    return meta
 
 
 def preexisting_state(path):
@@ -978,6 +999,56 @@ def cmd_confirm(args):
     print("final review completed by the user's check: " + args.what)
 
 
+def repo_named(st, key):
+    for name, r in st["repos"].items():
+        if key in (name, r.get("alias")) or os.path.realpath(os.path.expanduser(key)) == r["path"]:
+            return name, r
+    die(f"{key} is not one of the plan's repositories: " + ", ".join(st["repos"]))
+
+
+def cmd_push(args):
+    """Deliver one repository: push exactly the branch whose tip is the commit the
+    final review approved, with one explicit refspec, so that nothing implied by
+    configuration (mirror remotes, followed tags, submodules, push refspecs) goes
+    with it."""
+    d = state_dir_arg(args)
+    st = load_state(d)
+    final = st["final"]
+    if final["status"] != "approved":
+        die("the final review has not approved the change")
+    moved = moved_since(st, final)
+    if moved:
+        die("the change differs from what the final review approved (" + ", ".join(moved) + "); run final again")
+    name, r = repo_named(st, args.repo)
+    approved = final["heads"][name]
+    branch = args.branch or git(r["path"], "symbolic-ref", "--short", "-q", "HEAD")
+    if not branch:
+        die("HEAD is detached; name the branch to push with --branch")
+    tip = git_strict(r["path"], "rev-parse", "--verify", "refs/heads/" + branch + "^{commit}").decode().strip()
+    if tip != approved:
+        die(f"branch {branch} is at {tip[:12]}, not at the commit the final review approved ({approved[:12]})")
+    if not re.fullmatch(r"[\w./:@~+-]+", args.remote) or args.remote.startswith("-"):
+        die(f"{args.remote} is not a remote name or URL Niten pushes to")
+    target = args.to or branch
+    overrides = ["-c", "push.followTags=false", "-c", "push.recurseSubmodules=no"]
+    if re.fullmatch(r"[\w.-]+", args.remote):
+        overrides += ["-c", f"remote.{args.remote}.mirror=false"]
+    argv = [GIT_BIN, "-C", r["path"], *GIT_SAFE, *overrides, "push", "--no-follow-tags", "--no-recurse-submodules"]
+    if args.set_upstream:
+        argv.append("--set-upstream")
+    if args.force_with_lease:
+        argv.append("--force-with-lease")
+    argv += [args.remote, f"refs/heads/{branch}:refs/heads/{target}"]
+    print("niten: " + " ".join(shlex.quote(a) for a in argv[1:]), file=sys.stderr)
+    res = subprocess.run(argv, env=git_env())
+    final.setdefault("deliveries", []).append({"repo": name, "remote": args.remote, "branch": branch, "to": target,
+                                               "commit": approved, "exit": res.returncode, "at": now()})
+    save_state(d, st)
+    if res.returncode != 0:
+        die(f"git push failed (exit {res.returncode})", res.returncode)
+    print(f"pushed {name} {branch} ({approved[:12]}) to {args.remote} as {target}")
+
+
 def cmd_pause(args):
     d = state_dir_arg(args)
     st = load_state(d)
@@ -1168,15 +1239,10 @@ def outside_workspace(path, data, st):
     return not any(within(path, r) for r in roots)
 
 
-# ---------------------------------------------------------------- what a push sends
+# ---------------------------------------------------------------- pushes and the shell
 
-GIT_GLOBAL_OK = {"--no-pager", "-P", "--no-optional-locks", "--no-replace-objects"}
-PUSH_FLAGS = {"-u", "--set-upstream", "-f", "--force", "--force-if-includes", "--no-force-with-lease", "-q",
-              "--quiet", "-v", "--verbose", "--porcelain", "-n", "--dry-run", "--atomic", "--no-verify", "--verify",
-              "--progress", "--no-progress", "--thin", "--no-thin", "-4", "-6", "--ipv4", "--ipv6"}
-PUSH_VALUED = {"-o", "--push-option"}
-PUSH_SHORT = set("ufqvn46")
-REDIRECTS = {">", ">>", "<", ">&", "<&", "&>", "&>>", ">|", "<>"}
+REDIRECTS = {">", ">>", "<", ">&", "<&", "&>", "&>>", ">|", "<>", "<<", "<<<"}
+RUNNERS = {"env", "command", "builtin", "exec", "nice", "nohup", "time", "xargs", "sudo", "doas", "caffeinate"}
 
 
 class Unclear(Exception):
@@ -1184,11 +1250,13 @@ class Unclear(Exception):
 
 
 def shell_segments(command):
-    """The simple commands of a command line, split at ; && || | & and newlines.
-    Substitutions, subshells and groups make it unclear; redirections are dropped."""
+    """The simple commands of a command line, split at ; && || | & and newlines
+    (a backslash-newline continues a line). Substitutions, subshells and groups make
+    it unclear; redirections are dropped."""
     if re.search(r"\$\(|`|<\(|>\(", command):
         raise Unclear("a command substitution")
-    lex = shlex.shlex(command, posix=True, punctuation_chars=True)
+    lex = shlex.shlex(command.replace("\\\n", " "), posix=True, punctuation_chars="();<>|&\n")
+    lex.whitespace = " \t\r"
     lex.whitespace_split = True
     try:
         tokens = list(lex)
@@ -1198,13 +1266,13 @@ def shell_segments(command):
     for t in tokens:
         if skip:
             skip = False
-        elif t in (";", "&&", "||", "|", "&", ";;"):
+        elif t and set(t) <= set(";&|\n"):
             if cur:
                 segments.append(cur)
             cur = []
         elif t in ("(", ")", "{", "}"):
             raise Unclear("a subshell or a group")
-        elif t in REDIRECTS:
+        elif t in REDIRECTS or (t and set(t) <= set("<>&|")):
             if cur and cur[-1].isdigit():
                 cur.pop()
             skip = True
@@ -1215,93 +1283,44 @@ def shell_segments(command):
     return segments
 
 
-def git_pushes(command, cwd):
-    """(directory, arguments) of every `git push` in a command line, following cd and
-    git -C. Anything that could change what git pushes makes the line unclear."""
-    out = []
-    for seg in shell_segments(command):
-        if seg[0] == "cd":
-            cwd = os.path.normpath(os.path.join(cwd, os.path.expanduser(seg[1] if len(seg) > 1 else HOME)))
-            continue
-        if seg[0] in ("pushd", "popd", "builtin", "command", "env", "exec", "eval", "xargs", "sudo"):
-            if any(os.path.basename(t) == "git" for t in seg) and "push" in seg:
-                raise Unclear(f"git push run through {seg[0]}")
-            continue
-        i = 0
-        while i < len(seg) and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", seg[i]):
-            i += 1
-        if i >= len(seg) or os.path.basename(seg[i]) != "git":
-            continue
-        j, repo, bad = i + 1, cwd, None
-        while j < len(seg) and seg[j].startswith("-"):
-            opt = seg[j]
-            if opt == "-C" and j + 1 < len(seg):
-                repo = os.path.normpath(os.path.join(repo, os.path.expanduser(seg[j + 1])))
-                j += 2
-                continue
-            if opt not in GIT_GLOBAL_OK:
-                bad = bad or opt
-                if opt in ("-c", "--git-dir", "--work-tree", "--namespace", "--exec-path", "--super-prefix"):
-                    j += 1
-            j += 1
-        if j < len(seg) and seg[j] == "push":
-            if i > 0:
-                raise Unclear("environment variables set for git push")
-            if bad:
-                raise Unclear(f"the git option {bad} before push")
-            out.append((repo, seg[j + 1:]))
-    return out
+def git_subcommand(seg):
+    """The git subcommand a simple command runs, through runners and VAR=value
+    prefixes, or None."""
+    i = 0
+    while i < len(seg) and (re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", seg[i]) or os.path.basename(seg[i]) in RUNNERS
+                            or (i > 0 and seg[i].startswith("-") and os.path.basename(seg[i - 1]) in RUNNERS)):
+        i += 1
+    if i >= len(seg) or os.path.basename(seg[i]) != "git":
+        return None
+    j = i + 1
+    while j < len(seg) and seg[j].startswith("-"):
+        j += 2 if seg[j] in ("-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path") else 1
+    return seg[j:] if j < len(seg) else []
 
 
-def push_problem(repo_dir, args, st):
-    """Why a git push could send anything but the commits the final review
-    approved, or None."""
-    top = os.path.realpath(git_strict(repo_dir, "rev-parse", "--show-toplevel").decode().strip())
-    name = next((n for n, r in st["repos"].items() if os.path.realpath(r["path"]) == top), None)
-    if not name:
-        return f"it pushes {top}, which is not one of the plan's repositories"
-    approved = st["final"].get("heads", {}).get(name, "")
-    positionals, k = [], 0
-    while k < len(args):
-        a = args[k]
-        if a == "--":
-            positionals += args[k + 1:]
-            break
-        if a.startswith("--recurse-submodules"):
-            if a.split("=", 1)[-1] not in ("no", "check"):
-                return f"{a} pushes submodule commits"
-        elif a.startswith("--force-with-lease") or a.startswith("--push-option="):
-            pass
-        elif a in PUSH_VALUED:
-            k += 1
-        elif a in PUSH_FLAGS or (re.fullmatch(r"-[A-Za-z0-9]+", a) and set(a[1:]) <= PUSH_SHORT):
-            pass
-        elif a.startswith("-"):
-            return f"the push option {a} is not allowed in a Niten session"
-        else:
-            positionals.append(a)
-        k += 1
-    refspecs = positionals[1:]
-    if not refspecs:
-        default = git(top, "config", "--get", "push.default") or "simple"
-        if default not in ("simple", "current", "upstream", "tracking"):
-            return f"push.default={default} pushes more than the current branch"
-        if git(top, "config", "--get-regexp", r"^remote\..*\.push$"):
-            return "a configured remote push refspec decides what is pushed"
-        refspecs = ["HEAD"]
-    for spec in refspecs:
-        src = spec.lstrip("+").split(":", 1)[0]
-        if not src:
-            return f"{spec} deletes a remote ref"
-        if any(c in src for c in "*?["):
-            return f"{spec} is a pattern"
-        try:
-            sha = git_strict(top, "rev-parse", "--verify", "--quiet", src + "^{commit}").decode().strip()
-        except GitError:
-            return f"{src} does not resolve to a commit"
-        if sha != approved:
-            return f"{spec} pushes {sha[:12]}, not the commit the final review approved ({approved[:12]})"
-    return None
+def raw_push(command):
+    """Whether a command line pushes with git itself (push, send-pack, subtree push),
+    or mentions a push in a way that cannot be read."""
+    try:
+        segments = shell_segments(command)
+    except Unclear:
+        return bool(DELIVERY[0].search(command))
+    for seg in segments:
+        sub = git_subcommand(seg)
+        if sub and (sub[0] in ("push", "send-pack") or (sub[0] == "subtree" and "push" in sub[1:])):
+            return True
+    return False
+
+
+# What a session's shell keeps between commands and could make a later command do
+# something else: exported or assigned variables git and Python read, aliases and
+# functions. PATH itself is left alone (virtual environments change it).
+POISON = re.compile(
+    r"\b(export|declare|typeset|readonly|setenv)\b[^;&|\n]*\b(GIT_\w*|PYTHONPATH|PYTHONHOME|PYTHONSTARTUP|BASH_ENV|ENV|"
+    r"LD_PRELOAD|LD_LIBRARY_PATH|DYLD_\w+)\b"
+    r"|(^|[;&|\n]\s*)(GIT_\w*|PYTHONPATH|PYTHONHOME|PYTHONSTARTUP|BASH_ENV|ENV|DYLD_\w+|LD_PRELOAD)=\S*\s*($|[;&|\n])"
+    r"|\balias\s+[\w.-]+=|\bunalias\b|\bhash\s+-p\b"
+    r"|(^|[;&|\n]\s*)(function\s+)?[\w.:-]+\s*\(\)\s*\{|\bfunction\s+[\w.:-]+", re.M)
 
 
 READ_TOOLS = {"Read": "file_path", "Grep": "path", "Glob": "path", "NotebookRead": "notebook_path"}
@@ -1405,41 +1424,33 @@ def cmd_hook_pretooluse(args):
         decision("deny", "Niten: this command would change the session's record, the approved plan or Claude's "
                          "settings. The state changes only through niten.py; ask the user if something is wrong.")
         return
-    mentions_push = bool(DELIVERY[0].search(command))
+    if POISON.search(command):
+        decision("deny", "Niten: this would change what later commands do in the session's shell (an exported "
+                         "or assigned GIT_*/Python/loader variable, an alias or a function). Pass such settings "
+                         "on the one command that needs them, or ask the user.")
+        return
+    if raw_push(command):
+        decision("deny", f"Niten: in a session, deliver with `python3 {SCRIPT} push <repo> <remote> [--branch B] "
+                         f"[-u]`: it pushes exactly the commit the final review approved, nothing implied by "
+                         f"configuration. A raw git push is not used.")
+        return
     other_delivery = any(p.search(command) for p in DELIVERY[1:])
-    pushes, unclear = [], None
-    if mentions_push:
-        try:
-            pushes = git_pushes(command, data.get("cwd") or os.getcwd())
-        except Unclear as e:
-            unclear = str(e)
-    delivery = bool(pushes) or other_delivery or unclear is not None
-    if delivery:
+    if other_delivery:
         final = st["final"]
         if final["status"] != "approved":
-            decision("deny", f"Niten session ({d}): delivery (push or pull request) waits for the final review. "
-                             f"Approve every step, then run `python3 {SCRIPT} final`.")
-            return
-        if unclear:
-            decision("deny", f"Niten: in a session a push is a plain `git [-C <repo>] push <remote> <ref>`, so that "
-                             f"what it sends can be checked ({unclear}).")
+            decision("deny", f"Niten session ({d}): a pull request waits for the final review. Approve every step, "
+                             f"then run `python3 {SCRIPT} final`.")
             return
         try:
-            for repo_dir, args in pushes:
-                problem = push_problem(repo_dir, args, st)
-                if problem:
-                    decision("deny", f"Niten: {problem}. Only the commits the final review approved may be pushed.")
-                    return
-            moved = [n for n, h in heads(st).items() if h != final.get("heads", {}).get(n)] if other_delivery else []
+            moved = moved_since(st, final)
         except GitError as e:
-            decision("deny", f"Niten: the repositories cannot be checked against the final review ({e}); "
-                             f"delivery waits until git works again.")
+            decision("deny", f"Niten: the repositories cannot be checked against the final review ({e}).")
             return
         if moved:
             decision("deny", f"Niten: {', '.join(moved)} changed after the final review; run "
                              f"`python3 {SCRIPT} final` again before delivering.")
             return
-    label = important(command) or ("a git push" if pushes else None) or ("delivery" if delivery else None)
+    label = important(command) or ("delivery" if other_delivery else None)
     if label:
         explained(tool_input, label, where(st))
 
@@ -1539,6 +1550,15 @@ def main():
     p.add_argument("--state")
     p.add_argument("--user-approved", metavar="DECISION", help="another review after the limit, as the user decided")
     p.set_defaults(fn=cmd_final)
+    p = sub.add_parser("push", help="deliver a repository: push the branch at the final-approved commit")
+    p.add_argument("repo", help="repository name, repo-N alias or path")
+    p.add_argument("remote")
+    p.add_argument("--branch", help="local branch to push (default: the current branch)")
+    p.add_argument("--to", help="remote branch name (default: the same)")
+    p.add_argument("-u", "--set-upstream", action="store_true")
+    p.add_argument("--force-with-lease", action="store_true")
+    p.add_argument("--state")
+    p.set_defaults(fn=cmd_push)
     p = sub.add_parser("confirm")
     p.add_argument("what", help="what the user checked")
     p.add_argument("--state")

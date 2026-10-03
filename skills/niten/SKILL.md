@@ -23,9 +23,10 @@ plan path or a ticket key; if empty, ask which plan.
    blocks ending your turn while the current step is unapproved, unless you are waiting
    for the user (rule 4) or a review is running. Do the steps yourself in this session:
    do not hand step work to sub-agents, whose commands may escape the hooks and the log.
-2. **No delivery before the final review.** No `git push` and no pull request until
-   `niten.py final` approved the exact commits you deliver; a hook enforces it, and a
-   commit after the final review needs a new final review.
+2. **No delivery before the final review, and only through Niten.** Pushes go through
+   `niten.py push`, which sends exactly the branch at the commit the final review
+   approved; a raw `git push` is refused in a session. No pull request before the final
+   review; a commit after it needs a new final review.
 3. **Evidence, not claims.** A hook logs every Bash command you run, failed ones too,
    with its exit code and output, to `<plan>.niten/commands.jsonl`, together with the
    user's messages and answers. Each entry is signed with a key you may not read, and a
@@ -58,7 +59,10 @@ plan path or a ticket key; if empty, ask which plan.
 7. **The record is not yours to edit.** The session state, the command log and the
    reviews in `<plan>.niten/`, the plan and its receipts, and Claude's settings are
    protected; only `niten.py` changes the state. You write only `evidence/*.md`. The
-   hooks (`niten.py hook-*`) are Claude Code's, never run them yourself. Claude's own
+   hooks (`niten.py hook-*`) are Claude Code's, never run them yourself. Do not change
+   what later commands do through the shell (exporting or assigning `GIT_*` or Python
+   variables, aliases, functions); give such settings to the one command that needs
+   them. Claude's own
    directory `~/.claude` (settings, Niten's registry, the log's key) is out of reach in
    a session: no shell command names it, globs over hidden names or sweeps the home
    directory; read project files with the Read tool.
@@ -129,9 +133,10 @@ plan path or a ticket key; if empty, ask which plan.
    prompt.
 3. After approval, ask the user how to deliver: push the work branch(es) and open pull
    request(s) (their Git host and conventions), or leave the branches local. Do what
-   they choose; each push goes through a permission prompt. Push plainly, one repository
-   at a time: `git -C <repo> push [-u] <remote> HEAD` or a branch name; every ref you push
-   must be the commit the final review approved.
+   they choose. Push one repository at a time with
+   `niten.py push <repo> <remote> [--branch B] [--to NAME] [-u] [--force-with-lease]`;
+   each push goes through a permission prompt. It pushes the branch only if its tip is the
+   approved commit, with no tags, mirrors or submodules implied by configuration.
 4. `niten.py finish` (it refuses if the commits differ from what the final review
    approved). Report: steps with their review counts, what changed where, what
    external operations were done (with digests/IDs), what is left to the user.

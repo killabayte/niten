@@ -49,7 +49,8 @@ Code session that started a Niten session and do nothing anywhere else.
 | Hook | Rule |
 |---|---|
 | `Stop` | Claude cannot end its turn while the current step, or the final review, is not approved, unless it is waiting for your answer or a review is running. After three blocks in a row without any progress the turn ends with a message to you, so a broken reviewer cannot trap the session in a loop. |
-| `PreToolUse` | No `git push` or pull request before the final review approved exactly the commits being delivered. A push must be a plain `git [-C <repo>] push <remote> <ref>…` whose every ref resolves to the approved commit of a plan's repository (`--all`, `--mirror`, `--tags`, deletions, patterns and anything that hides what is pushed are refused); `finish` refuses unless the commits and the working trees are what the final review approved. |
+| `PreToolUse` | Delivery only after the final review approved exactly the commits being delivered. A raw `git push` (also `send-pack`, `subtree push`, or a push hidden in a multi-line or unclear command) is refused; pushes go through `niten.py push`, which sends one explicit refspec for the branch at the approved commit, with followed tags, mirror remotes and submodules switched off. Pull requests are refused before the final review or after a later change; `finish` refuses unless the commits and the working trees are what the final review approved. |
+| `PreToolUse` | The session's shell cannot be changed for later commands: no exported or assigned `GIT_*`, Python or loader variables, no aliases or functions. |
 | `PreToolUse` | Every important action is put to you, with Claude's explanation of what it does and why the current step needs it, even where your permission settings would allow it. A command without an explanation is refused. |
 | `PreToolUse` | The session's state, command log and reviews, the approved plan and its receipts, and Claude's settings cannot be edited by Claude; Claude cannot run the hooks itself, and Claude's own directory `~/.claude` (with the key that signs the log) is out of reach: no shell command may name it, glob over hidden names or sweep the home directory, and the file tools cannot read Niten's files there. |
 | `PostToolUse`, `PostToolUseFailure` | Every Bash command, failed ones too, is logged with its exit code and output, and so are your answers to Claude's questions, as the reviewer's evidence. Each entry is signed; a review refuses a log with an entry the hooks did not write. |
@@ -80,6 +81,17 @@ the log. The checks are pattern-based and the agents run as your own OS user: a
 deliberately obfuscated shell command (a name assembled at run time, an encoded script)
 can slip past them. Plain commands, quoting tricks, globs over hidden names and sweeps of
 the home directory are caught; the signed log and the final review are there for the rest.
+
+## Threat model
+
+Niten keeps a cooperative executor honest and makes its work checkable: it catches
+mistakes, shortcuts and drift (unreviewed changes, unexplained outward actions, claims
+without proof, deliveries of the wrong commits), and it makes deliberate evasion visible.
+It is not a sandbox. The executor runs as your OS user with your tools, so a determined
+attempt to get around the hooks — a command whose meaning is assembled at run time, a
+fake binary planted earlier on `PATH` — is outside what pattern checks can stop. For
+that, the signed command log, the reviewer and the final review are the backstop, and
+you approve every important action yourself.
 
 ## Requirements
 
@@ -126,6 +138,7 @@ calls it, you rarely need to.
 | `review S-NNN [--user-approved DECISION]` | Codex reviews the current step's committed changes |
 | `final [--user-approved DECISION]` | Codex reviews the whole change, after every step is approved |
 | `confirm "WHAT"` | You checked what the final reviewer could not verify |
+| `push REPO REMOTE [--branch B] [--to NAME] [-u] [--force-with-lease]` | Deliver one repository: push the branch at the commit the final review approved, and nothing else |
 | `pause "reason"` / `resume` | Wait for you without the Stop hook blocking |
 | `attach --state DIR` | Continue a session in a new Claude Code session |
 | `finish [--abort]` | End the session |
