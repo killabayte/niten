@@ -359,13 +359,76 @@ def heads(st):
     return {name: git(r["path"], "rev-parse", "HEAD") for name, r in st["repos"].items()}
 
 
+def status_paths(path):
+    """Paths with uncommitted changes (tracked or untracked), from `git status -z`."""
+    r = subprocess.run(["git", "-C", path, "status", "--porcelain", "-z", "--untracked-files=all"],
+                       capture_output=True)
+    fields, out, i = r.stdout.decode("utf-8", "surrogateescape").split("\0"), [], 0
+    while i < len(fields):
+        entry = fields[i]
+        if len(entry) > 3:
+            out.append(entry[3:])
+            if entry[0] in "RC":
+                i += 1  # the original path of a rename or copy follows
+        i += 1
+    return out
+
+
+def content_hash(path):
+    try:
+        with open(path, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
+    except IsADirectoryError:
+        return "directory"
+    except OSError:
+        return "absent"
+
+
+def own_paths(st, r):
+    """The session's own files inside a repository (a plan kept there)."""
+    return [os.path.relpath(p, r["path"]) for p in sidecars(st["plan"]) + [st_dir(st)] if within(p, r["path"])]
+
+
+def preexisting_state(path):
+    """Content of every path that had uncommitted changes when the session started."""
+    return {p: content_hash(os.path.join(path, p)) for p in status_paths(path)}
+
+
 def new_changes(st, r):
-    """Uncommitted entries that were not there when the session started, other than
-    the session's own files (a plan kept inside the repository)."""
-    before = set((r["preexisting"] or "").splitlines())
-    own = [os.path.relpath(p, r["path"]) for p in sidecars(st["plan"]) + [st_dir(st)] if within(p, r["path"])]
-    return [l for l in git(r["path"], "status", "--porcelain").splitlines()
-            if l not in before and not any(l[3:].strip('"').startswith(o) for o in own)]
+    """Uncommitted changes since the session started: a path changed now that was
+    not before, or a path changed before whose content is no longer what it was."""
+    own = own_paths(st, r)
+    before = r.get("preexisting_content", {})
+    now_ = [p for p in status_paths(r["path"]) if not any(p.startswith(o) for o in own)]
+    out = [p for p in now_ if p not in before]
+    out += [p for p, h in before.items() if content_hash(os.path.join(r["path"], p)) != h]
+    return sorted(set(out))
+
+
+def tree_fingerprint(st, r):
+    """The content of a repository's working tree beyond its HEAD: tracked changes
+    (staged or not) and every untracked file, the session's own files left out."""
+    excludes = [":(exclude)" + o for o in own_paths(st, r)]
+    diff = subprocess.run(["git", "-C", r["path"], "diff", "HEAD", "--binary", "--", "."] + excludes,
+                          capture_output=True).stdout
+    h = hashlib.sha256(diff)
+    tracked = set(subprocess.run(["git", "-C", r["path"], "diff", "HEAD", "--name-only", "-z"],
+                                 capture_output=True).stdout.decode("utf-8", "surrogateescape").split("\0"))
+    for p in sorted(status_paths(r["path"])):
+        if p not in tracked and not any(p.startswith(o) for o in own_paths(st, r)):
+            h.update(p.encode("utf-8", "surrogateescape") + b"\0" + content_hash(os.path.join(r["path"], p)).encode())
+    return h.hexdigest()
+
+
+def trees(st):
+    return {name: tree_fingerprint(st, r) for name, r in st["repos"].items()}
+
+
+def moved_since(st, approval):
+    """Repositories whose commits or working tree differ from an approval."""
+    now_heads, now_trees = heads(st), trees(st)
+    return sorted({n for n in st["repos"] if now_heads[n] != approval.get("heads", {}).get(n)
+                   or now_trees[n] != approval.get("trees", {}).get(n)})
 
 
 # ---------------------------------------------------------------- codex
@@ -593,8 +656,8 @@ def log_summary(d, sid):
 
 
 def snapshot(st):
-    """The commits and uncommitted changes a review is about."""
-    return {"heads": heads(st), "changes": {n: new_changes(st, r) for n, r in st["repos"].items()}}
+    """The commits and the working-tree content a review is about."""
+    return {"heads": heads(st), "trees": trees(st)}
 
 
 def review_step(d, st, sid, final, user_approved):
@@ -667,6 +730,7 @@ def review_step(d, st, sid, final, user_approved):
     step = st["final"] if final else step_of(st, sid)
     reviews, ledger = step["reviews"], step.setdefault("ledger", {})
     entry = {"n": n, "file": out, "verdict": verdict["verdict"], "at": now(), "heads": before["heads"],
+             "trees": before["trees"],
              "user_approved": user_approved or None, **meta}
     if snapshot(st) != before:
         reviews.append({**entry, "approved": False, "discarded": "the change moved during the review"})
@@ -683,7 +747,7 @@ def review_step(d, st, sid, final, user_approved):
     elif ok:
         step["status"] = "approved"
         if final:
-            step["heads"] = before["heads"]
+            step["heads"], step["trees"] = before["heads"], before["trees"]
         else:
             unv = st.setdefault("unverified", {})
             for c in verdict["criteria"]:
@@ -757,7 +821,8 @@ def cmd_start(args):
             die(f"repository {name}: not found; pass --repo {name}=PATH (or set NITEN_WORKSPACE)")
         repos[name] = {"path": os.path.realpath(p), "alias": alias,
                        "base": git(p, "rev-parse", "HEAD"), "branch": git(p, "rev-parse", "--abbrev-ref", "HEAD"),
-                       "preexisting": git(p, "status", "--porcelain")}
+                       "preexisting": git(p, "status", "--porcelain"),
+                       "preexisting_content": preexisting_state(p)}
     d = os.path.splitext(plan)[0] + ".niten"
     if os.path.exists(d):
         existing = os.path.exists(os.path.join(d, "state.json"))
@@ -813,7 +878,7 @@ def cmd_status(args):
     elif st["final"]["status"] != "approved":
         print("next: final review")
     else:
-        moved = {n: h for n, h in heads(st).items() if h != st["final"].get("heads", {}).get(n)}
+        moved = moved_since(st, st["final"])
         print("next: delivery" if not moved else "WARNING: commits changed after the final review: "
               + ", ".join(moved) + "; run the final review again")
 
@@ -845,12 +910,12 @@ def cmd_confirm(args):
     final = st["final"]
     if final["status"] != "needs_user":
         die("nothing waits for the user's check")
-    if [n for n, h in heads(st).items() if h != final["reviews"][-1]["heads"].get(n)]:
-        die("commits changed since the final review; run final again")
-    if any(new_changes(st, r) for r in st["repos"].values()):
-        die("there are uncommitted changes since the final review; run final again")
+    last = final["reviews"][-1]
+    moved = moved_since(st, last)
+    if moved:
+        die("the change moved since the final review (" + ", ".join(moved) + "); run final again")
     final["status"] = "approved"
-    final["heads"] = final["reviews"][-1]["heads"]
+    final["heads"], final["trees"] = last["heads"], last["trees"]
     final["user_check"] = {"what": args.what, "criteria": final.get("unverified", []), "at": now()}
     save_state(d, st)
     print("final review completed by the user's check: " + args.what)
@@ -896,10 +961,9 @@ def cmd_finish(args):
     if not args.abort:
         if st["final"]["status"] != "approved":
             die("the final review has not approved the change; ask the user before --abort")
-        moved = [n for n, h in heads(st).items() if h != st["final"].get("heads", {}).get(n)]
-        if moved or any(new_changes(st, r) for r in st["repos"].values()):
-            die("the change differs from what the final review approved ("
-                + (", ".join(moved) or "uncommitted changes") + "); run final again")
+        moved = moved_since(st, st["final"])
+        if moved:
+            die("the change differs from what the final review approved (" + ", ".join(moved) + "); run final again")
     st["finished"] = {"at": now(), "aborted": bool(args.abort)}
     save_state(d, st)
     unregister(d)
@@ -945,7 +1009,7 @@ def progress(d, st):
     except OSError:
         log = 0
     reviews = sum(len(s["reviews"]) for s in st["steps"]) + len(st["final"]["reviews"])
-    return hashlib.sha256(json.dumps([reviews, log, heads(st)], sort_keys=True).encode()).hexdigest()
+    return hashlib.sha256(json.dumps([reviews, log, heads(st), trees(st)], sort_keys=True).encode()).hexdigest()
 
 
 def cmd_hook_stop(args):
@@ -1047,6 +1111,24 @@ READ_TOOLS = {"Read": "file_path", "Grep": "path", "Glob": "path", "NotebookRead
 HOOK_CALL = re.compile(r"\bniten\.py\b[^|;&]*\bhook-|\bhook-(stop|pretooluse|posttooluse|userprompt)\b")
 NITEN_CODE = re.compile(r"niten\.py|skills/niten/scripts|\bimport\s+niten\b|\bfrom\s+niten\s+import\b|"
                         + re.escape(HERE))
+# Claude's own directory (settings, transcripts, Niten's registry and the log's key)
+# is out of a session's reach: no mention of it, no glob that could expand to a hidden
+# name, no option that makes globs match hidden names, no recursive sweep of HOME.
+CLAUDE_REACH = re.compile(r"\.claude\b|hook\.key|(^|[\s/=(])\.[^\s/()]*[*?\[]|dotglob|globdots|GLOBIGNORE|"
+                          r"\*\([^)]*D[^)]*\)")
+
+
+def home_sweep(command):
+    roots = r"(~|\$HOME|\$\{HOME\}|" + re.escape(HOME) + r")/?"
+    return re.search(r"\b(find|grep|egrep|rg|ag|ack|tar|zip|rsync|cp|scp|du|ls|tree)\b[^|;&]*\s" + roots
+                     + r"(\s|$|[;&|)])", command)
+
+
+def reaches_claude_dir(command):
+    flat = re.sub(r"[\'\"\\]", "", command)  # .cla''ude, ".claude", \.claude
+    return bool(CLAUDE_REACH.search(flat) or home_sweep(flat))
+
+
 START_OVERRIDE = re.compile(r"\bniten\.py\b[^|;&]*\bstart\b[^|;&]*--(unapproved|restart)\b")
 INTERPRETER = re.compile(r"\b(python[0-9.]*|node|ruby|perl|bash|sh|zsh|osascript|exec|eval|source)\b")
 
@@ -1091,10 +1173,18 @@ def cmd_hook_pretooluse(args):
         decision("deny", "Niten: the hooks and their signing key belong to Claude Code, not to the session. "
                          "Use niten.py's own commands.")
         return
-    if tool in READ_TOOLS and tool_input.get(READ_TOOLS[tool]):
-        path = os.path.realpath(os.path.expanduser(tool_input[READ_TOOLS[tool]]))
-        if within(path, KEY) or (tool != "Read" and within(KEY, path)):
-            decision("deny", "Niten: the log's signing key is not readable in a session.")
+    if command and not NITEN_CALL.match(command) and reaches_claude_dir(command):
+        decision("deny", "Niten: Claude's own directory (~/.claude) is out of reach in a session, and so are "
+                         "globs over hidden names and sweeps of the home directory. Read project files with the "
+                         "Read tool; ask the user if you need something there.")
+        return
+    if tool in READ_TOOLS:
+        path = tool_input.get(READ_TOOLS[tool]) or ""
+        real = os.path.realpath(os.path.expanduser(path)) if path else ""
+        probe = " ".join(str(tool_input.get(k, "")) for k in ("path", "pattern", "glob", "file_path"))
+        if (real and (within(real, NITEN_HOME) or (tool != "Read" and within(KEY, real))))  \
+                or (tool != "Read" and reaches_claude_dir(probe)):
+            decision("deny", "Niten: the log's signing key and Niten's registry are not readable in a session.")
             return
 
     if tool in FILE_TOOLS:

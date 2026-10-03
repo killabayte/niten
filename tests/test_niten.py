@@ -700,6 +700,126 @@ class HookTest(Base):
         self.assertIsNone(self.hook("stop", session="sess-1"))
 
 
+class DirtyTreeTest(Base):
+    """Approvals bind the content of files that were already dirty (review round 3)."""
+
+    def dirty_start(self):
+        self.commit("app", "dirty.txt", "committed baseline\n")
+        path = os.path.join(self.ws, "app", "dirty.txt")
+        with open(path, "w") as f:
+            f.write("the user's pre-existing edit\n")
+        self.start()
+        self.assertIn("dirty.txt", self.state_json()["repos"]["app"]["preexisting"])
+        return path
+
+    def run_final_while(self, change):
+        """Run the final review and call change() while the reviewer works."""
+        ready, release = os.path.join(self.tmp, "review-ready"), os.path.join(self.tmp, "review-release")
+        with open(self.codex) as f:
+            code = f.read()
+        with open(self.codex, "w") as f:
+            f.write('#!/bin/sh\ntouch "$REVIEW_READY"\nwhile [ ! -e "$REVIEW_RELEASE" ]; do sleep 0.05; done\n'
+                    + code.split("\n", 1)[1])
+        p = subprocess.Popen([sys.executable, SCRIPT, "final"], cwd=self.ws, env=self.env(
+            REVIEW_READY=ready, REVIEW_RELEASE=release), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            end = time.monotonic() + 10
+            while not os.path.exists(ready) and time.monotonic() < end:
+                time.sleep(0.02)
+            self.assertTrue(os.path.exists(ready), "the scripted reviewer did not start")
+            change()
+            open(release, "w").close()
+            out, err = p.communicate(timeout=15)
+            self.assertEqual(p.returncode, 0, err)
+            return out
+        finally:
+            if p.poll() is None:
+                p.kill()
+                p.communicate()
+
+    def write(self, path, text):
+        with open(path, "w") as f:
+            f.write(text)
+
+    def test_editing_a_dirty_file_during_the_review_discards_it(self):
+        path = self.dirty_start()
+        self.approve_all_steps()
+        self.evidence("final")
+        out = self.run_final_while(lambda: self.write(path, "different content while the review runs\n"))
+        self.assertIn("DISCARDED", out)
+        self.assertNotEqual(self.state_json()["final"]["status"], "approved")
+
+    def test_editing_an_untracked_file_during_the_review_discards_it(self):
+        scratch = os.path.join(self.ws, "app", "notes.txt")
+        self.write(scratch, "before\n")
+        self.start()
+        self.approve_all_steps()
+        self.evidence("final")
+        out = self.run_final_while(lambda: self.write(scratch, "after\n"))
+        self.assertIn("DISCARDED", out)
+
+    def test_editing_a_dirty_file_after_the_final_review_stops_finish(self):
+        path = self.dirty_start()
+        self.approve_all_steps()
+        self.evidence("final")
+        self.ok("final")
+        self.write(path, "another change after the final approval\n")
+        r = self.run_niten("finish")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("differs from what the final review approved", r.stderr)
+        self.assertIn("changed after the final review", self.ok("status"))
+
+    def test_editing_a_dirty_file_must_be_settled_before_the_review(self):
+        path = self.dirty_start()
+        self.write(path, "the executor changed a file the user had already changed\n")
+        self.evidence("S-001")
+        r = self.run_niten("review", "S-001")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("dirty.txt", r.stderr)
+
+    def test_confirm_needs_the_reviewed_content(self):
+        path = self.dirty_start()
+        self.approve_all_steps()
+        self.evidence("final")
+        self.ok("final", FAKE_VERDICT="unverifiable")
+        self.write(path, "changed after the review\n")
+        r = self.run_niten("confirm", "checked")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("moved since the final review", r.stderr)
+
+
+class ClaudeDirTest(Base):
+    """Claude's own directory, with the log's key, is out of a session's reach."""
+
+    def setUp(self):
+        super().setUp()
+        self.start()
+        self.hook("userprompt", prompt="Continue the approved plan.")  # creates the key
+        self.key = os.path.join(self.home, ".claude", "niten", "hook.key")
+        self.assertTrue(os.path.exists(self.key))
+
+    def test_globs_and_sweeps_cannot_reach_the_key(self):
+        keydir = os.path.dirname(self.key)
+        for cmd in (f"cat {shlex.quote(keydir)}/*", "cat ~/.claude/niten/*", "cat ~/.cl*/n*/*",
+                    "cd ~ && cat .cla''ude/niten/*", "cat ../../home/.claude/niten/*", "find ~ -name '*.key'",
+                    "grep -r . ~/", "ls -la ~", "shopt -s dotglob; cat ~/*/niten/*", "cat ~/.?laude/niten/*",
+                    "tar czf /tmp/x.tgz $HOME", "cat ~/.[c]laude/niten/*", "zsh -c 'print -l ~/*(D)'"):
+            self.assertEqual(self.bash(cmd, WHY)["permissionDecision"], "deny", cmd)
+        for cmd in ("cat app/README.md", "ls -la", "grep -rn TODO ~/workspace/repo", "find . -name '*.py'",
+                    "ls ~/workspace", f"python3 {SCRIPT} status"):
+            self.assertIsNone(self.bash(cmd), cmd)
+
+    def test_file_tools_cannot_reach_the_key_or_the_registry(self):
+        self.assertEqual(self.pre("Read", file_path=self.key)["permissionDecision"], "deny")
+        self.assertEqual(self.pre("Read", file_path=os.path.join(os.path.dirname(self.key), "active.json"))
+                         ["permissionDecision"], "deny")
+        self.assertEqual(self.pre("Grep", pattern="x", path=self.home)["permissionDecision"], "deny")
+        self.assertEqual(self.pre("Glob", pattern="**/.claude/**/*")["permissionDecision"], "deny")
+        self.assertEqual(self.pre("Glob", pattern="~/.cl*/*")["permissionDecision"], "deny")
+        self.assertIsNone(self.pre("Read", file_path=os.path.join(self.ws, "app", ".claude", "settings.json")))
+        self.assertIsNone(self.pre("Grep", pattern="TODO", path=os.path.join(self.ws, "app")))
+
+
 class InstallTest(unittest.TestCase):
     def setUp(self):
         self.home = os.path.realpath(tempfile.mkdtemp())

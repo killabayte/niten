@@ -58,8 +58,10 @@ plan path or a ticket key; if empty, ask which plan.
 7. **The record is not yours to edit.** The session state, the command log and the
    reviews in `<plan>.niten/`, the plan and its receipts, and Claude's settings are
    protected; only `niten.py` changes the state. You write only `evidence/*.md`. The
-   hooks (`niten.py hook-*`) are Claude Code's, never run them yourself, and do not read
-   `~/.claude/niten/hook.key`.
+   hooks (`niten.py hook-*`) are Claude Code's, never run them yourself. Claude's own
+   directory `~/.claude` (settings, Niten's registry, the log's key) is out of reach in
+   a session: no shell command names it, globs over hidden names or sweeps the home
+   directory; read project files with the Read tool.
 
 ## Procedure
 
@@ -98,8 +100,11 @@ plan path or a ticket key; if empty, ask which plan.
    steps have nothing to commit.
 5. `niten.py review <step>`, as a **background** Bash command (`run_in_background`):
    a review takes minutes, longer than a foreground command may run. Wait for it to
-   finish, then read its output; do not change the repositories while it runs, or its
-   verdict is **DISCARDED** and you review again. The reviewer sees only this step's
+   finish, then read its output; do not change the repositories while it runs (commits,
+   or the content of any file, including ones that were already modified before the
+   session), or its verdict is **DISCARDED** and you review again. Do not change a file
+   that had uncommitted changes before the session without asking the user: a review
+   refuses until that is settled. The reviewer sees only this step's
    changes (since the previous step's approval), the step's log entries and your
    evidence; it must judge every criterion of the step and settle every open finding
    by its id. A criterion it cannot verify passes the step but returns at the final

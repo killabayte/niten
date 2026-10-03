@@ -26,7 +26,8 @@ with two models; Niten carries it out with the same two models in fixed roles.
   and settles every open finding, with no blocker or major one left unaddressed; otherwise
   Claude fixes and asks again. A failed, malformed or stale review never counts as
   approval, and a verdict is discarded if the repositories moved while the reviewer
-  worked. A final review checks the whole change against every criterion of the plan
+  worked: their commits, or the content of their working trees, including files that were
+  already modified before the session. A final review checks the whole change against every criterion of the plan
   before anything is delivered; what nobody could verify, in a step or at the end, goes to
   you to check and confirm.
 - **You are in the loop.** Claude asks when it needs a login, a permission, a decision the
@@ -44,9 +45,9 @@ Code session that started a Niten session and do nothing anywhere else.
 | Hook | Rule |
 |---|---|
 | `Stop` | Claude cannot end its turn while the current step, or the final review, is not approved, unless it is waiting for your answer or a review is running. After three blocks in a row without any progress the turn ends with a message to you, so a broken reviewer cannot trap the session in a loop. |
-| `PreToolUse` | No `git push` or pull request before the final review approved exactly the commits being delivered; `finish` refuses as well. |
+| `PreToolUse` | No `git push` or pull request before the final review approved exactly the commits being delivered; `finish` refuses unless the commits and the working trees are what the final review approved. |
 | `PreToolUse` | Every important action is put to you, with Claude's explanation of what it does and why the current step needs it, even where your permission settings would allow it. A command without an explanation is refused. |
-| `PreToolUse` | The session's state, command log and reviews, the approved plan and its receipts, and Claude's settings cannot be edited by Claude; Claude cannot run the hooks itself or read the key that signs the log. |
+| `PreToolUse` | The session's state, command log and reviews, the approved plan and its receipts, and Claude's settings cannot be edited by Claude; Claude cannot run the hooks itself, and Claude's own directory `~/.claude` (with the key that signs the log) is out of reach: no shell command may name it, glob over hidden names or sweep the home directory, and the file tools cannot read Niten's files there. |
 | `PostToolUse`, `PostToolUseFailure` | Every Bash command, failed ones too, is logged with its exit code and output, and so are your answers to Claude's questions, as the reviewer's evidence. Each entry is signed; a review refuses a log with an entry the hooks did not write. |
 | `UserPromptSubmit` | Your messages are logged too, so a deviation from the plan counts as decided only if you decided it; a pause to wait for you ends when you answer. |
 
@@ -70,8 +71,10 @@ approval or over an earlier one is put to you.
 Everything else (scope, the quality of the evidence, asking instead of guessing) is the
 skill's instruction to the model, backed by the reviewer, which rejects out-of-scope or
 unproven work. Commands hidden in scripts are not classified; the reviewer sees them in
-the log. The checks are pattern-based: deliberate obfuscation of a shell command can slip
-past them, which the signed log and the final review are there to catch.
+the log. The checks are pattern-based and the agents run as your own OS user: a
+deliberately obfuscated shell command (a name assembled at run time, an encoded script)
+can slip past them. Plain commands, quoting tricks, globs over hidden names and sweeps of
+the home directory are caught; the signed log and the final review are there for the rest.
 
 ## Requirements
 
