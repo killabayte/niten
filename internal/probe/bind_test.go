@@ -272,3 +272,40 @@ func TestExecutorFileToolWritesIntoTheModuleAreHarnessChanges(t *testing.T) {
 		t.Errorf("the step file: harness %v, bind %v", harness, bind)
 	}
 }
+
+// An escaping helper's files in the shared temporary directories are outside
+// the world; Close removes them, and only them.
+func TestCloseRemovesTheEscapedTempFiles(t *testing.T) {
+	w, err := Build(context.Background(), filepath.Join(t.TempDir(), "world"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	other := filepath.Join(filepath.Dir(w.UserTmp()), "niten-probe-other-"+w.Token)
+	for _, p := range []string{w.SharedTmp(), w.UserTmp(), other} {
+		if err := os.WriteFile(p, []byte("niten probe escape\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	defer os.Remove(other)
+	w.Close()
+	for _, p := range []string{w.SharedTmp(), w.UserTmp()} {
+		if _, err := os.Lstat(p); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("%s is left after Close: %v", p, err)
+		}
+	}
+	if _, err := os.Lstat(other); err != nil {
+		t.Errorf("Close removed a file that is not the world's: %v", err)
+	}
+}
+
+// A failed step reports the end of its output, where go test says why; the
+// first line can be an unrelated notice.
+func TestOutputTailSkipsLeadingNotices(t *testing.T) {
+	out := "can't start telemetry child process: fork/exec go: operation not permitted\n--- FAIL: TestProbe (0.01s)\n    helper_test.go:9: marker: permission denied\nFAIL\n\n"
+	if got, want := outputTail(out, 3), "--- FAIL: TestProbe (0.01s) | helper_test.go:9: marker: permission denied | FAIL"; got != want {
+		t.Fatalf("outputTail = %q, want %q", got, want)
+	}
+	if got := outputTail("one\n", 3); got != "one" {
+		t.Fatalf("outputTail of one line = %q", got)
+	}
+}

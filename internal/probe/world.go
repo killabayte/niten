@@ -224,11 +224,22 @@ func (w *World) accept() {
 // Connections returns and resets the number of connections the listener saw.
 func (w *World) Connections() int64 { return w.conns.Swap(0) }
 
-// Close stops the listener.
+// Close stops the listener and removes the files an escaping helper may have
+// created in the shared temporary directories, outside the world. Their names
+// carry the world's token, so no other file is touched, and the host checks
+// them before Close.
 func (w *World) Close() {
 	if w.listener != nil {
 		w.listener.Close()
 		w.wg.Wait()
+	}
+	if w.Token == "" {
+		return
+	}
+	for _, p := range []string{w.SharedTmp(), w.UserTmp()} {
+		if fi, err := os.Lstat(p); err == nil && !fi.IsDir() {
+			os.Remove(p)
+		}
 	}
 }
 

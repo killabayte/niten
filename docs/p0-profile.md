@@ -181,6 +181,11 @@ Go 1.26.3. No model was called. What the run established:
 - Harmless denials that appear in every run and need no allowance: writes to
   `/dev/dtracehelper`, `ipc-posix-shm-read-data apple.shm.notification_center` and
   reads of the real home's `.CFUserTextEncoding`.
+- The go command's telemetry child cannot start in the sandbox. In a fresh scratch home
+  the first `go` command (Go 1.26.3) prints `can't start telemetry child process:
+  fork/exec .../bin/go: operation not permitted` and goes on; its exit status is
+  unchanged, and later commands in the same scratch print nothing. No child escapes the
+  process group. The line is a notice, not the reason for a failed check.
 - Denials are observable without extra tooling: `/usr/bin/log show --style compact
   --predicate 'eventMessage CONTAINS "deny"'` lists `Sandbox: <process> deny(1) <op> <path>`.
 - `sandbox-exec` worked while the coordinator itself ran inside Claude Code's Bash

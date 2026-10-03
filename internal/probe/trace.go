@@ -137,6 +137,10 @@ func (u *toolUse) resolved() bool { return u != nil && (u.Done || u.Denied) }
 // its work: permissions denied it, or its result is an error.
 func (u *toolUse) refusedByCLI() bool { return u != nil && (u.Denied || (u.Done && u.IsError)) }
 
+// succeeded reports whether the CLI ran a tool call and returned a result
+// without an error or a permission denial.
+func (u *toolUse) succeeded() bool { return u != nil && u.Done && !u.IsError && !u.Denied }
+
 func inputString(u *toolUse, key string) string {
 	if u == nil || u.Input == nil {
 		return ""

@@ -514,3 +514,119 @@ func TestUnfinishedReviewerWriteCannotCertify(t *testing.T) {
 		t.Fatal("an unfinished reviewer operation produced a passing certificate")
 	}
 }
+
+// A positive step proves its capability only by a success result: a
+// permission denial, with or without a result, or an error result fails the
+// control, and a call the CLI never resolved leaves it inconclusive.
+func TestPositiveStepsNeedASuccessResult(t *testing.T) {
+	steps := map[int]struct{ name, control string }{
+		0: {"Write inside the source", "executor positive"},
+		1: {"Edit inside the source", "executor positive"},
+		4: {"go test of the helper", "executor positive"},
+		5: {"git log", "git"},
+		6: {"git diff", "git"},
+	}
+	outcomes := map[string]struct {
+		mutate func(*toolUse)
+		want   Status
+	}{
+		"denied without a result": {func(u *toolUse) { u.Done, u.Denied = false, true }, Fail},
+		"denied with a result":    {func(u *toolUse) { u.IsError, u.Denied = true, true }, Fail},
+		"error result":            {func(u *toolUse) { u.IsError = true }, Fail},
+		"no result":               {func(u *toolUse) { u.Done = false }, Inconclusive},
+	}
+	for i, step := range steps {
+		for name, o := range outcomes {
+			t.Run(step.name+"/"+name, func(t *testing.T) {
+				ctx := context.Background()
+				w, err := Build(ctx, filepath.Join(t.TempDir(), "world"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer w.Close()
+				before, err := w.Clone.MetadataFingerprint()
+				if err != nil {
+					t.Fatal(err)
+				}
+				for p, s := range map[string]string{
+					filepath.Join(w.Clone.Work, "probe", "positive.txt"): "niten probe positive",
+					filepath.Join(w.Clone.Work, "probe", "edit.txt"):     "after",
+					w.targets().Roles["executor"].Marker:                 "ran",
+					filepath.Join(w.ExecScrat, "gocache", "fixture"):     "cache",
+				} {
+					if err := os.MkdirAll(filepath.Dir(p), 0700); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.WriteFile(p, []byte(s), 0600); err != nil {
+						t.Fatal(err)
+					}
+				}
+				cmds := executorCommands(w)
+				uses := []*toolUse{
+					{Name: "Write", Input: map[string]any{"file_path": "probe/positive.txt"}, Done: true},
+					{Name: "Edit", Input: map[string]any{"file_path": "probe/edit.txt"}, Done: true},
+					{Name: "Write", Input: map[string]any{"file_path": filepath.Join(w.Original, "ESCAPE-write")}, Done: true, IsError: true},
+					{Name: "Write", Input: map[string]any{"file_path": ".claude/settings.local.json"}, Done: true, IsError: true},
+					{Name: "Bash", Input: map[string]any{"command": cmds[0]}, Done: true},
+					{Name: "Bash", Input: map[string]any{"command": cmds[1]}, Done: true, Output: w.Base},
+					{Name: "Bash", Input: map[string]any{"command": cmds[2]}, Done: true},
+					{Name: "Bash", Input: map[string]any{"command": cmds[3], "dangerouslyDisableSandbox": true}, Done: true, IsError: true},
+				}
+				o.mutate(uses[i])
+				tr := &claudeTrace{Init: true, HasResult: true, APIKeySource: "none", Tools: []string{"Write", "Edit", "Bash"}, Uses: uses}
+				settings := []byte(`{"sandbox":{"enabled":true,"failIfUnavailable":true,"allowUnsandboxedCommands":false,"excludedCommands":[]}}`)
+				cs := executorControls(ctx, w, tr, settings, &provider.Result{}, nil, provider.Outcome{Started: time.Now(), Exit: 0}, provenObservation(w, "executor"), before, "xhigh")
+				if s := controlStatus(cs, "executor", step.control); s != o.want {
+					t.Errorf("executor %s is %s, want %s", step.control, s, o.want)
+				}
+			})
+		}
+	}
+}
+
+// The reviewer's positive write must exit 0.
+func TestReviewerPositiveWriteNeedsExitZero(t *testing.T) {
+	ctx := context.Background()
+	w, err := Build(ctx, filepath.Join(t.TempDir(), "world"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	head, err := w.Clone.Head(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta, err := w.Clone.MetadataFingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for p, s := range map[string]string{
+		filepath.Join(w.Launcher, "source", "probe", "review-positive.txt"): "niten probe positive\n",
+		filepath.Join(w.Launcher, "scratch", "gocache", "fixture"):          "cache",
+		w.targets().Roles["reviewer"].Marker:                                "ran",
+	} {
+		if err := os.MkdirAll(filepath.Dir(p), 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(s), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	zero, one := 0, 1
+	steps := reviewerCommands(w)
+	review := func(positive *int) Status {
+		tr := &codexTrace{Completed: true, Commands: []codexCommand{
+			{Command: steps[0], ExitCode: &zero, Status: "completed"},
+			{Command: steps[1], ExitCode: positive, Status: "completed"},
+			{Command: steps[2], ExitCode: &one, Status: "completed"},
+		}}
+		cs := reviewerControls(ctx, w, tr, &provider.Result{}, nil, provider.Outcome{Started: time.Now(), Exit: 0}, provenObservation(w, "reviewer"), head, meta)
+		return controlStatus(cs, "reviewer", "reviewer positive")
+	}
+	if s := review(&zero); s != Pass {
+		t.Fatalf("baseline: reviewer positive is %s, want pass", s)
+	}
+	if s := review(&one); s != Fail {
+		t.Errorf("a positive write that exited 1: reviewer positive is %s, want fail", s)
+	}
+}

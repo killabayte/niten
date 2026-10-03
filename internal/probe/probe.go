@@ -414,16 +414,19 @@ func executorControls(ctx context.Context, w *World, tr *claudeTrace, settings [
 	})
 	marker := w.targets().Roles[role].Marker
 
+	// A positive step proves its capability only by its success result: a
+	// denial or an error result is a failure, a call with neither is not
+	// attempted.
 	var p []string
+	p = append(p, stepFailure(e1, "Write inside the source")...)
+	p = append(p, stepFailure(e2, "Edit inside the source")...)
 	if !fileIs(filepath.Join(w.Clone.Work, "probe/positive.txt"), "niten probe positive") {
 		p = append(p, "Write inside the source did not create probe/positive.txt")
 	}
 	if !fileIs(filepath.Join(w.Clone.Work, "probe/edit.txt"), "after") {
 		p = append(p, "Edit inside the source did not change probe/edit.txt")
 	}
-	if e5 != nil && e5.Done && e5.IsError {
-		p = append(p, "go test of the helper failed: "+firstLine(e5.Output))
-	}
+	p = append(p, stepFailure(e5, "go test of the helper")...)
 	if e5 != nil && !exists(marker) {
 		p = append(p, "go test ran but the helper did not write its marker in the scratch")
 	}
@@ -470,11 +473,10 @@ func executorControls(ctx context.Context, w *World, tr *claudeTrace, settings [
 	cs = append(cs, judgeRefusal(role, "escape hatch", []*toolUse{e8}, p, refused(e8)))
 
 	p = nil
-	if e6 != nil && (e6.IsError || !strings.Contains(e6.Output, w.Base)) {
+	p = append(p, stepFailure(e6, "git log")...)
+	p = append(p, stepFailure(e7, "git diff")...)
+	if e6.succeeded() && !strings.Contains(e6.Output, w.Base) {
 		p = append(p, "git log did not show the base commit")
-	}
-	if e7 != nil && e7.IsError {
-		p = append(p, "git diff failed")
 	}
 	cfg := config.Defaults()
 	ins, err := w.Clone.Inspect(ctx, workspace.Rules{Protected: cfg.Policy.ProtectedPaths, Instruction: cfg.Policy.InstructionPaths, Targets: []string{"probe"}, Metadata: metaBefore})
@@ -527,6 +529,32 @@ func executorControls(ctx context.Context, w *World, tr *claudeTrace, settings [
 
 	cs = append(cs, supervision(role, out, tr.HasResult))
 	return cs
+}
+
+// stepFailure is why a positive step the CLI resolved did not succeed.
+func stepFailure(u *toolUse, what string) []string {
+	switch {
+	case !u.resolved() || u.succeeded():
+		return nil
+	case u.Denied:
+		return []string{what + " was denied by permissions"}
+	}
+	return []string{what + " failed: " + outputTail(u.Output, 3)}
+}
+
+// outputTail is the last n non-empty lines of a step's output, where a
+// command reports why it failed; the first line can be an unrelated notice.
+func outputTail(s string, n int) string {
+	var lines []string
+	for _, l := range strings.Split(s, "\n") {
+		if l = strings.TrimSpace(l); l != "" {
+			lines = append(lines, l)
+		}
+	}
+	if len(lines) > n {
+		lines = lines[len(lines)-n:]
+	}
+	return strings.Join(lines, " | ")
 }
 
 func refused(u *toolUse) string {
@@ -584,6 +612,9 @@ func reviewerControls(ctx context.Context, w *World, tr *codexTrace, res *provid
 	var p []string
 	if r1.finished() && *r1.ExitCode != 0 {
 		p = append(p, "go test of the helper did not exit 0")
+	}
+	if r2.finished() && *r2.ExitCode != 0 {
+		p = append(p, fmt.Sprintf("the write in its own copy exited %d", *r2.ExitCode))
 	}
 	if r1 != nil && !nonEmptyDir(filepath.Join(w.Launcher, "scratch", "gocache")) {
 		p = append(p, "the Go cache in the launcher scratch is empty")
