@@ -19,13 +19,16 @@ with two models; Niten carries it out with the same two models in fixed roles.
   which calls `codex exec` in a read-only sandbox, without your Codex configuration,
   rules, MCP servers or plugins. Codex sees the plan's step, only this step's changes, the
   commands that actually ran and Claude's evidence, and returns a structured verdict: each
-  acceptance criterion as met, not met or not verifiable, every earlier finding settled as
-  addressed, not addressed or withdrawn, new findings with a severity and the exact fix,
-  and what it chose not to judge. A step passes only on `approve` with no blocker or major
-  finding, no unmet criterion and no unaddressed earlier finding; otherwise Claude fixes
-  and asks again. A failed or malformed review never counts as approval. A final review
-  checks the whole change against the plan before anything is delivered; what nobody
-  could verify goes to you to check and confirm.
+  acceptance criterion as met, not met or not verifiable, every open earlier finding
+  settled by its id as addressed, not addressed or withdrawn, new findings with a severity
+  and the exact fix, and what it chose not to judge. A step passes only on `approve` that
+  judges every criterion in scope, leaves none unmet, raises no blocker or major finding
+  and settles every open finding, with no blocker or major one left unaddressed; otherwise
+  Claude fixes and asks again. A failed, malformed or stale review never counts as
+  approval, and a verdict is discarded if the repositories moved while the reviewer
+  worked. A final review checks the whole change against every criterion of the plan
+  before anything is delivered; what nobody could verify, in a step or at the end, goes to
+  you to check and confirm.
 - **You are in the loop.** Claude asks when it needs a login, a permission, a decision the
   plan leaves open or information it cannot find. After three unapproved reviews of one
   step it stops and asks you how to go on.
@@ -41,10 +44,10 @@ Code session that started a Niten session and do nothing anywhere else.
 | Hook | Rule |
 |---|---|
 | `Stop` | Claude cannot end its turn while the current step, or the final review, is not approved, unless it is waiting for your answer or a review is running. After three blocks in a row without any progress the turn ends with a message to you, so a broken reviewer cannot trap the session in a loop. |
-| `PreToolUse` | No `git push` or pull request before the final review approved exactly the commits being delivered. |
+| `PreToolUse` | No `git push` or pull request before the final review approved exactly the commits being delivered; `finish` refuses as well. |
 | `PreToolUse` | Every important action is put to you, with Claude's explanation of what it does and why the current step needs it, even where your permission settings would allow it. A command without an explanation is refused. |
-| `PreToolUse` | The session's state, command log and reviews, the approved plan and its receipts, and Claude's settings cannot be edited by Claude. |
-| `PostToolUse`, `PostToolUseFailure` | Every Bash command, failed ones too, is logged with its exit code and output, and so are your answers to Claude's questions, as the reviewer's evidence. |
+| `PreToolUse` | The session's state, command log and reviews, the approved plan and its receipts, and Claude's settings cannot be edited by Claude; Claude cannot run the hooks itself or read the key that signs the log. |
+| `PostToolUse`, `PostToolUseFailure` | Every Bash command, failed ones too, is logged with its exit code and output, and so are your answers to Claude's questions, as the reviewer's evidence. Each entry is signed; a review refuses a log with an entry the hooks did not write. |
 | `UserPromptSubmit` | Your messages are logged too, so a deviation from the plan counts as decided only if you decided it; a pause to wait for you ends when you answer. |
 
 Important actions: git pushes and history rewrites; image pushes, registry logins and
@@ -61,10 +64,14 @@ your own patterns in `~/.claude/niten/config.json`:
 ```
 
 Your own deny rules still win: a command they block cannot be approved through Niten.
+The hooks guard only a Niten session started (or attached) inside the Claude Code session
+that runs it; outside one they do nothing, except that starting a session without
+approval or over an earlier one is put to you.
 Everything else (scope, the quality of the evidence, asking instead of guessing) is the
 skill's instruction to the model, backed by the reviewer, which rejects out-of-scope or
 unproven work. Commands hidden in scripts are not classified; the reviewer sees them in
-the log.
+the log. The checks are pattern-based: deliberate obfuscation of a shell command can slip
+past them, which the signed log and the final review are there to catch.
 
 ## Requirements
 

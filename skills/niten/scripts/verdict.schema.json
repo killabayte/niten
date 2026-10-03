@@ -1,20 +1,50 @@
 {
   "type": "object",
   "additionalProperties": false,
-  "required": ["verdict", "summary", "criteria", "previous_findings", "findings", "declined"],
+  "required": [
+    "verdict",
+    "summary",
+    "criteria",
+    "previous_findings",
+    "findings",
+    "declined"
+  ],
   "properties": {
-    "verdict": {"type": "string", "enum": ["approve", "request_changes"]},
-    "summary": {"type": "string"},
+    "verdict": {
+      "type": "string",
+      "enum": [
+        "approve",
+        "request_changes"
+      ]
+    },
+    "summary": {
+      "type": "string"
+    },
     "criteria": {
       "type": "array",
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["id", "status", "evidence"],
+        "required": [
+          "id",
+          "status",
+          "evidence"
+        ],
         "properties": {
-          "id": {"type": "string"},
-          "status": {"type": "string", "enum": ["met", "not_met", "cannot_verify"]},
-          "evidence": {"type": "string"}
+          "id": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "met",
+              "not_met",
+              "cannot_verify"
+            ]
+          },
+          "evidence": {
+            "type": "string"
+          }
         }
       }
     },
@@ -23,11 +53,26 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["finding", "status", "note"],
+        "required": [
+          "id",
+          "status",
+          "note"
+        ],
         "properties": {
-          "finding": {"type": "string"},
-          "status": {"type": "string", "enum": ["addressed", "not_addressed", "withdrawn"]},
-          "note": {"type": "string"}
+          "id": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "addressed",
+              "not_addressed",
+              "withdrawn"
+            ]
+          },
+          "note": {
+            "type": "string"
+          }
         }
       }
     },
@@ -36,15 +81,38 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["severity", "location", "problem", "fix"],
+        "required": [
+          "severity",
+          "location",
+          "problem",
+          "fix"
+        ],
         "properties": {
-          "severity": {"type": "string", "enum": ["blocker", "major", "minor"]},
-          "location": {"type": "string"},
-          "problem": {"type": "string"},
-          "fix": {"type": "string"}
+          "severity": {
+            "type": "string",
+            "enum": [
+              "blocker",
+              "major",
+              "minor"
+            ]
+          },
+          "location": {
+            "type": "string"
+          },
+          "problem": {
+            "type": "string"
+          },
+          "fix": {
+            "type": "string"
+          }
         }
       }
     },
-    "declined": {"type": "array", "items": {"type": "string"}}
+    "declined": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
   }
 }

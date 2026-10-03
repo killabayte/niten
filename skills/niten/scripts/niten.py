@@ -23,9 +23,11 @@ import argparse
 import datetime as dt
 import glob
 import hashlib
+import hmac
 import json
 import os
 import re
+import secrets
 import shlex
 import shutil
 import subprocess
@@ -36,6 +38,7 @@ HOME = os.path.expanduser("~")
 NITEN_HOME = os.path.join(HOME, ".claude", "niten")
 REGISTRY = os.path.join(NITEN_HOME, "active.json")
 CONFIG = os.path.join(NITEN_HOME, "config.json")
+KEY = os.path.join(NITEN_HOME, "hook.key")  # signs the log; the executor may not read it
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPT = os.path.join(HERE, "niten.py")
 SCHEMA = os.path.join(HERE, "verdict.schema.json")
@@ -49,9 +52,9 @@ LOG_TAIL = 4000          # characters of stdout/stderr kept per logged command
 
 DELIVERY = [
     re.compile(r"\bgit\b[^|;&]*\bpush\b"),
-    re.compile(r"\bgh\s+pr\s+(create|merge)\b"),
-    re.compile(r"\bbb\s+pr\b"),
-    re.compile(r"\b(curl|wget|http)\b[^|;&]*pullrequests"),
+    re.compile(r"\bgh\b[^|;&]*\bpr\s+(create|merge)\b"),
+    re.compile(r"\bbb\b[^|;&]*\bpr\b"),
+    re.compile(r"\b(curl|wget|http|https)\b[^|;&]*pullrequests"),
 ]
 
 # Actions with an effect outside the working tree, or one that cannot be undone. In a
@@ -63,8 +66,11 @@ IMPORTANT = [
     ("an infrastructure change", r"\b(terraform|tofu|terragrunt)\b[^|;&]*\b(apply|destroy|import|taint|untaint|force-unlock|state\s+(rm|mv|push|replace-provider))\b"),
     ("a cluster change", r"\bkubectl\b[^|;&]*\b(apply|create|delete|edit|patch|replace|scale|annotate|label|set|rollout|cordon|uncordon|drain|taint|exec|cp|port-forward)\b"),
     ("a release change", r"\bhelm\b[^|;&]*\b(install|upgrade|uninstall|delete|rollback|push)\b"),
-    ("a pull request, release or repository change", r"\bgh\s+(pr|release|repo)\s+(create|merge|close|delete|edit)\b|\bgh\s+api\b[^|;&]*(-X|--method)\s*(POST|PUT|PATCH|DELETE)\b"),
-    ("a write to a web API", r"\b(curl|wget|http)\b[^|;&]*(-X\s*|--request\s+|--method\s+)(POST|PUT|PATCH|DELETE)\b|\bcurl\b[^|;&]*\s(-d|--data\S*|-F|--form|-T|--upload-file)\s"),
+    ("a pull request, release or repository change", r"\bgh\b[^|;&]*\b(pr|release|repo|issue|secret|variable|workflow)\s+(create|merge|close|delete|edit|set|run|reopen|comment|transfer|archive)\b"),
+    ("a write through the GitHub API", r"\bgh\b[^|;&]*\bapi\b[^|;&]*(\s(-f|-F|--field|--raw-field|--input)(\s|=)|(-X|--method)(\s*|=)(POST|PUT|PATCH|DELETE)\b)"),
+    ("a write to a web API", r"\b(curl|wget|http|https|xh)\b[^|;&]*(-X\s*|--request(\s+|=)|--method(\s+|=))(POST|PUT|PATCH|DELETE)\b"
+                             r"|\bcurl\b[^|;&]*\s(-d|--data\S*|-F|--form\S*|-T|--upload-file|--json)(\s|=)"
+                             r"|\bwget\b[^|;&]*--(post|put)-(data|file)\b|\b(http|https|xh)\s+(POST|PUT|PATCH|DELETE)\b"),
     ("a recursive forced delete", r"\brm\s+(-\w*r\w*f|-\w*f\w*r)\b|\brm\s+-r\s+-f\b|\brm\s+-f\s+-r\b"),
     ("a package publication", r"\b(npm|yarn|pnpm)\s+publish\b|\btwine\s+upload\b|\bgradlew?\b[^|;&]*\bpublish\w*\b"),
     ("a command on another machine", r"(^|[\s;&|(])(ssh|scp|rsync)\s"),
@@ -82,12 +88,19 @@ MCP_WRITE = re.compile(r"(create|update|delete|remove|send|post|add|edit|move|tr
                        r"publish|upload|write|assign|schedule|archive|invite|share|rename|set_|_set|replace)", re.I)
 FILE_TOOLS = {"Write": "file_path", "Edit": "file_path", "MultiEdit": "file_path", "NotebookEdit": "notebook_path"}
 
+# Values of keys that name a secret (SecretAccessKey, SessionToken, AWS_SECRET_ACCESS_KEY,
+# client_secret, password, ...) and well-known token shapes. The key is kept, the value
+# masked.
+SECRET_KEY = (r"[A-Za-z0-9_.-]*(secret|passw(or)?d|token|credential|api[_-]?key|access[_-]?key|private[_-]?key|"
+              r"session[_-]?key|authorization|cookie)[A-Za-z0-9_.-]*")
 SECRETS = [
-    re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{8,}"),
-    re.compile(r"\b(AKIA|ASIA)[A-Z0-9]{16}\b"),
-    re.compile(r"(?i)\b(password|passwd|secret|token|api[_-]?key|authorization)\b[\"']?(\s*[:=]\s*|\s+)[\"']?[^\"'\s,}]+"),
-    re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b"),
-    re.compile(r"[A-Za-z0-9+/=_-]{120,}"),
+    (re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{8,}"), "Bearer [REDACTED]"),
+    (re.compile(r"\b(AKIA|ASIA)[A-Z0-9]{16}\b"), "[REDACTED]"),
+    (re.compile(r"(?i)(\"?\b" + SECRET_KEY + r"\"?\s*[:=]\s*)(\"[^\"]*\"|'[^']*'|[^\s,{}\[\]\"']+)"), r"\1[REDACTED]"),
+    (re.compile(r"(?i)(--?" + SECRET_KEY + r"(\s+|=))(\"[^\"]*\"|'[^']*'|\S+)"), r"\1[REDACTED]"),
+    (re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b"), "[REDACTED]"),
+    (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", re.S), "[REDACTED]"),
+    (re.compile(r"[A-Za-z0-9+/=_-]{120,}"), "[REDACTED]"),
 ]
 
 
@@ -126,9 +139,54 @@ def important(command):
 
 
 def redact(text):
-    for p in SECRETS:
-        text = p.sub("[REDACTED]", text)
+    for pattern, replacement in SECRETS:
+        text = pattern.sub(replacement, text)
     return text
+
+
+# ---------------------------------------------------------------- the signed log
+
+
+def hook_key():
+    """The key that signs log entries, created on first use, readable only by the
+    user; the PreToolUse hook keeps the executor from reading it."""
+    try:
+        with open(KEY, "rb") as f:
+            return f.read()
+    except OSError:
+        pass
+    os.makedirs(NITEN_HOME, exist_ok=True)
+    try:
+        fd = os.open(KEY, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as f:
+            f.write(secrets.token_hex(32).encode())
+    except FileExistsError:
+        pass
+    with open(KEY, "rb") as f:
+        return f.read()
+
+
+def signature(entry):
+    body = json.dumps({k: v for k, v in entry.items() if k != "sig"}, sort_keys=True, ensure_ascii=False)
+    return hmac.new(hook_key(), body.encode(), hashlib.sha256).hexdigest()
+
+
+def forged_entries(d):
+    """Line numbers of log entries the hooks did not write."""
+    bad = []
+    try:
+        with open(os.path.join(d, "commands.jsonl")) as f:
+            for n, line in enumerate(f, 1):
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    bad.append(n)
+                    continue
+                if not isinstance(entry, dict) or not hmac.compare_digest(str(entry.get("sig", "")), signature(entry)):
+                    bad.append(n)
+    except OSError:
+        pass
+    return bad
 
 
 # ---------------------------------------------------------------- basics
@@ -199,14 +257,17 @@ def unregister(state_dir):
     save_json(REGISTRY, [e for e in registry() if e["state_dir"] != state_dir])
 
 
-def find_active(cwd, sid=None):
+def find_active(cwd, sid=None, by_cwd=True):
     """The active niten session of a Claude session: by its session id when both
-    sides have one, otherwise the session whose cwd or repositories contain cwd."""
+    sides have one, otherwise (commands typed by hand, never hooks) the session
+    whose cwd or repositories contain cwd."""
     sid = session_id() if sid is None else sid
     if sid:
         for e in registry():
             if e.get("session_id") == sid:
                 return e["state_dir"]
+    if not by_cwd:
+        return None
     best, best_len = None, -1
     for e in registry():
         if sid and e.get("session_id"):
@@ -340,31 +401,39 @@ def valid_verdict(v):
             and all(strs(f, ("location", "problem", "fix")) and f.get("severity") in ("blocker", "major", "minor")
                     for f in v["findings"])
             and isinstance(v.get("previous_findings"), list)
-            and all(strs(p, ("finding", "note")) and p.get("status") in ("addressed", "not_addressed", "withdrawn")
+            and all(strs(p, ("id", "note")) and p.get("status") in ("addressed", "not_addressed", "withdrawn")
                     for p in v["previous_findings"])
             and isinstance(v.get("declined"), list) and all(isinstance(x, str) for x in v["declined"]))
 
 
 def run_codex(prompt, root, out_path):
-    """One reviewer call: read-only sandbox, no user config, MCP servers, plugins or
-    sub-agents (MCP tools are not bound by the sandbox), schema-checked output."""
+    """One reviewer call: read-only sandbox, no user config, rules, MCP servers,
+    plugins or sub-agents (MCP tools are not bound by the sandbox), schema-checked
+    output written to a file of this call only."""
     model = os.environ.get("NITEN_REVIEW_MODEL", "gpt-6-astra")
     effort = os.environ.get("NITEN_REVIEW_EFFORT", "high")
     timeout = int(os.environ.get("NITEN_REVIEW_TIMEOUT", "1800"))
     argv = [codex_bin(), "exec", "--json", "--output-schema", SCHEMA, "-o", out_path,
             "-m", model, "-c", "model_reasoning_effort=" + effort, "-c", 'approval_policy="never"',
-            "-s", "read-only", "--ephemeral", "--skip-git-repo-check", "--ignore-user-config", "--ignore-rules", "-C", root,
-            "-c", "mcp_servers={}", "-c", "plugins={}", "-c", "agents.enabled=false",
+            "-s", "read-only", "--ephemeral", "--skip-git-repo-check", "--ignore-user-config", "--ignore-rules",
+            "-C", root, "-c", "mcp_servers={}", "-c", "plugins={}", "-c", "agents.enabled=false",
             "-c", 'web_search="disabled"', "-"]
     print(f"niten: reviewer {model}/{effort} working (timeout {timeout // 60} min)...", file=sys.stderr, flush=True)
+    if os.path.exists(out_path):
+        os.remove(out_path)
     started = time.time()
+
+    def fail(msg):
+        if os.path.exists(out_path):
+            os.remove(out_path)
+        die(msg + "; nothing was approved")
     try:
         r = subprocess.run(argv, input=prompt, capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
-        die("reviewer timed out; nothing was approved")
+        fail("reviewer timed out")
     if r.returncode != 0:
-        tail = "\n".join((r.stderr or r.stdout).strip().splitlines()[-15:])
-        die(f"reviewer failed (exit {r.returncode}); nothing was approved:\n{tail}")
+        tail_ = "\n".join((r.stderr or r.stdout).strip().splitlines()[-15:])
+        fail(f"reviewer failed (exit {r.returncode}):\n{tail_}")
     usage = {}
     for line in (r.stdout or "").splitlines():
         try:
@@ -375,19 +444,58 @@ def run_codex(prompt, root, out_path):
             usage = ev["usage"]
     verdict = load_json(out_path)
     if not valid_verdict(verdict):
-        die("reviewer returned no valid verdict in " + out_path + "; nothing was approved")
+        fail("reviewer returned no valid verdict")
     return verdict, {"model": model, "effort": effort, "seconds": round(time.time() - started), "usage": usage}
 
 
-def approved(v):
-    bad = [f for f in v["findings"] if f["severity"] in ("blocker", "major")]
-    unmet = [c for c in v["criteria"] if c["status"] == "not_met"]
-    open_ = [p for p in v["previous_findings"] if p["status"] == "not_addressed"]
-    return v["verdict"] == "approve" and not bad and not unmet and not open_
+CRITERION_RE = re.compile(r"\bR-\d+\.C\d+\b")
 
 
-def unverified(v):
-    return [c for c in v["criteria"] if c["status"] == "cannot_verify"]
+def criteria_in(text):
+    return sorted(set(CRITERION_RE.findall(text)), key=lambda c: [int(x) for x in re.findall(r"\d+", c)])
+
+
+def judge(verdict, required, ledger, carried, final):
+    """Whether a verdict approves its scope: the reviewer approved; judged every
+    criterion in scope, none not met; raised no blocker or major finding; settled
+    every open earlier finding, leaving no blocker or major one unaddressed. A final
+    approval with anything nobody could verify (now, or carried from a step) goes to
+    the user. Returns (approved, needs_user, reasons, unverifiable)."""
+    reasons = []
+    if verdict["verdict"] != "approve":
+        reasons.append("the reviewer requested changes")
+    by_id = {c["id"]: c for c in verdict["criteria"]}
+    missing = [c for c in required if c not in by_id]
+    if missing:
+        reasons.append("the reviewer did not judge " + ", ".join(missing))
+    unmet = [c["id"] for c in verdict["criteria"] if c["status"] == "not_met"]
+    if unmet:
+        reasons.append("not met: " + ", ".join(unmet))
+    bad = [f for f in verdict["findings"] if f["severity"] in ("blocker", "major")]
+    if bad:
+        reasons.append(f"{len(bad)} blocker/major finding(s)")
+    settled = {p["id"]: p for p in verdict["previous_findings"]}
+    open_ = {i: f for i, f in ledger.items() if f["status"] == "open"}
+    unsettled = [i for i in open_ if i not in settled]
+    if unsettled:
+        reasons.append("earlier findings not settled: " + ", ".join(unsettled))
+    still = [i for i, f in open_.items() if f["severity"] in ("blocker", "major")
+             and settled.get(i, {}).get("status") == "not_addressed"]
+    if still:
+        reasons.append("earlier blocker/major findings not addressed: " + ", ".join(still))
+    unverifiable = [c["id"] for c in verdict["criteria"] if c["status"] == "cannot_verify"]
+    if final:
+        unverifiable += [c for c in carried if c not in unverifiable and by_id.get(c, {}).get("status") != "met"]
+    ok = not reasons
+    return ok, ok and final and bool(unverifiable), reasons, unverifiable
+
+
+def update_ledger(ledger, verdict, scope, n):
+    for p in verdict["previous_findings"]:
+        if p["id"] in ledger and ledger[p["id"]]["status"] == "open" and p["status"] != "not_addressed":
+            ledger[p["id"]].update(status=p["status"], note=p["note"], settled_in=n)
+    for f in verdict["findings"]:
+        ledger[f"{scope}-F{len(ledger) + 1}"] = {**f, "status": "open", "round": n}
 
 
 # ---------------------------------------------------------------- review
@@ -419,15 +527,15 @@ def repos_block(st, since, final):
     return "\n".join(out)
 
 
-def prior_findings(reviews):
-    """Every finding raised so far in this scope, by round: the ledger a re-review
-    settles item by item."""
-    lines = []
-    for r in reviews:
-        v = load_json(r["file"], {}) or {}
-        for f in v.get("findings", []):
-            lines.append(f"- round {r['n']} [{f['severity']}] {f['location']}: {f['problem']} (asked fix: {f['fix']})")
-    return "\n".join(lines) if lines else "none"
+def ledger_text(ledger):
+    open_ = [f"- {i} [{f['severity']}] {f['location']}: {f['problem']} (asked fix: {f['fix']})"
+             for i, f in ledger.items() if f["status"] == "open"]
+    settled = [f"- {i} {f['status']} in round {f.get('settled_in')}: {f['problem']}"
+               for i, f in ledger.items() if f["status"] != "open"]
+    text = "Open — settle every one of these by its id in `previous_findings`:\n" + ("\n".join(open_) or "none")
+    if settled:
+        text += "\nAlready settled (do not reopen without new evidence):\n" + "\n".join(settled)
+    return text
 
 
 REVIEW_RULES = """\
@@ -440,8 +548,7 @@ executor: each entry is a command the executor actually ran, with its exit code 
 tail of its output (secrets masked). The evidence file is the executor's own account,
 mapping each verification to proof. Trust the log over the account: a claim the log
 does not support is not proven. For external operations (registries, cloud APIs) the log
-is the proof; say in the criterion's evidence which log entry proves it, or that you
-could not verify it.
+is the proof; say in the criterion's evidence which log entry proves it.
 
 The log also holds the user's own messages and answers ("kind": "user_message" or
 "question"): a deviation from the plan counts as decided only if the user decided it
@@ -454,17 +561,17 @@ Check:
 2. Nothing outside the scope changed: no side refactors, no unrelated files, no edits to
    the plan. Changes present before the session do not count.
 3. No secrets or credentials in the diff, the evidence or the log.
-4. Earlier findings: settle each one in `previous_findings` as addressed, not_addressed
-   or withdrawn (only on new evidence), with a short note. On a re-review report new
-   problems only if they are real and in scope; prefer one strong finding over several
-   weak ones, and do not reopen settled points.
+4. Earlier findings: settle every open one by its id in `previous_findings`: addressed,
+   not_addressed, or withdrawn (only on new evidence), with a short note. On a re-review
+   report new problems only if they are real and in scope; prefer one strong finding over
+   several weak ones, and do not reopen settled points.
 
 Approve only if all of this holds. Otherwise request changes. Each finding names the
 file or command, the problem and the exact fix. Severity: blocker (wrong or unsafe),
 major (a criterion not met or not proven), minor (does not block). Use cannot_verify
 only when neither the files nor the log can prove a criterion; it goes to the user. In
 `declined`, list anything you chose not to judge, with the reason. Return the JSON object
-the schema requires; list every criterion id in scope in `criteria`.
+the schema requires, with an entry in `criteria` for every criterion id listed above.
 """
 
 
@@ -485,14 +592,24 @@ def log_summary(d, sid):
     return f"Command log (recorded by the harness): {path} — {which}, {n} command(s)"
 
 
+def snapshot(st):
+    """The commits and uncommitted changes a review is about."""
+    return {"heads": heads(st), "changes": {n: new_changes(st, r) for n, r in st["repos"].items()}}
+
+
 def review_step(d, st, sid, final, user_approved):
     plan = st["plan"]
     if sha256_file(plan) != st["plan_sha256"]:
         die("the plan changed since the session started; ask the user (a changed plan needs a new "
             "Shogun approval and a new session)")
+    forged = forged_entries(d)
+    if forged:
+        die(f"the command log has entries the hooks did not write (lines {', '.join(map(str, forged[:10]))}); "
+            f"stop and tell the user")
+    scope = "final" if final else sid
     step = st["final"] if final else step_of(st, sid)
     reviews = step["reviews"]
-    failed = sum(1 for r in reviews if not r["approved"])
+    failed = sum(1 for r in reviews if not r["approved"] and not r.get("discarded"))
     if failed >= MAX_REVIEWS and not user_approved:
         die(f"{failed} reviews without approval. Stop and ask the user how to proceed; if they want another "
             f"review, run it with --user-approved \"<their decision>\" (they confirm it in a permission prompt)")
@@ -501,56 +618,84 @@ def review_step(d, st, sid, final, user_approved):
         if fresh:
             die(f"commit the {'change' if final else 'step'}'s changes in {name} before the review "
                 f"(uncommitted: {', '.join(fresh[:5])})")
-    ev = os.path.join(d, "evidence", ("final" if final else sid) + ".md")
+    ev = os.path.join(d, "evidence", scope + ".md")
     if not os.path.exists(ev) or os.path.getsize(ev) == 0:
         die(f"write the evidence first: {ev} (for each verification: which logged command proves it, and how)")
     text = open(plan).read()
     if final:
         what = "the whole change (final review)"
-        scope = ("Review the complete change against the plan's goal, every requirement and its acceptance "
+        required = criteria_in(text)
+        carried = sorted(st.get("unverified", {}))
+        intro = ("Review the complete change against the plan's goal, every requirement and its acceptance "
                  "criteria, and the plan's end-to-end verification. Every step was approved separately; look "
                  "for gaps between steps, missing criteria and anything outside the plan's scope.\n")
+        if carried:
+            intro += ("Step reviews could not verify: " + ", ".join(carried) + ". Mark each met only if the log "
+                      "or the files now prove it.\n")
         since = {}
     else:
         section = next(s["text"] for s in plan_steps(text) if s["id"] == sid)
         what = f"step {sid} ({step['title']})"
-        scope = f"The step, as the plan states it:\n\n{section}\n"
+        required = criteria_in(section)
+        carried = []
+        intro = f"The step, as the plan states it:\n\n{section}\n"
         since = step.get("start") or {}
+    ledger = step.setdefault("ledger", {})
     n = len(reviews) + 1
     prompt = (f"Review {what} of the plan at {plan}. Read the plan file for the requirements, criteria and "
-              f"context.\n\n{scope}\nRepositories:\n{repos_block(st, since, final)}\n"
+              f"context.\n\n{intro}\nCriteria in scope: {', '.join(required) or 'none listed'}\n\n"
+              f"Repositories:\n{repos_block(st, since, final)}\n"
               f"Executor's evidence: {ev}\n{log_summary(d, None if final else sid)}\n\n"
-              f"Findings of the previous review:\n{prior_findings(reviews)}\n\n" + REVIEW_RULES)
-    name = ("final" if final else sid) + f"-r{n}"
+              f"Earlier findings in this scope:\n{ledger_text(ledger)}\n\n" + REVIEW_RULES)
+    name = f"{scope}-r{n}"
     os.makedirs(os.path.join(d, "reviews"), exist_ok=True)
     with open(os.path.join(d, "reviews", name + ".prompt.md"), "w") as f:
         f.write(prompt)
+    attempt = os.path.join(d, "reviews", f"{name}.attempt-{time.time_ns()}.json")
     out = os.path.join(d, "reviews", name + ".json")
     root = os.path.commonpath([r["path"] for r in st["repos"].values()] + [os.path.dirname(plan), d])
+    before = snapshot(st)
     st["reviewing"] = {"pid": os.getpid(), "scope": name, "since": now()}
     save_state(d, st)
     try:
-        verdict, meta = run_codex(prompt, root, out)
+        verdict, meta = run_codex(prompt, root, attempt)
     finally:
         st = load_state(d)
         st["reviewing"] = None
         save_state(d, st)
-        step = st["final"] if final else step_of(st, sid)
-        reviews = step["reviews"]
-    ok = approved(verdict)
-    needs_user = ok and final and bool(unverified(verdict))
-    at_heads = heads(st)
-    reviews.append({"n": n, "file": out, "verdict": verdict["verdict"], "approved": ok, "at": now(),
-                    "heads": at_heads, "user_approved": user_approved or None, **meta})
-    step["status"] = "needs_user" if needs_user else ("approved" if ok else "changes_requested")
+    os.replace(attempt, out)
+    step = st["final"] if final else step_of(st, sid)
+    reviews, ledger = step["reviews"], step.setdefault("ledger", {})
+    entry = {"n": n, "file": out, "verdict": verdict["verdict"], "at": now(), "heads": before["heads"],
+             "user_approved": user_approved or None, **meta}
+    if snapshot(st) != before:
+        reviews.append({**entry, "approved": False, "discarded": "the change moved during the review"})
+        save_state(d, st)
+        print(f"{what}: review {n} DISCARDED — commits or uncommitted changes moved while the reviewer worked, so "
+              f"its verdict is not about the current change. Nothing was approved; review again.")
+        return
+    ok, needs_user, reasons, unverifiable = judge(verdict, required, ledger, carried, final)
+    update_ledger(ledger, verdict, scope, n)
+    reviews.append({**entry, "approved": ok and not needs_user, "reasons": reasons})
     if needs_user:
-        ok = False
-    if ok and not final:
-        nxt = current_step(st)
-        if nxt:
-            nxt["start"] = at_heads
-    if ok and final:
-        step["heads"] = at_heads
+        step["status"] = "needs_user"
+        step["unverified"] = unverifiable
+    elif ok:
+        step["status"] = "approved"
+        if final:
+            step["heads"] = before["heads"]
+        else:
+            unv = st.setdefault("unverified", {})
+            for c in verdict["criteria"]:
+                if c["status"] == "cannot_verify":
+                    unv[c["id"]] = {"scope": sid, "evidence": c["evidence"]}
+                elif c["status"] == "met":
+                    unv.pop(c["id"], None)
+            nxt = current_step(st)
+            if nxt:
+                nxt["start"] = before["heads"]
+    else:
+        step["status"] = "changes_requested"
     save_state(d, st)
     result = "NEEDS THE USER'S CHECK" if needs_user else ("APPROVED" if ok else "CHANGES REQUESTED")
     print(f"{what}: review {n} -> {result}")
@@ -558,19 +703,18 @@ def review_step(d, st, sid, final, user_approved):
     for c in verdict["criteria"]:
         print(f"  criterion {c['id']}: {c['status']} — {c['evidence']}")
     for p in verdict["previous_findings"]:
-        print(f"  earlier finding {p['status']}: {p['finding']} — {p['note']}")
-    for f in verdict["findings"]:
-        print(f"  [{f['severity']}] {f['location']}: {f['problem']}\n      fix: {f['fix']}")
+        print(f"  earlier finding {p['id']} {p['status']}: {p['note']}")
+    for i, f in ledger.items():
+        if f.get("round") == n:
+            print(f"  {i} [{f['severity']}] {f['location']}: {f['problem']}\n      fix: {f['fix']}")
     for x in verdict["declined"]:
         print("  not judged: " + x)
     if needs_user:
-        print("NEEDS THE USER: the reviewer approved, but nobody could verify: "
-              + "; ".join(f"{c['id']} ({c['evidence']})" for c in unverified(verdict))
-              + f". Ask the user to check these; when they confirm, run `python3 {SCRIPT} confirm \"<what they "
-              + "checked>\"` (they approve it in a permission prompt).")
-    elif verdict["verdict"] == "approve" and not ok:
-        print("  (the reviewer said approve, but a blocker/major finding, an unmet criterion or an unaddressed "
-              "earlier finding keeps it open)")
+        print("NEEDS THE USER: nobody could verify " + ", ".join(unverifiable) + ". Ask the user to check these; "
+              f"when they confirm, run `python3 {SCRIPT} confirm \"<what they checked>\"` (they approve it in a "
+              "permission prompt).")
+    elif not ok:
+        print("  open because: " + "; ".join(reasons))
     tokens = meta["usage"]
     print(f"review file: {out} ({meta['seconds']}s" + (f", tokens {tokens}" if tokens else "") + ")")
 
@@ -615,13 +759,16 @@ def cmd_start(args):
                        "base": git(p, "rev-parse", "HEAD"), "branch": git(p, "rev-parse", "--abbrev-ref", "HEAD"),
                        "preexisting": git(p, "status", "--porcelain")}
     d = os.path.splitext(plan)[0] + ".niten"
-    if os.path.exists(os.path.join(d, "state.json")):
-        if not args.restart:
+    if os.path.exists(d):
+        existing = os.path.exists(os.path.join(d, "state.json"))
+        if existing and not args.restart:
             die(f"a session already exists in {d}; continue it (attach), or ask the user about --restart")
+        # A session starts from an empty directory: nothing prepared beforehand
+        # (a log, evidence) can pass as the session's own record.
         archive = d + "." + time.strftime("%Y%m%d%H%M%S")
         os.rename(d, archive)
         unregister(d)
-        print("previous session archived: " + archive)
+        print(("previous session" if existing else "files left without a session") + " archived: " + archive)
     st = {"plan": plan, "plan_sha256": sha256_file(plan), "approval_sha256": sha256_file(receipt),
           "unapproved": bool(args.unapproved), "started": now(), "cwd": cwd, "repos": repos, "paused": None,
           "steps": [{"id": s["id"], "title": s["title"], "status": "pending", "reviews": [], "start": None}
@@ -632,6 +779,9 @@ def cmd_start(args):
     save_state(d, st)
     register(cwd, d)
     print("niten session started: " + d)
+    if not session_id():
+        print("WARNING: not inside a Claude Code session, so the hooks do not guard this session until "
+              "`niten.py attach --state " + d + "` is run from one")
     for name, r in repos.items():
         print(f"  {name}: {r['path']} at {r['base'][:12]} on {r['branch']}"
               + (" (has pre-existing changes)" if r["preexisting"] else ""))
@@ -697,9 +847,11 @@ def cmd_confirm(args):
         die("nothing waits for the user's check")
     if [n for n, h in heads(st).items() if h != final["reviews"][-1]["heads"].get(n)]:
         die("commits changed since the final review; run final again")
+    if any(new_changes(st, r) for r in st["repos"].values()):
+        die("there are uncommitted changes since the final review; run final again")
     final["status"] = "approved"
     final["heads"] = final["reviews"][-1]["heads"]
-    final["user_check"] = {"what": args.what, "at": now()}
+    final["user_check"] = {"what": args.what, "criteria": final.get("unverified", []), "at": now()}
     save_state(d, st)
     print("final review completed by the user's check: " + args.what)
 
@@ -741,8 +893,13 @@ def cmd_attach(args):
 def cmd_finish(args):
     d = state_dir_arg(args)
     st = load_state(d)
-    if st["final"]["status"] != "approved" and not args.abort:
-        die("the final review has not approved the change; ask the user before --abort")
+    if not args.abort:
+        if st["final"]["status"] != "approved":
+            die("the final review has not approved the change; ask the user before --abort")
+        moved = [n for n, h in heads(st).items() if h != st["final"].get("heads", {}).get(n)]
+        if moved or any(new_changes(st, r) for r in st["repos"].values()):
+            die("the change differs from what the final review approved ("
+                + (", ".join(moved) or "uncommitted changes") + "); run final again")
     st["finished"] = {"at": now(), "aborted": bool(args.abort)}
     save_state(d, st)
     unregister(d)
@@ -763,7 +920,7 @@ def hook_input():
 
 
 def active(data):
-    d = find_active(data.get("cwd") or os.getcwd(), data.get("session_id", ""))
+    d = find_active(data.get("cwd") or os.getcwd(), data.get("session_id", ""), by_cwd=False)
     st = load_json(os.path.join(d, "state.json")) if d else None
     return (d, st) if st and not st.get("finished") else (None, None)
 
@@ -886,16 +1043,59 @@ def outside_workspace(path, data, st):
     return not any(within(path, r) for r in roots)
 
 
+READ_TOOLS = {"Read": "file_path", "Grep": "path", "Glob": "path", "NotebookRead": "notebook_path"}
+HOOK_CALL = re.compile(r"\bniten\.py\b[^|;&]*\bhook-|\bhook-(stop|pretooluse|posttooluse|userprompt)\b")
+NITEN_CODE = re.compile(r"niten\.py|skills/niten/scripts|\bimport\s+niten\b|\bfrom\s+niten\s+import\b|"
+                        + re.escape(HERE))
+START_OVERRIDE = re.compile(r"\bniten\.py\b[^|;&]*\bstart\b[^|;&]*--(unapproved|restart)\b")
+INTERPRETER = re.compile(r"\b(python[0-9.]*|node|ruby|perl|bash|sh|zsh|osascript|exec|eval|source)\b")
+
+
+def key_mentions():
+    rel = os.path.relpath(KEY, HOME)
+    return [KEY, "~/" + rel, "$HOME/" + rel, "${HOME}/" + rel, "hook.key"]
+
+
+def explained(tool_input, label, where_):
+    """Ask the user about an important action, with the executor's explanation, or
+    refuse it until the executor gives one."""
+    explanation = " ".join((tool_input.get("description") or "").split())
+    if len(explanation) < MIN_EXPLANATION:
+        decision("deny", f"Niten: this is {label}, so the user approves it. Run the same command again with a "
+                         f"Bash `description` that tells the user, in one or two sentences, what it does and why "
+                         f"the current plan step needs it.")
+    else:
+        decision("ask", f"Niten {where_}, {label}: {explanation}")
+
+
 def cmd_hook_pretooluse(args):
-    """In a Niten session: delivery only after the final review of the exact commits;
+    """In a Niten session: only Claude Code runs the hooks and the key that signs the
+    log stays unread; delivery only after the final review of the exact commits;
     important actions go to the user with the executor's explanation, even where the
-    permission settings would allow them; protected files are not edited by hand."""
+    permission settings would allow them; protected files are not edited by hand.
+    Before a session exists, starting one without approval or over an earlier one is
+    put to the user. Nothing else happens outside a session."""
     data = hook_input()
-    d, st = active(data) if data else (None, None)
-    if not st:
+    if not data:
         return
     tool = data.get("tool_name", "")
     tool_input = data.get("tool_input") or {}
+    command = tool_input.get("command", "") if tool == "Bash" else ""
+    d, st = active(data)
+    if not st:
+        if command and START_OVERRIDE.search(command):
+            explained(tool_input, "a Niten override", "(no session yet)")
+        return
+    if command and (HOOK_CALL.search(command) or any(k in command for k in key_mentions())
+                    or (NITEN_CODE.search(command) and INTERPRETER.search(command) and not NITEN_CALL.match(command))):
+        decision("deny", "Niten: the hooks and their signing key belong to Claude Code, not to the session. "
+                         "Use niten.py's own commands.")
+        return
+    if tool in READ_TOOLS and tool_input.get(READ_TOOLS[tool]):
+        path = os.path.realpath(os.path.expanduser(tool_input[READ_TOOLS[tool]]))
+        if within(path, KEY) or (tool != "Read" and within(KEY, path)):
+            decision("deny", "Niten: the log's signing key is not readable in a session.")
+            return
 
     if tool in FILE_TOOLS:
         path = tool_input.get(FILE_TOOLS[tool], "")
@@ -914,7 +1114,6 @@ def cmd_hook_pretooluse(args):
 
     if tool != "Bash":
         return
-    command = tool_input.get("command", "")
     if bash_touches_protected(command, d, st):
         decision("deny", "Niten: this command would change the session's record, the approved plan or Claude's "
                          "settings. The state changes only through niten.py; ask the user if something is wrong.")
@@ -932,15 +1131,8 @@ def cmd_hook_pretooluse(args):
                              f"`python3 {SCRIPT} final` again before delivering.")
             return
     label = important(command) or ("delivery" if delivery else None)
-    if not label:
-        return
-    explanation = " ".join((tool_input.get("description") or "").split())
-    if len(explanation) < MIN_EXPLANATION:
-        decision("deny", f"Niten: this is {label}, so the user approves it. Run the same command again with a "
-                         f"Bash `description` that tells the user, in one or two sentences, what it does and why "
-                         f"the current plan step needs it.")
-        return
-    decision("ask", f"Niten {where(st)}, {label}: {explanation}")
+    if label:
+        explained(tool_input, label, where(st))
 
 
 def tail(text):
@@ -951,6 +1143,7 @@ def tail(text):
 def log_entry(d, st, entry):
     cur = current_step(st)
     entry = {"at": now(), "step": cur["id"] if cur else "final", **entry}
+    entry["sig"] = signature(entry)
     with open(os.path.join(d, "commands.jsonl"), "a") as f:
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 

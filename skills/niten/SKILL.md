@@ -28,10 +28,13 @@ plan path or a ticket key; if empty, ask which plan.
    commit after the final review needs a new final review.
 3. **Evidence, not claims.** A hook logs every Bash command you run, failed ones too,
    with its exit code and output, to `<plan>.niten/commands.jsonl`, together with the
-   user's messages and answers; the reviewer trusts that log over your words. For each
+   user's messages and answers. Each entry is signed with a key you may not read, and a
+   review refuses a log with an entry the hooks did not write; the reviewer trusts that
+   log over your words. For each
    step also write `<plan>.niten/evidence/<step>.md`: for every verification `V-NNN`,
    which logged command proves it and what it showed (digests, IDs); after a review,
-   add your answer to each finding (fixed how, or why you disagree). Run the
+   add your answer to each finding by its id (`S-001-F1`: fixed how, or why you
+   disagree). Run the
    verifications as real commands so they are logged. Never put secrets in commands'
    output or in the evidence.
 4. **Ask instead of guessing or working around.** When you need access (credentials, a
@@ -54,7 +57,9 @@ plan path or a ticket key; if empty, ask which plan.
    tag must be absent") and its stop conditions exactly.
 7. **The record is not yours to edit.** The session state, the command log and the
    reviews in `<plan>.niten/`, the plan and its receipts, and Claude's settings are
-   protected; only `niten.py` changes the state. You write only `evidence/*.md`.
+   protected; only `niten.py` changes the state. You write only `evidence/*.md`. The
+   hooks (`niten.py hook-*`) are Claude Code's, never run them yourself, and do not read
+   `~/.claude/niten/hook.key`.
 
 ## Procedure
 
@@ -73,7 +78,8 @@ plan path or a ticket key; if empty, ask which plan.
      branches or touching a dirty tree.
 4. `niten.py start --plan <plan> [--repo NAME=PATH ...]`. It refuses a plan without its
    approval receipt (and runs `shogun verify` when Shogun is installed); only the user
-   can choose `--unapproved`. Repositories are found by `--repo`, the plan's
+   can choose `--unapproved`. Run it from this Claude Code session: the hooks guard only
+   a session bound to it. Repositories are found by `--repo`, the plan's
    `<plan>.manifest.json`, `$NITEN_WORKSPACE/<name>`, then `<cwd>/<name>`. It records
    each repo's base commit and pre-existing changes (not part of your change) and
    registers the session for this Claude session.
@@ -92,9 +98,12 @@ plan path or a ticket key; if empty, ask which plan.
    steps have nothing to commit.
 5. `niten.py review <step>`, as a **background** Bash command (`run_in_background`):
    a review takes minutes, longer than a foreground command may run. Wait for it to
-   finish, then read its output. The reviewer sees only this step's changes (since the
-   previous step's approval), the step's log entries and your evidence, and settles
-   every earlier finding one by one.
+   finish, then read its output; do not change the repositories while it runs, or its
+   verdict is **DISCARDED** and you review again. The reviewer sees only this step's
+   changes (since the previous step's approval), the step's log entries and your
+   evidence; it must judge every criterion of the step and settle every open finding
+   by its id. A criterion it cannot verify passes the step but returns at the final
+   review.
    - **APPROVED** → next step.
    - **CHANGES REQUESTED** → fix every blocker and major finding (minor ones: fix if
      cheap and in scope), commit the fix, update the evidence, review again.
@@ -115,7 +124,8 @@ plan path or a ticket key; if empty, ask which plan.
 3. After approval, ask the user how to deliver: push the work branch(es) and open pull
    request(s) (their Git host and conventions), or leave the branches local. Do what
    they choose; each push goes through a permission prompt.
-4. `niten.py finish`. Report: steps with their review counts, what changed where, what
+4. `niten.py finish` (it refuses if the commits differ from what the final review
+   approved). Report: steps with their review counts, what changed where, what
    external operations were done (with digests/IDs), what is left to the user.
 
 ### Interruptions
