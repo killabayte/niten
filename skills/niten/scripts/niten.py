@@ -15,12 +15,14 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
 
 HOME = os.path.expanduser("~")
 REGISTRY = os.path.join(HOME, ".claude", "niten", "active.json")
+CONFIG = os.path.join(HOME, ".claude", "niten", "config.json")
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCHEMA = os.path.join(HERE, "verdict.schema.json")
 
@@ -30,6 +32,63 @@ DELIVERY = [
     re.compile(r"\bbb\s+pr\b"),
     re.compile(r"pullrequests"),
 ]
+
+# Commands with an effect outside the working tree, or one that cannot be undone. In a
+# Niten session each one needs the user's approval with an explanation, whatever the
+# permission settings would otherwise allow.
+IMPORTANT = [
+    ("git push or a history rewrite", r"\bgit\b[^|;&]*\b(push|reset\s+--hard|clean\s+-\w*f|branch\s+-D|tag\s+-d|filter-branch|filter-repo)\b"),
+    ("a registry push, login or image removal", r"\bdocker\b[^|;&]*\b(push|login|rmi|system\s+prune|image\s+(rm|prune))\b|\bdocker\s+buildx\b[^|;&]*(--push\b|\bimagetools\s+create\b)"),
+    ("an infrastructure change", r"\b(terraform|tofu|terragrunt)\b[^|;&]*\b(apply|destroy|import|taint|untaint|force-unlock|state\s+(rm|mv|push|replace-provider))\b"),
+    ("a cluster change", r"\bkubectl\b[^|;&]*\b(apply|create|delete|edit|patch|replace|scale|annotate|label|set|rollout|cordon|uncordon|drain|taint|exec|cp|port-forward)\b"),
+    ("a release change", r"\bhelm\b[^|;&]*\b(install|upgrade|uninstall|delete|rollback|push)\b"),
+    ("a pull request, release or repository change", r"\bgh\s+(pr|release|repo)\s+(create|merge|close|delete|edit)\b|\bgh\s+api\b[^|;&]*(-X|--method)\s*(POST|PUT|PATCH|DELETE)\b"),
+    ("a write to a web API", r"\b(curl|wget|http)\b[^|;&]*(-X\s*|--request\s+|--method\s+)(POST|PUT|PATCH|DELETE)\b|\bcurl\b[^|;&]*\s(-d|--data\S*|-F|--form|-T|--upload-file)\s"),
+    ("a recursive forced delete", r"\brm\s+(-\w*r\w*f|-\w*f\w*r)\b|\brm\s+-r\s+-f\b|\brm\s+-f\s+-r\b"),
+    ("a package publication", r"\b(npm|yarn|pnpm)\s+publish\b|\btwine\s+upload\b|\bgradlew?\b[^|;&]*\bpublish\w*\b"),
+    ("a command on another machine", r"(^|[\s;&|(])(ssh|scp|rsync)\s"),
+    ("a command as root", r"(^|[\s;&|(])sudo\s"),
+]
+
+# aws operations that only read; every other aws operation changes something.
+AWS_READ = re.compile(r"^(describe|list|get|wait|help|ls)\b|^(describe-|list-|get-|batch-get-|search-|lookup-|validate-|filter-|test-)")
+AWS_VALUED = {"--profile", "--region", "--output", "--endpoint-url", "--query", "--color", "--ca-bundle",
+              "--cli-read-timeout", "--cli-connect-timeout", "--cli-binary-format"}
+MIN_EXPLANATION = 25
+
+
+def aws_writes(command):
+    """Whether a command runs an aws operation that is not read-only."""
+    try:
+        words = shlex.split(command, comments=False, posix=True)
+    except ValueError:
+        words = command.split()
+    for i, w in enumerate(words):
+        if os.path.basename(w) != "aws":
+            continue
+        args, j = [], i + 1
+        while j < len(words) and len(args) < 2 and words[j] not in ("|", "&&", "||", ";"):
+            t = words[j]
+            if t.startswith("-"):
+                if "=" not in t and t in AWS_VALUED:
+                    j += 1
+            else:
+                args.append(t)
+            j += 1
+        if len(args) == 2 and not AWS_READ.search(args[1]):
+            return True
+    return False
+
+
+def important(command):
+    """The reason a command needs the user's approval, or None."""
+    extra = (load_json(CONFIG, {}) or {}).get("ask", [])
+    for label, pattern in IMPORTANT + [("a command in your Niten ask list", p) for p in extra]:
+        if re.search(pattern, command):
+            return label
+    if aws_writes(command):
+        return "a cloud change"
+    return None
 
 
 def now():
@@ -496,26 +555,48 @@ def cmd_hook_stop(args):
     print(json.dumps({"decision": "block", "reason": reason}))
 
 
+def decision(kind, reason):
+    print(json.dumps({"hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": kind,
+        "permissionDecisionReason": reason,
+    }}))
+
+
 def cmd_hook_pretooluse(args):
+    """In a Niten session: delivery waits for the final review, and every important
+    command is put to the user with the executor's explanation of why the step needs
+    it, even where the permission settings would run it without asking."""
     data = hook_input()
     if not data or data.get("tool_name") != "Bash":
         return
-    command = (data.get("tool_input") or {}).get("command", "")
-    if not any(p.search(command) for p in DELIVERY):
+    tool_input = data.get("tool_input") or {}
+    command = tool_input.get("command", "")
+    delivery = any(p.search(command) for p in DELIVERY)
+    label = important(command)
+    if not delivery and not label:
         return
     d = find_active(data.get("cwd") or os.getcwd(), data.get("session_id", ""))
     if not d:
         return
     st = load_json(os.path.join(d, "state.json"))
-    if not st or st["final"]["status"] == "approved":
+    if not st:
         return
     script = os.path.join(HERE, "niten.py")
-    print(json.dumps({"hookSpecificOutput": {
-        "hookEventName": "PreToolUse",
-        "permissionDecision": "deny",
-        "permissionDecisionReason": (f"Niten session ({d}): delivery (push or pull request) waits for the "
-                                     f"final review. Approve every step, then run `python3 {script} final`."),
-    }}))
+    if delivery and st["final"]["status"] != "approved":
+        decision("deny", f"Niten session ({d}): delivery (push or pull request) waits for the final review. "
+                         f"Approve every step, then run `python3 {script} final`.")
+        return
+    label = label or "delivery"
+    explanation = " ".join((tool_input.get("description") or "").split())
+    if len(explanation) < MIN_EXPLANATION:
+        decision("deny", f"Niten: this is {label}, so the user approves it. Run the same command again with a "
+                         f"Bash `description` that tells the user, in one or two sentences, what it does and why "
+                         f"the current plan step needs it.")
+        return
+    cur = current_step(st)
+    where = f"{cur['id']} ({cur['title']})" if cur else "final stage"
+    decision("ask", f"Niten {where}, {label}: {explanation}")
 
 
 def main():

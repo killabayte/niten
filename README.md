@@ -39,6 +39,20 @@ Code session that started a Niten session and do nothing anywhere else.
 |---|---|
 | `Stop` | Claude cannot end its turn while the current step, or the final review, is not approved, unless the session is paused to wait for you. |
 | `PreToolUse` (Bash) | No `git push` and no pull request before the final review approved the change. |
+| `PreToolUse` (Bash) | Every important command is put to you, with Claude's explanation of what it does and why the current step needs it, even where your permission settings would run it without asking. A call without an explanation is refused. |
+
+Important commands: git pushes and history rewrites; image pushes, registry logins and
+image removal; any `aws` operation that is not describe, list or get; Terraform,
+`kubectl`, Helm changes; pull requests, releases and repository changes through `gh`;
+writes to web APIs with `curl`/`wget`; recursive forced deletes; package publication;
+`ssh`/`scp`/`rsync`; `sudo`. Read-only commands pass without an extra question. Add your
+own patterns (regular expressions) in `~/.claude/niten/config.json`:
+
+```json
+{"ask": ["\\bmake\\s+deploy\\b"]}
+```
+
+Your own deny rules still win: a command they block cannot be approved through Niten.
 
 Everything else (scope, evidence, asking instead of guessing) is the skill's instruction
 to the model, backed by the reviewer, which rejects out-of-scope or unproven work.

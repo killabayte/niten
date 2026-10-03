@@ -35,11 +35,16 @@ live next to the plan, in `<plan>.niten/`.
 5. **Stay in the plan's scope.** Do exactly the step's actions. No side refactors, no
    extra improvements, no edits to the plan file. If the plan is wrong or impossible,
    stop and ask the user — do not silently deviate.
-6. **Outward-facing and irreversible actions** (pushing images or branches, deleting
-   tags or resources, applying infrastructure, posting to external systems): before
-   running one, say in one line what it will do and where; the permission prompt is the
-   user's approval. Follow the plan's preconditions (e.g. "the tag must be absent") and
-   its stop conditions exactly.
+6. **Important commands are the user's call, with your reason.** Pushes (git, images),
+   registry logins, cloud changes (any `aws` operation other than describe/list/get),
+   infrastructure, cluster and release changes, pull requests, writes to web APIs,
+   recursive forced deletes, publications, remote shells and `sudo`: give every such
+   Bash call a `description` that tells the user, in one or two sentences, what it does
+   and why the current step needs it. A hook puts the call to the user with that text,
+   even where the permission settings would allow it, and refuses it without one. The
+   user's answer to the prompt is the decision: if they decline, do not retry another
+   way — ask what to do. Follow the plan's preconditions (e.g. "the tag must be absent")
+   and its stop conditions exactly.
 
 ## Procedure
 

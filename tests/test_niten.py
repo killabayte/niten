@@ -228,21 +228,60 @@ class HookTest(Base):
         self.run_niten("resume")
         self.assertIsNotNone(self.hook("stop"))
 
+    def bash(self, command, description="", session="sess-1"):
+        out = self.hook("pretooluse", session=session, tool_name="Bash",
+                        tool_input={"command": command, "description": description})
+        return out["hookSpecificOutput"] if out else None
+
     def test_push_waits_for_the_final_review(self):
-        push = {"tool_name": "Bash", "tool_input": {"command": "git -C app push origin HEAD"}}
-        out = self.hook("pretooluse", **push)
-        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
-        for cmd in ("docker push registry/x:1", "git status", "gh pr list"):
-            self.assertIsNone(self.hook("pretooluse", tool_name="Bash", tool_input={"command": cmd}), cmd)
+        explained = "Push the work branch so the user can open a pull request for review"
+        out = self.bash("git -C app push origin HEAD", explained)
+        self.assertEqual(out["permissionDecision"], "deny")
+        self.assertIn("final review", out["permissionDecisionReason"])
+        for cmd in ("git status", "gh pr list"):
+            self.assertIsNone(self.bash(cmd), cmd)
         self.assertIsNone(self.hook("pretooluse", tool_name="Write", tool_input={"file_path": "x"}))
-        self.assertIsNone(self.hook("pretooluse", session="another", **push))
+        self.assertIsNone(self.bash("git push", explained, session="another"))
         for step in ("S-001", "S-002"):
             self.evidence(step)
             self.run_niten("review", step)
         self.assertIn("run the final review", self.hook("stop")["reason"])
         self.run_niten("final")
-        self.assertIsNone(self.hook("pretooluse", **push))
+        out = self.bash("git -C app push origin HEAD", explained)
+        self.assertEqual(out["permissionDecision"], "ask")
+        self.assertIn("final stage", out["permissionDecisionReason"])
         self.assertIsNone(self.hook("stop"))
+
+    def test_important_commands_are_put_to_the_user_with_an_explanation(self):
+        why = "Push the mirrored uv image to the team registry, because this step mirrors the base images"
+        for cmd in ("docker push registry/x:1", "aws --region r ecr batch-delete-image --repository-name x",
+                    "aws s3 cp f s3://b/f", "terraform apply", "kubectl -n x delete pod y", "rm -rf build",
+                    "curl -X POST https://api/x", "ssh host uptime",
+                    "aws ecr get-login-password | docker login --password-stdin registry"):
+            out = self.bash(cmd)
+            self.assertEqual(out["permissionDecision"], "deny", cmd)
+            self.assertIn("description", out["permissionDecisionReason"], cmd)
+            self.assertEqual(self.bash(cmd, "push it").get("permissionDecision"), "deny", cmd)
+            out = self.bash(cmd, why)
+            self.assertEqual(out["permissionDecision"], "ask", cmd)
+            self.assertIn("S-001 (First step)", out["permissionDecisionReason"], cmd)
+            self.assertIn(why, out["permissionDecisionReason"], cmd)
+            self.assertIsNone(self.bash(cmd, why, session="another"), cmd)
+
+    def test_read_only_commands_pass_without_a_question(self):
+        for cmd in ("aws ecr describe-images --repository-name x", "aws --profile p ecr list-images --repository-name x",
+                    "aws sts get-caller-identity", "aws s3 ls s3://b", "docker pull --platform linux/amd64 img",
+                    "docker build -t x .", "docker buildx imagetools inspect img", "terraform plan", "kubectl get pods",
+                    "git diff --stat", "curl -s https://api/x", "rm -f tmp.txt", "grep -rn push ."):
+            self.assertIsNone(self.bash(cmd), cmd)
+
+    def test_the_ask_list_can_be_extended(self):
+        os.makedirs(os.path.join(self.home, ".claude", "niten"), exist_ok=True)
+        with open(os.path.join(self.home, ".claude", "niten", "config.json"), "w") as f:
+            json.dump({"ask": [r"\bmake\s+deploy\b"]}, f)
+        out = self.bash("make deploy", "Deploy the change to the test environment as the step requires")
+        self.assertEqual(out["permissionDecision"], "ask")
+        self.assertIn("ask list", out["permissionDecisionReason"])
 
     def test_hooks_never_fail_on_bad_input(self):
         for kind in ("stop", "pretooluse"):
