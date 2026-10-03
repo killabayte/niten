@@ -983,6 +983,35 @@ class GitViewTest(Base):
         r = self.run_niten("review", "S-001")
         self.assertIn("git configuration of app changed", r.stderr)
 
+    def test_a_reordered_multi_valued_setting_stops_the_review(self):
+        root = os.path.join(self.ws, "app")
+        first, second = "/usr/bin/ssh -o BatchMode=yes", "/usr/bin/ssh -o BatchMode=no"
+        git(root, "config", "--add", "core.sshCommand", first)
+        git(root, "config", "--add", "core.sshCommand", second)
+        self.start()
+        git(root, "config", "--unset-all", "core.sshCommand")
+        git(root, "config", "--add", "core.sshCommand", second)
+        git(root, "config", "--add", "core.sshCommand", first)
+        self.assertEqual(git(root, "config", "--get", "core.sshCommand"), first)
+        self.evidence("S-001")
+        r = self.run_niten("review", "S-001")
+        self.assertIn("git configuration of app changed", r.stderr)
+
+    def test_a_nested_include_change_stops_the_review(self):
+        root = os.path.join(self.ws, "app")
+        parent, leaf = os.path.join(self.tmp, "parent.cfg"), os.path.join(self.tmp, "leaf.cfg")
+        with open(parent, "w") as f:
+            f.write("[include]\n\tpath = leaf.cfg\n")
+        with open(leaf, "w") as f:
+            f.write("[core]\n\tsshCommand = /usr/bin/ssh -o BatchMode=yes\n")
+        git(root, "config", "include.path", parent)
+        self.start()
+        with open(leaf, "w") as f:
+            f.write("[core]\n\tsshCommand = /usr/bin/ssh -o BatchMode=no\n")
+        self.evidence("S-001")
+        r = self.run_niten("review", "S-001")
+        self.assertIn("git configuration of app changed", r.stderr)
+
     def test_global_git_configuration_is_put_to_the_user(self):
         self.start()
         out = self.bash("git config --global diff.hide.textconv /usr/bin/true", WHY)

@@ -443,31 +443,29 @@ def own_paths(st, r):
 UPSTREAM_KEY = re.compile(r"^branch\..+\.(remote|merge)$")
 
 
-def config_meta(path, f):
-    """A config file as git reads it, upstream keys left out, with every file it
-    includes."""
-    rel = os.path.relpath(f, path)
-    if not os.path.exists(f):
-        return {rel: "absent"}
-    entries = sorted(e for e in zsplit(git_strict(path, "config", "--file", f, "--list", "-z"))
-                     if not UPSTREAM_KEY.match(e.split("\n", 1)[0]))
-    meta = {rel: hashlib.sha256("\0".join(entries).encode("utf-8", "surrogateescape")).hexdigest()}
-    for e in entries:
-        key, _, value = e.partition("\n")
-        if key == "include.path" or (key.startswith("includeif.") and key.endswith(".path")):
-            inc = os.path.join(os.path.dirname(f), os.path.expanduser(value))
-            meta[f"{rel} includes {value}"] = content_hash(inc)
+def config_meta(path):
+    """The repository's configuration as git itself reads it: local (and per-worktree)
+    scope with every include expanded by git, in git's order, each value with the file
+    it comes from. Only a branch's upstream keys are left out."""
+    meta = {}
+    scopes = ["--local"]
+    if git(path, "config", "--local", "--bool", "--get", "extensions.worktreeConfig") == "true":
+        scopes.append("--worktree")
+    for scope in scopes:
+        fields = git_strict(path, "config", scope, "--includes", "--show-origin", "--list", "-z").decode(
+            "utf-8", "surrogateescape").split("\0")
+        kept = [f"{origin}\0{entry}" for origin, entry in zip(fields[0::2], fields[1::2])
+                if not UPSTREAM_KEY.match(entry.split("\n", 1)[0])]
+        meta["config " + scope] = hashlib.sha256("\0\0".join(kept).encode("utf-8", "surrogateescape")).hexdigest()
     return meta
 
 
 def git_meta(path):
-    """The repository's own configuration that decides what git shows: config,
-    per-worktree config, info/exclude and info/attributes, byte for byte."""
+    """The repository's own configuration that decides what git shows and does: its
+    config as git reads it, info/exclude and info/attributes byte for byte, and its
+    hooks."""
     common = os.path.join(path, git_strict(path, "rev-parse", "--git-common-dir").decode().strip())
-    gitdir = os.path.join(path, git_strict(path, "rev-parse", "--git-dir").decode().strip())
-    meta = {}
-    for f in (os.path.join(common, "config"), os.path.join(gitdir, "config.worktree")):
-        meta.update(config_meta(path, f))
+    meta = config_meta(path)
     for f in (os.path.join(common, "info", "exclude"), os.path.join(common, "info", "attributes")):
         meta[os.path.relpath(f, path)] = content_hash(f)
     hooks = os.path.join(path, git(path, "config", "--get", "core.hooksPath") or os.path.join(common, "hooks"))
