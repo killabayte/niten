@@ -671,7 +671,7 @@ class HookTest(Base):
         self.hook("posttooluse", session="another", tool_name="Bash", tool_input={"command": "ls"},
                   tool_response={"stdout": "x"})
         self.hook("posttooluse", hook_event_name="PostToolUseFailure", tool_name="Bash",
-                  tool_input={"command": "pytest"}, error="Exit code 1: 2 failed")
+                  tool_input={"command": "pytest"}, error="Exit code 1\n2 failed")
         self.hook("posttooluse", tool_name="AskUserQuestion", tool_input={"questions": [{"question": "Reuse repo?"}]},
                   tool_response={"answers": {"Reuse repo?": "Yes"}})
         with open(os.path.join(self.state, "commands.jsonl")) as f:
@@ -686,7 +686,7 @@ class HookTest(Base):
         self.assertNotIn("AKIAABCDEFGHIJKLMNOP", raw)
         self.assertNotIn("hunter2", raw)
         self.assertNotIn(secret, raw)
-        self.assertEqual(entries[4]["exit_code"], "failed")
+        self.assertEqual(entries[4]["exit_code"], 1)
         self.assertIn("2 failed", entries[4]["stderr"])
         self.assertEqual(entries[5]["kind"], "question")
         self.assertIn("Yes", entries[5]["answers"])
@@ -694,6 +694,22 @@ class HookTest(Base):
         self.ok("review", "S-001")
         with open(os.path.join(self.state, "reviews", "S-001-r1.prompt.md")) as f:
             self.assertIn("6 command(s)", f.read())
+
+    def test_the_log_keeps_paths_and_exit_codes_as_claude_code_reports_them(self):
+        path = "/private/tmp/" + "/".join(["claude-501", "-Users-someone-workspace-project-with-a-long-name"] * 3)
+        self.hook("posttooluse", tool_name="Bash", tool_input={"command": f"rm -rf {path}"},
+                  tool_response={"stdout": "", "stderr": "", "interrupted": False})  # the real shape: no exit code
+        self.hook("posttooluse", hook_event_name="PostToolUseFailure", tool_name="Bash",
+                  tool_input={"command": "sh -c 'exit 3'"}, error="Exit code 3\nto-stdout\nto-stderr")
+        self.hook("posttooluse", tool_name="Bash", tool_input={"command": "aws ecr get-login-password | cat"},
+                  tool_response={"stdout": "eyJwYXlsb2FkIjoi" + "Ab+/" * 40 + "==", "stderr": ""})
+        with open(os.path.join(self.state, "commands.jsonl")) as f:
+            entries = [json.loads(l) for l in f]
+        self.assertEqual(entries[0]["command"], f"rm -rf {path}")
+        self.assertEqual(entries[0]["exit_code"], 0)
+        self.assertEqual(entries[1]["exit_code"], 3)
+        self.assertIn("to-stderr", entries[1]["stderr"])
+        self.assertNotIn("Ab+/Ab+/", entries[2]["stdout"])
 
     def test_hooks_never_fail_on_bad_input(self):
         for kind in ("stop", "pretooluse", "posttooluse", "userprompt"):  # PostToolUseFailure shares posttooluse

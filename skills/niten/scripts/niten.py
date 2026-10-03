@@ -102,8 +102,16 @@ SECRETS = [
     (re.compile(r"(?i)(--?" + SECRET_KEY + r"(\s+|=))(\"[^\"]*\"|'[^']*'|\S+)"), r"\1[REDACTED]"),
     (re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b"), "[REDACTED]"),
     (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", re.S), "[REDACTED]"),
-    (re.compile(r"[A-Za-z0-9+/=_-]{120,}"), "[REDACTED]"),
 ]
+
+# A long run of base64 characters is a token (a registry password, an encoded key)
+# unless it reads as a path: with slashes and none of base64's + and = it is left alone.
+LONG_RUN = re.compile(r"[A-Za-z0-9+/=_-]{120,}")
+
+
+def _long_run(m):
+    run = m.group(0)
+    return run if "/" in run and not ("+" in run or "=" in run) else "[REDACTED]"
 
 
 def aws_writes(command):
@@ -143,7 +151,7 @@ def important(command):
 def redact(text):
     for pattern, replacement in SECRETS:
         text = pattern.sub(replacement, text)
-    return text
+    return LONG_RUN.sub(_long_run, text)
 
 
 # ---------------------------------------------------------------- the signed log
@@ -1530,8 +1538,12 @@ def cmd_hook_posttooluse(args):
     else:
         out, err, code, interrupted = str(resp or ""), "", None, None
     if failed:
-        err = (err + "\n" if err else "") + str(data.get("error") or "")
-        code = code if code not in (None, 0) else "failed"
+        error = str(data.get("error") or "")
+        err = (err + "\n" if err else "") + error
+        m = re.match(r"\s*Exit code (\d+)", error)
+        code = code if code not in (None, 0) else (int(m.group(1)) if m else "failed")
+    elif code is None:
+        code = 0  # Claude Code reports a non-zero exit as a failure, through PostToolUseFailure
     command = tool_input.get("command", "")
     if re.search(r"get-login-password|print-access-token|get-token|\btoken\b", command) and "|" not in command:
         out = "[output withheld: credential]"
