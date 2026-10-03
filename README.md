@@ -112,7 +112,8 @@ git clone https://github.com/killabayte/niten.git && cd niten
 
 The skill is linked into `~/.claude/skills/niten`, so `git pull` updates it. The hooks are
 added to `~/.claude/settings.json` after a backup; running the installer again changes
-nothing. `./install.sh uninstall` removes both. `CLAUDE_CONFIG_DIR` is honoured. Start a
+nothing. A hook never blocks Claude Code by failing: if the skill is missing (the clone
+checked out at a commit without it, or removed), the hooks do nothing. `./install.sh uninstall` removes both. `CLAUDE_CONFIG_DIR` is honoured. Start a
 new Claude Code session afterwards.
 
 ## Use

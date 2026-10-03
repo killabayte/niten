@@ -1116,7 +1116,7 @@ class InstallTest(unittest.TestCase):
         for event, sub in (("Stop", "hook-stop"), ("PreToolUse", "hook-pretooluse"),
                            ("PostToolUse", "hook-posttooluse"), ("PostToolUseFailure", "hook-posttooluse"),
                            ("UserPromptSubmit", "hook-userprompt")):
-            self.assertTrue(any(c.endswith(sub) and "niten.py" in c for c in commands[event]), event)
+            self.assertTrue(any(sub in c and "niten.py" in c for c in commands[event]), event)
         self.assertEqual(data["hooks"]["PreToolUse"][0]["matcher"], "*")
         self.assertEqual(data["hooks"]["PostToolUse"][0]["matcher"], "Bash|AskUserQuestion")
         self.assertIn("already up to date", self.sh())
@@ -1124,6 +1124,23 @@ class InstallTest(unittest.TestCase):
         self.sh("uninstall")
         self.assertFalse(os.path.lexists(link))
         self.assertEqual(self.load(), self.original)
+
+    def test_hooks_never_block_when_the_skill_is_gone(self):
+        self.sh()
+        commands = [h["command"] for groups in self.load()["hooks"].values() for g in groups for h in g["hooks"]
+                    if "niten.py" in h["command"]]
+        os.remove(os.path.join(self.home, ".claude", "skills", "niten"))  # the link now points nowhere
+        for c in commands:
+            r = subprocess.run(["sh", "-c", c], input='{"session_id": "s", "tool_name": "Bash"}', text=True,
+                               capture_output=True)
+            self.assertEqual((r.returncode, r.stdout), (0, ""), c)
+        broken = os.path.join(self.home, "broken.py")
+        with open(broken, "w") as f:
+            f.write("this is not python\n")
+        r = subprocess.run(["sh", "-c", commands[0].replace(os.path.join(self.home, ".claude", "skills", "niten",
+                                                                          "scripts", "niten.py"), broken)],
+                           text=True, capture_output=True)
+        self.assertEqual(r.returncode, 0)
 
 
 if __name__ == "__main__":
