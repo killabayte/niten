@@ -15,7 +15,10 @@ niten status RUN_ID [--config FILE] [--json]
 ```
 
 `run` starts a prepared run. `resume` continues a paused or waiting run after
-recovering its attempts. `status` reads the saved projection without the run lock and
+recovering its attempts. Every session first needs a passing live certificate for its
+exact binding of binaries, models, settings template, managed policy, environment filter,
+adapter argv and OS (see [live probe](live-probe.md)). Without one, nothing is recorded
+and no model starts. `status` reads the saved projection without the run lock and
 never calls a model. Progress lines go to stderr and the result to stdout. SIGINT and
 SIGTERM stop the current model call and pause the run with exit 130. Exit codes: 0 only
 for `done`, 1 for a failed final gate or a failed attestation, 2 for configuration,

@@ -143,7 +143,12 @@ func (s *Seatbelt) Run(ctx context.Context, p Policy, cmd Command) (Result, erro
 	// Whatever happened, nothing from the group may outlive the run: kill the
 	// group and wait until it is gone.
 	_ = syscall.Kill(-pgid, syscall.SIGKILL)
-	if syscall.Kill(-pgid, 0) == nil {
+	// After a timeout the group was stopped by our own signal while it ran:
+	// members still present at this instant are casualties of that kill (and
+	// under load may simply not be reaped yet), not processes that outlived a
+	// command which said it was done. The group is waited out either way, and
+	// a member still holding the roots afterwards is a straggler below.
+	if !res.TimedOut && syscall.Kill(-pgid, 0) == nil {
 		res.Stragglers = true
 	}
 	for deadline := time.Now().Add(3 * time.Second); syscall.Kill(-pgid, 0) == nil; {

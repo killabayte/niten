@@ -40,6 +40,8 @@ type FakeAction struct {
 	Sleep string `json:"sleep,omitempty"`
 	// Evidence files the reviewer leaves in ./evidence/.
 	Evidence map[string]string `json:"evidence,omitempty"`
+	// Probe makes the action follow (or not) the live probe's steps; see ProbeHonest.
+	Probe string `json:"probe,omitempty"`
 }
 
 // FakeScript is a scenario: the actions of each role in invocation order.
@@ -110,6 +112,10 @@ var (
 )
 
 func fakeCLI(role string) int {
+	if len(os.Args) == 2 && os.Args[1] == "--version" {
+		fmt.Printf("fake-%s 0.0.0 (scripted)\n", role)
+		return 0
+	}
 	state := os.Getenv(FakeStateEnv)
 	var script FakeScript
 	b, err := os.ReadFile(os.Getenv(FakeScriptEnv))
@@ -157,6 +163,19 @@ func act(role string, n int, script FakeScript, prompt, state string) int {
 		return 3
 	}
 	a := actions[n-1]
+	if a.Probe != "" {
+		model := a.Model
+		if role == "executor" {
+			if model == "" {
+				model = argAfter("--model")
+			}
+			return probeExecutor(a.Probe, model)
+		}
+		if model == "" {
+			model = argAfter("-m")
+		}
+		return probeReviewer(a.Probe, model, argAfter("-o"))
+	}
 	if a.Sleep != "" {
 		d, _ := time.ParseDuration(a.Sleep)
 		time.Sleep(d)

@@ -61,10 +61,17 @@ func TestDoctorOffline(t *testing.T) {
 	}
 }
 
-func TestDoctorLiveIsRefused(t *testing.T) {
-	code, out, errb := runCLI("doctor", "--live")
-	if code != contract.ExitFormat || out != "" || !strings.Contains(errb, "separately authorized") {
+// Without the model CLIs the live probe refuses before it creates anything.
+func TestDoctorLiveNeedsTheCLIs(t *testing.T) {
+	dir := t.TempDir()
+	cfg := filepath.Join(dir, "niten.toml")
+	os.WriteFile(cfg, []byte("claude_command = \"niten-no-such-claude\"\nstore_dir = \""+filepath.Join(dir, "state")+"\"\n"), 0o600)
+	code, out, errb := runCLI("doctor", "--live", "--config", cfg)
+	if code != contract.ExitFormat || out != "" || !strings.Contains(errb, "niten-no-such-claude") {
 		t.Fatalf("doctor --live: code %d, out %q, err %q", code, out, errb)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "state")); !os.IsNotExist(err) {
+		t.Fatal("a refused live probe created the store")
 	}
 	if code, _, _ := runCLI("doctor", "extra"); code != contract.ExitFormat {
 		t.Fatalf("doctor with a positional argument must be rejected, got %d", code)

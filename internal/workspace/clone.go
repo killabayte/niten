@@ -69,10 +69,12 @@ func CreateClone(ctx context.Context, source, base, work, gitdir string) (*Clone
 		return nil, fmt.Errorf("base %q is not a full commit id", base)
 	}
 	args := append(append([]string{}, isolatedFlags...), "clone", "--quiet", "--no-local", "--no-checkout", "--template=", "--separate-git-dir", gitdir, "--", src, work)
-	cmd := exec.CommandContext(ctx, "git", args...)
-	cmd.Env = isolatedEnv()
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return nil, fmt.Errorf("git clone: %v: %s", err, bytes.TrimSpace(out))
+	if _, stderr, err := runGit(ctx, func() *exec.Cmd {
+		cmd := exec.CommandContext(ctx, GitBinary(), args...)
+		cmd.Env = isolatedEnv()
+		return cmd
+	}, nil); err != nil {
+		return nil, fmt.Errorf("git clone: %v: %s", err, bytes.TrimSpace(stderr))
 	}
 	c := &Clone{}
 	if c.Work, err = Canonical(work); err != nil {
@@ -145,25 +147,37 @@ func (c *Clone) checkPointer() error {
 // ignored, so the only configuration is the clone's own (written by Niten,
 // outside every model write root). Without filter, diff or merge driver
 // definitions, attributes a candidate writes cannot make git run a program.
+// IsolatedGitEnv is the environment of a git command that must touch only the
+// repository its arguments name: every GIT_* variable of the caller removed
+// (GIT_DIR or GIT_WORK_TREE would redirect it, and -C does not override them),
+// the global and system configuration and system attributes off.
+func IsolatedGitEnv() []string { return isolatedEnv() }
+
 func isolatedEnv(extra ...string) []string {
 	return append(append(gitEnv(), "GIT_CONFIG_GLOBAL="+os.DevNull, "GIT_CONFIG_NOSYSTEM=1", "GIT_ATTR_NOSYSTEM=1"), extra...)
 }
 
 // isolatedFlags precede every git command on the clone.
 var isolatedFlags = []string{"--no-replace-objects", "--no-lazy-fetch", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
-	"-c", "core.attributesFile=" + os.DevNull, "-c", "core.excludesFile=" + os.DevNull}
+	"-c", "core.attributesFile=" + os.DevNull, "-c", "core.excludesFile=" + os.DevNull,
+	// No background writes to the git directory. The metadata fingerprint is
+	// sensitive to any file under it, so a commit-graph, a repacked ref or a
+	// maintenance run between a recorded fingerprint and a later check would
+	// read as tampering. gc.auto is also set in the persisted config.
+	"-c", "gc.auto=0", "-c", "maintenance.auto=false", "-c", "core.commitGraph=false",
+	"-c", "fetch.writeCommitGraph=false", "-c", "gc.writeCommitGraph=false", "-c", "pack.writeReverseIndex=false"}
 
 // git runs a git command on the clone with the hardened, isolated environment plus env.
 func (c *Clone) git(ctx context.Context, env []string, args ...string) ([]byte, error) {
 	full := append(append([]string{"--git-dir", c.GitDir, "--work-tree", c.Work}, isolatedFlags...), args...)
-	cmd := exec.CommandContext(ctx, "git", full...)
-	cmd.Env = isolatedEnv(env...)
-	cmd.Dir = c.Work
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	out, err := cmd.Output()
+	out, stderr, err := runGit(ctx, func() *exec.Cmd {
+		cmd := exec.CommandContext(ctx, GitBinary(), full...)
+		cmd.Env = isolatedEnv(env...)
+		cmd.Dir = c.Work
+		return cmd
+	}, nil)
 	if err != nil {
-		return out, fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
+		return out, fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(stderr)))
 	}
 	return out, nil
 }
@@ -938,10 +952,11 @@ func (c *Clone) readBlobs(ctx context.Context, shas []string) (map[string][]byte
 	for _, s := range shas {
 		in.WriteString(s + "\n")
 	}
-	cmd := exec.CommandContext(ctx, "git", append(append([]string{"--git-dir", c.GitDir}, isolatedFlags...), "cat-file", "--batch")...)
-	cmd.Env = isolatedEnv()
-	cmd.Stdin = &in
-	raw, err := cmd.Output()
+	raw, _, err := runGit(ctx, func() *exec.Cmd {
+		cmd := exec.CommandContext(ctx, GitBinary(), append(append([]string{"--git-dir", c.GitDir}, isolatedFlags...), "cat-file", "--batch")...)
+		cmd.Env = isolatedEnv()
+		return cmd
+	}, in.Bytes())
 	if err != nil {
 		return nil, fmt.Errorf("git cat-file --batch: %w", err)
 	}
@@ -1030,11 +1045,12 @@ func (c *Clone) SourcesChanged(ctx context.Context, commit, dir string, outputs 
 			in.WriteString(e.path + "\n")
 		}
 		cp := &Clone{Work: dir, GitDir: c.GitDir}
-		cmd := exec.CommandContext(ctx, "git", append(append([]string{"--git-dir", c.GitDir, "--work-tree", dir}, isolatedFlags...), "hash-object", "--no-filters", "--stdin-paths")...)
-		cmd.Env = isolatedEnv()
-		cmd.Dir = cp.Work
-		cmd.Stdin = &in
-		hashes, err := cmd.Output()
+		hashes, _, err := runGit(ctx, func() *exec.Cmd {
+			cmd := exec.CommandContext(ctx, GitBinary(), append(append([]string{"--git-dir", c.GitDir, "--work-tree", dir}, isolatedFlags...), "hash-object", "--no-filters", "--stdin-paths")...)
+			cmd.Env = isolatedEnv()
+			cmd.Dir = cp.Work
+			return cmd
+		}, in.Bytes())
 		if err != nil {
 			return nil, fmt.Errorf("git hash-object: %w", err)
 		}

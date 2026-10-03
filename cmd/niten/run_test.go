@@ -82,9 +82,10 @@ func cliScript(t *testing.T) testutil.FakeScript {
 	mul := sub + "\nfunc Mul(a, b int) int { return a * b }\n"
 	tsub := testutil.CalcFiles["calc_test.go"] + "\nfunc TestSub(t *testing.T) {\n\tif Sub(5, 3) != 2 || Sub(3, 5) != -2 {\n\t\tt.Fatal(\"Sub\")\n\t}\n}\n"
 	tmul := tsub + "\nfunc TestMul(t *testing.T) {\n\tif Mul(4, 3) != 12 {\n\t\tt.Fatal(\"Mul\")\n\t}\n}\n"
+	// The first invocation of each role is the live probe of doctor --live.
 	return testutil.FakeScript{
-		Executor: []testutil.FakeAction{step("S-001", "R-001.C1", "S-001/V-001", sub, tsub), step("S-002", "R-002.C1", "S-002/V-001", mul, tmul)},
-		Reviewer: []testutil.FakeAction{approve("R-001.C1"), approve("R-002.C1"), approve("R-001.C1", "R-002.C1")},
+		Executor: []testutil.FakeAction{{Probe: testutil.ProbeHonest}, step("S-001", "R-001.C1", "S-001/V-001", sub, tsub), step("S-002", "R-002.C1", "S-002/V-001", mul, tmul)},
+		Reviewer: []testutil.FakeAction{{Probe: testutil.ProbeHonest}, approve("R-001.C1"), approve("R-002.C1"), approve("R-001.C1", "R-002.C1")},
 	}
 }
 
@@ -100,7 +101,15 @@ func TestRunStatusResumeCLI(t *testing.T) {
 	if code, _, errb := runCLI("resume", runID, "--config", cfg); code != contract.ExitFormat || !strings.Contains(errb, "niten run") {
 		t.Fatalf("resume of a prepared run: %d %s", code, errb)
 	}
-	code, out, errb := runCLI("run", runID, "--config", cfg, "--json")
+	// Without a live certificate nothing runs.
+	if code, _, errb := runCLI("run", runID, "--config", cfg); code != contract.ExitFormat || !strings.Contains(errb, "doctor --live") {
+		t.Fatalf("run without a certificate: %d %s", code, errb)
+	}
+	code, out, errb := runCLI("doctor", "--live", "--config", cfg)
+	if code != contract.ExitOK || !strings.Contains(out, "result: pass") {
+		t.Fatalf("doctor --live: %d\n%s\n%s", code, out, errb)
+	}
+	code, out, errb = runCLI("run", runID, "--config", cfg, "--json")
 	var res map[string]any
 	if err := json.Unmarshal([]byte(out), &res); err != nil || code != contract.ExitOK || res["state"] != "done" {
 		t.Fatalf("run: %d %v\n%s\n%s", code, err, out, errb)
@@ -111,6 +120,17 @@ func TestRunStatusResumeCLI(t *testing.T) {
 	code, out, _ = runCLI("status", runID, "--config", cfg)
 	if code != contract.ExitOK || !strings.Contains(out, ": done") || !strings.Contains(out, "receipt: receipts/1-done.json (done)") || !strings.Contains(out, "invocations 5 of 24") {
 		t.Fatalf("status after run: %d\n%s", code, out)
+	}
+	var receipt struct {
+		Certificates []struct {
+			Fingerprint string `json:"fingerprint"`
+			SHA256      string `json:"sha256"`
+			Skipped     bool   `json:"skipped"`
+		} `json:"certificates"`
+	}
+	rb, _ := os.ReadFile(filepath.Join(filepath.Dir(cfg), "state", "niten", "runs", runID, "execution.json"))
+	if json.Unmarshal(rb, &receipt) != nil || len(receipt.Certificates) != 1 || receipt.Certificates[0].Skipped || receipt.Certificates[0].SHA256 == "" {
+		t.Fatalf("the receipt does not name the live certificate: %+v", receipt)
 	}
 	code, out, _ = runCLI("status", runID, "--config", cfg, "--json")
 	var st map[string]any

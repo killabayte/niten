@@ -32,6 +32,9 @@ attestations go through `resume --answers`.
 
 The engine is tested offline on scripted model CLIs and the real verifier sandbox. No
 live model has been called; the first live run is the separately authorized pilot.
+`niten doctor --live` certifies the executor and reviewer profiles with one call of each
+CLI, and runs refuse to start without a passing certificate. The harness is tested
+offline; the live probe needs a separately authorized budget and has not run.
 `niten version`, `niten help` and an offline `niten doctor` also work. `verify` and
 `export` are present but refuse to run with exit code 2. `prepare` needs a Shogun build
 with the S0 manifest sidecar (`shogun verify --require-manifest`).
@@ -43,6 +46,7 @@ approval receipt.
 go build ./... && go test ./...      # offline; the sandbox tests need macOS
 go run ./cmd/niten doctor            # checks the verifier sandbox, never calls a model
 go run ./cmd/niten prepare PLAN.md --repo repo-1=/path/to/checkout
+go run ./cmd/niten doctor --live     # one claude and one codex call; needs an authorized budget
 go run ./cmd/niten run RUN_ID        # calls the configured claude and codex CLIs
 go run ./cmd/niten status RUN_ID
 ```
@@ -72,6 +76,8 @@ go run ./cmd/niten status RUN_ID
     crash recovery.
 13. [Engine](docs/engine.md): the P3 loop, journal, trust rules, checks, packets,
     limits, gates, the final gate and the receipt.
+14. [Live probe](docs/live-probe.md): `doctor --live`, its controls, budget, binding and
+    certificate.
 
 ## First version
 

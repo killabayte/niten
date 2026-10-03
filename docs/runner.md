@@ -46,8 +46,23 @@ the live probes are separately authorized. The engine that drives these pieces (
   worktree. Every later command runs with an explicit git dir and work tree,
   `--no-replace-objects`, `--no-lazy-fetch` and hooks disabled, and with the user's
   global and system configuration, system attributes and the user's attribute and
-  exclude files ignored. The only configuration is the clone's own, so attributes a
-  candidate writes can name no filter, diff or merge program that git would run.
+  exclude files ignored. Background git writes (gc, maintenance, commit-graph,
+  reverse indexes) are disabled, so the metadata fingerprint changes only from the
+  coordinator's own commits. Every git command runs the git in PATH, except that on
+  macOS the `/usr/bin/git` shim is resolved once to the developer tools' git it would
+  start. A git that dies from a crash signal produced no answer and is run once more;
+  reads are idempotent and the coordinator's writes are deterministic or
+  compare-and-swap, so a repeat after a write that landed fails instead of doing it
+  twice. A non-zero exit, or the kill of a cancelled context, is never repeated. The
+  repeat answers a rare `git ls-tree` that died with SIGSEGV, seen in full runs of the
+  test suite under the race detector on macOS; its cause is not confirmed. One
+  hypothesis is the shim and its lookup cache under many concurrent calls. The other is
+  the race runtime in the test binary's forked child before it executes git: one run
+  reported `exit status 66` with a ThreadSanitizer `CHECK failed` for a `git config`
+  command, which git itself cannot print. Neither is proven, and an exit 66 is not
+  repeated: nothing shows that git did not run. The only configuration is the clone's
+  own, so attributes a candidate writes can name no filter, diff or merge program that
+  git would run.
 - `Inspect` snapshots the whole worktree through a private index in the git directory
   (the real index is not touched) and classifies every change against HEAD. Hard
   violations: a protected path, an instruction path without an explicit plan target, a
@@ -94,7 +109,7 @@ paths:
 | Status | When |
 |---|---|
 | `unknown` | the sandboxed run failed (a holder outside the attempt's group, a scan error, an unavailable backend), or `Seal` failed |
-| `invalidated` | the check edited or removed the code under test, added a file to the source tree that is not a declared output, or group members outlived it |
+| `invalidated` | the check edited or removed the code under test, added a file to the source tree that is not a declared output, or group members outlived it (after a timeout, the members the coordinator's own kill stops are not counted) |
 | `failed` | timeout, wrong exit code or signal, truncated output, an unmet stdout expectation |
 | `passed` | none of the above |
 
@@ -123,9 +138,10 @@ write failure is an error, never a clean outcome.
 alive with the recorded start time. A reused PID, a dead leader or an unreadable process
 table is never grounds for a signal; members left in a dead leader's group are reported.
 
-`FilterEnv` removes API keys and model overrides (`ANTHROPIC_*`, `OPENAI_*`,
-`CLAUDE_CODE_*`, `CODEX_API_KEY`, `RUST_LOG` and the other built-in names) plus the
-configured `strip_env` names, and returns only the removed names for the record.
+`FilterEnv` removes API keys, model overrides and git's own variables (`ANTHROPIC_*`,
+`OPENAI_*`, `GIT_*`, `CLAUDE_CODE_*`, `CODEX_API_KEY`, `RUST_LOG` and the other built-in
+names) plus the configured `strip_env` names, and returns only the removed names for the
+record.
 
 ## Adapters
 

@@ -52,13 +52,13 @@ var ErrUnsupported = errors.New("unsupported repository")
 // repository without those features.
 func Git(ctx context.Context, root string, args ...string) ([]byte, error) {
 	full := append([]string{"-C", root, "--no-optional-locks", "--no-replace-objects", "--no-lazy-fetch", "-c", "core.fsmonitor=false"}, args...)
-	cmd := exec.CommandContext(ctx, "git", full...)
-	cmd.Env = gitEnv()
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	out, err := cmd.Output()
+	out, stderr, err := runGit(ctx, func() *exec.Cmd {
+		cmd := exec.CommandContext(ctx, GitBinary(), full...)
+		cmd.Env = gitEnv()
+		return cmd
+	}, nil)
 	if err != nil {
-		return out, fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
+		return out, fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(stderr)))
 	}
 	return out, nil
 }

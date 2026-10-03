@@ -81,7 +81,7 @@ func newWorld(t *testing.T, script testutil.FakeScript, s setup) *world {
 
 func (w *world) open() *Engine {
 	w.t.Helper()
-	e, err := Open(Options{Store: w.store, RunID: w.runID, Out: testWriter{w.t}})
+	e, err := Open(Options{Store: w.store, RunID: w.runID, Out: testWriter{w.t}, SkipCertificate: true})
 	if err != nil {
 		w.t.Fatalf("open: %v", err)
 	}
